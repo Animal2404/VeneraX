@@ -1127,6 +1127,22 @@ class _ReaderSettingsState extends State<ReaderSettings> {
                     : null,
                 useDeviceSettings: useDeviceSpecificSettings,
               ),
+              SelectSetting(
+                title: "Inference backend".tl,
+                settingKey: "imageTranslationExecutionProvider",
+                help:
+                    "Hardware acceleration backend used for OCR models. DirectML works with modern NVIDIA, AMD, and Intel GPUs on Windows."
+                        .tl,
+                optionTranslation: {
+                  "auto": "Automatic (Recommended)".tl,
+                  "directml": "DirectML (GPU)".tl,
+                  "cuda": "CUDA (NVIDIA GPU)".tl,
+                  "cpu": "CPU only".tl,
+                },
+                onChanged: () {
+                  _markTranslationCustom("imageTranslationExecutionProvider");
+                },
+              ),
               _SliderSetting(
                 title: "Pages per pre-translation request".tl,
                 settingsIndex: "imageTranslationPreBatchPages",
@@ -1147,6 +1163,28 @@ class _ReaderSettingsState extends State<ReaderSettings> {
                   _markTranslationCustom("imageTranslationOcrWorkers");
                 },
               ),
+              if (App.isDesktop) ...[
+                _SliderSetting(
+                  title: "OCR detection batch size".tl,
+                  settingsIndex: "imageTranslationOcrDetBatch",
+                  interval: 1,
+                  min: 1,
+                  max: 4,
+                  onChanged: () {
+                    _markTranslationCustom("imageTranslationOcrDetBatch");
+                  },
+                ),
+                _SliderSetting(
+                  title: "OCR recognition batch size".tl,
+                  settingsIndex: "imageTranslationOcrRecBatch",
+                  interval: 1,
+                  min: 1,
+                  max: 8,
+                  onChanged: () {
+                    _markTranslationCustom("imageTranslationOcrRecBatch");
+                  },
+                ),
+              ],
               _SliderSetting(
                 title: "Image download concurrency".tl,
                 settingsIndex: "imageTranslationImageConcurrency",
@@ -1167,6 +1205,16 @@ class _ReaderSettingsState extends State<ReaderSettings> {
                   _markTranslationCustom("imageTranslationLlmConcurrency");
                 },
               ),
+              if (App.isWindows || App.isLinux || App.isMacOS)
+                ListTile(
+                  leading: const Icon(Icons.memory),
+                  title: Text("Runtime backend status".tl),
+                  subtitle: Text(
+                    TranslationWorker.instance.lastReport != null
+                        ? '${TranslationWorker.instance.lastReport!.active.name.toUpperCase()} (ORT ${TranslationWorker.instance.lastReport!.runtimeVersion})'
+                        : "Not initialized (will detect on first translation)".tl,
+                  ),
+                ),
             ],
             _CallbackSetting(
               title: "Translation models".tl,

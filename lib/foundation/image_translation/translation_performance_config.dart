@@ -1,5 +1,6 @@
 import 'package:venera/foundation/app.dart';
 import 'package:venera/foundation/appdata.dart';
+import 'package:venera/foundation/image_translation/ort_capabilities.dart';
 
 enum TranslationPerformancePreset { saver, balanced, fast, custom }
 
@@ -9,12 +10,18 @@ class TranslationPerformanceValues {
     required this.ocrWorkers,
     required this.imageConcurrency,
     required this.llmConcurrency,
+    this.ep = EpPreference.auto,
+    this.detBatch = 1,
+    this.recBatch = 1,
   });
 
   final int batchPages;
   final int ocrWorkers;
   final int imageConcurrency;
   final int llmConcurrency;
+  final EpPreference ep;
+  final int detBatch;
+  final int recBatch;
 }
 
 abstract final class TranslationPerformanceConfig {
@@ -34,6 +41,15 @@ abstract final class TranslationPerformanceConfig {
         _ => TranslationPerformancePreset.balanced,
       };
 
+  static EpPreference _epSetting() {
+    return switch (appdata.settings['imageTranslationExecutionProvider']) {
+      'directml' => EpPreference.directml,
+      'cuda' => EpPreference.cuda,
+      'cpu' => EpPreference.cpu,
+      _ => EpPreference.auto,
+    };
+  }
+
   static TranslationPerformanceValues valuesFor(
     TranslationPerformancePreset preset, {
     required bool isDesktop,
@@ -43,18 +59,27 @@ abstract final class TranslationPerformanceConfig {
       ocrWorkers: 1,
       imageConcurrency: 1,
       llmConcurrency: 1,
+      ep: EpPreference.cpu,
+      detBatch: 1,
+      recBatch: 1,
     ),
     TranslationPerformancePreset.balanced => TranslationPerformanceValues(
       batchPages: isDesktop ? 4 : 2,
       ocrWorkers: 0,
       imageConcurrency: isDesktop ? 3 : 2,
       llmConcurrency: 2,
+      ep: EpPreference.auto,
+      detBatch: 1,
+      recBatch: 1,
     ),
     TranslationPerformancePreset.fast => TranslationPerformanceValues(
       batchPages: isDesktop ? 8 : 4,
       ocrWorkers: isDesktop ? 3 : 2,
       imageConcurrency: isDesktop ? 6 : 3,
       llmConcurrency: isDesktop ? 4 : 3,
+      ep: EpPreference.auto,
+      detBatch: 1,
+      recBatch: 1,
     ),
     TranslationPerformancePreset.custom => TranslationPerformanceValues(
       batchPages: _intSetting(
@@ -73,6 +98,9 @@ abstract final class TranslationPerformanceConfig {
         'imageTranslationLlmConcurrency',
         2,
       ).clamp(1, isDesktop ? 4 : 3),
+      ep: _epSetting(),
+      detBatch: _intSetting('imageTranslationOcrDetBatch', 1).clamp(1, 16),
+      recBatch: _intSetting('imageTranslationOcrRecBatch', 1).clamp(1, 64),
     ),
   };
 

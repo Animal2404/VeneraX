@@ -22,6 +22,7 @@ import 'package:venera/foundation/image_translation/translation_config.dart';
 import 'package:venera/foundation/image_translation/translation_models.dart';
 import 'package:venera/foundation/image_translation/translation_performance_config.dart';
 import 'package:venera/foundation/image_translation/translation_service.dart';
+import 'package:venera/foundation/image_translation/translation_worker.dart';
 import 'package:venera/foundation/import_tasks.dart';
 import 'package:venera/foundation/js_engine.dart';
 import 'package:venera/foundation/launcher_icon.dart';

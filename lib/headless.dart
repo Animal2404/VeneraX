@@ -11,6 +11,7 @@ import 'package:venera/foundation/follow_update_scope.dart';
 import 'package:venera/foundation/app.dart';
 import 'package:venera/foundation/favorites.dart';
 import 'package:venera/network/cookie_jar.dart';
+import 'package:venera/foundation/image_translation/ort_capabilities.dart';
 
 void cliPrint(Map<String, dynamic> data) {
   print('[CLI PRINT] ${jsonEncode(data)}');
@@ -263,6 +264,36 @@ Future<void> runHeadlessMode(List<String> args) async {
           'message': 'Updated comics list.',
           'data': jsonDecode(json),
         });
+      }
+      break;
+    case 'ocr-selfcheck':
+      cliPrint({'status': 'running', 'message': 'Probing OCR runtime & execution providers...'});
+      try {
+        final probe = probeOrtRuntime();
+        final prefStr = (subCommand ?? 'auto').toLowerCase();
+        final pref = EpPreference.values.firstWhere(
+          (p) => p.name == prefStr,
+          orElse: () => EpPreference.auto,
+        );
+        final order = planEpOrder(pref, probe);
+        cliPrint({
+          'status': 'success',
+          'data': {
+            'runtimeVersion': probe.runtimeVersion,
+            'hasCudaSymbol': probe.hasCudaSymbol,
+            'hasDmlSymbol': probe.hasDmlSymbol,
+            'isWindows': probe.isWindows,
+            'isDesktop': probe.isDesktop,
+            'plannedOrder': order.map((e) => e.name).toList(),
+          },
+        });
+      } catch (e, stack) {
+        cliPrint({
+          'status': 'error',
+          'message': 'Probe failed: $e',
+          'stack': stack.toString(),
+        });
+        exit(1);
       }
       break;
     default:

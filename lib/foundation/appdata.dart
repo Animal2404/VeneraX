@@ -540,6 +540,10 @@ class Settings with ChangeNotifier {
     // Dart 估文字笔画并用邻域填充抹掉原文，仅在需要时加描边/半透明底（默认）。
     // 渲染图缓存键会带此模式的标记，切换后自动从已存文本重渲，不重跑 OCR/翻译。
     'imageTranslationInpaintMode': 'smart', // patch, smart
+    // 推理执行提供者：auto, directml, cuda, cpu
+    'imageTranslationExecutionProvider': 'auto',
+    'imageTranslationOcrDetBatch': 1,
+    'imageTranslationOcrRecBatch': 1,
   };
 
   operator [](String key) {

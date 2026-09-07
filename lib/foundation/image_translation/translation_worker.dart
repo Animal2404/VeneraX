@@ -4,6 +4,7 @@ import 'dart:math' as math;
 
 import 'package:venera/foundation/app.dart';
 import 'package:venera/foundation/image_translation/hf_tokenizer.dart';
+import 'package:venera/foundation/image_translation/ort_capabilities.dart';
 import 'package:venera/foundation/image_translation/ort_ffi.dart';
 import 'package:venera/foundation/image_translation/translation_types.dart';
 import 'package:venera/foundation/image_translation/translation_performance_config.dart';
@@ -42,8 +43,11 @@ class _OcrPageRequest {
     this.height,
     this.sourceLang,
     this.paths,
-    this.intraThreads,
-  );
+    this.intraThreads, {
+    this.epPref = EpPreference.auto,
+    this.detBatch = 1,
+    this.recBatch = 1,
+  });
 
   final int id;
   final TransferableTypedData pixels;
@@ -54,6 +58,16 @@ class _OcrPageRequest {
   final String sourceLang;
   final WorkerModelPaths paths;
   final int intraThreads;
+  final EpPreference epPref;
+  final int detBatch;
+  final int recBatch;
+}
+
+class _ProbeRequest {
+  const _ProbeRequest(this.id, this.pref, this.paths);
+  final int id;
+  final EpPreference pref;
+  final WorkerModelPaths paths;
 }
 
 class _ReleaseRequest {
@@ -61,11 +75,12 @@ class _ReleaseRequest {
 }
 
 class _WorkerResponse {
-  _WorkerResponse(this.id, this.result, this.error);
+  _WorkerResponse(this.id, this.result, this.error, [this.report]);
 
   final int id;
   final Object? result;
   final String? error;
+  final EpReport? report;
 }
 
 /// Resolves the OCR worker count without touching platform or settings state.
@@ -77,7 +92,12 @@ int resolveOcrPoolSize({
   required bool isDesktop,
   required String sourceLang,
   required bool hasJapaneseModel,
+  OrtEpKind ep = OrtEpKind.cpu,
 }) {
+  if (ep != OrtEpKind.cpu && isDesktop) {
+    if (requested > 0) return requested.clamp(1, 2);
+    return (processorCount ~/ 4).clamp(1, 2);
+  }
   if (isMobile &&
       (sourceLang == 'ja' || (sourceLang == 'auto' && hasJapaneseModel))) {
     return 1;
@@ -182,12 +202,24 @@ class TranslationWorker {
   final _workers = <_IsolateWorker>[];
 
   bool _isWarm = false;
+  EpReport? _lastReport;
 
   /// Whether a recognition request has already come back. Until it has, the
   /// next one also pays for loading the ONNX models into a fresh isolate —
   /// seconds on mobile — which the task list shows as its own stage rather
   /// than as a recognition step that appears to hang.
   bool get isWarm => _isWarm;
+  EpReport? get lastReport => _lastReport;
+
+  Future<EpReport> capabilities({
+    required EpPreference pref,
+    required WorkerModelPaths paths,
+  }) async {
+    var worker = _pickWorker(1);
+    var report = await worker.probe(pref: pref, paths: paths);
+    _lastReport = report;
+    return report;
+  }
 
   int _poolSize(String sourceLang, WorkerModelPaths paths) {
     var n = TranslationPerformanceConfig.effective.ocrWorkers;
@@ -198,6 +230,7 @@ class TranslationWorker {
       isDesktop: App.isDesktop,
       sourceLang: sourceLang,
       hasJapaneseModel: paths.jaEncoder != null,
+      ep: _lastReport?.active ?? OrtEpKind.cpu,
     );
   }
 
@@ -212,12 +245,16 @@ class TranslationWorker {
     // avoids oversubscribing the CPU (which would make more workers slower).
     var intraThreads = (Platform.numberOfProcessors ~/ poolSize).clamp(1, 4);
     var worker = _pickWorker(poolSize);
+    final perf = TranslationPerformanceConfig.effective;
     return worker
         .ocrPage(
           image,
           sourceLang: sourceLang,
           paths: paths,
           intraThreads: intraThreads,
+          epPref: perf.ep,
+          detBatch: perf.detBatch,
+          recBatch: perf.recBatch,
         )
         .whenComplete(() => _isWarm = true);
   }
@@ -291,6 +328,9 @@ class _IsolateWorker {
         _sendPort = message;
         completer.complete();
       } else if (message is _WorkerResponse) {
+        if (message.report != null) {
+          TranslationWorker.instance._lastReport = message.report;
+        }
         var pending = _pending.remove(message.id);
         if (pending == null) return;
         if (message.error != null) {
@@ -324,11 +364,21 @@ class _IsolateWorker {
     return await completer.future as T;
   }
 
+  Future<EpReport> probe({
+    required EpPreference pref,
+    required WorkerModelPaths paths,
+  }) {
+    return _request<EpReport>((id) => _ProbeRequest(id, pref, paths));
+  }
+
   Future<List<OcrBlock>> ocrPage(
     RgbaImage image, {
     required String sourceLang,
     required WorkerModelPaths paths,
     required int intraThreads,
+    EpPreference epPref = EpPreference.auto,
+    int detBatch = 1,
+    int recBatch = 1,
   }) {
     return _request<List<OcrBlock>>(
       (id) => _OcrPageRequest(
@@ -339,6 +389,9 @@ class _IsolateWorker {
         sourceLang,
         paths,
         intraThreads,
+        epPref: epPref,
+        detBatch: detBatch,
+        recBatch: recBatch,
       ),
     );
   }
@@ -372,8 +425,20 @@ void _workerMain(SendPort mainPort) {
   port.listen((message) {
     if (message is _OcrPageRequest) {
       try {
+        state.currentPref = message.epPref;
         var blocks = state.ocrPage(message);
-        mainPort.send(_WorkerResponse(message.id, blocks, null));
+        mainPort.send(_WorkerResponse(message.id, blocks, null, state.report));
+      } catch (e, s) {
+        mainPort.send(_WorkerResponse(message.id, null, '$e\n$s'));
+      }
+    } else if (message is _ProbeRequest) {
+      try {
+        state.currentPref = message.pref;
+        final firstModel = message.paths.jaEncoder ??
+            message.paths.recModels.values.firstOrNull ??
+            message.paths.detector;
+        state._session(firstModel);
+        mainPort.send(_WorkerResponse(message.id, state.report, null, state.report));
       } catch (e, s) {
         mainPort.send(_WorkerResponse(message.id, null, '$e\n$s'));
       }
@@ -388,12 +453,90 @@ class _WorkerState {
   final _charsets = <String, List<String>>{};
   WordPieceVocab? _jaVocab;
   int _intraThreads = 2;
+  EpPreference currentPref = EpPreference.auto;
+
+  OrtEpKind _ep = OrtEpKind.cpu;
+  OrtProbe? _probe;
+  int _consecutiveFailures = 0;
+  final _attempts = <String>[];
+  final _inputShapes = <String, List<int>>{};
+
+  OrtProbe _getProbe() {
+    return _probe ??= probeOrtRuntime();
+  }
+
+  EpReport get report => EpReport(
+        active: _ep,
+        runtimeVersion: OrtRuntime.runtimeVersion(),
+        attempts: List.unmodifiable(_attempts),
+        modelInputShapes: Map.unmodifiable(_inputShapes),
+        batchCapable: _inputShapes.values.isNotEmpty &&
+            _inputShapes.values.every((s) => s.isNotEmpty && s[0] <= 0),
+      );
 
   OrtFfiSession _session(String path) {
-    return _sessions.putIfAbsent(
+    final key = '$path@${_ep.name}';
+    final existing = _sessions[key];
+    if (existing != null) return existing;
+
+    final probe = _getProbe();
+    final order = planEpOrder(currentPref, probe);
+
+    for (final candidate in order) {
+      try {
+        final session = OrtFfiSession.open(
+          path,
+          ep: candidate,
+          intraOpThreads: _intraThreads,
+        );
+        _ep = candidate;
+        _attempts.add('${candidate.name}:ok');
+        _sessions[key] = session;
+        try {
+          final shapes = session.inputShapes();
+          if (shapes.isNotEmpty) {
+            _inputShapes[path] = shapes.values.first;
+          }
+        } catch (_) {}
+        return session;
+      } on OrtFfiException catch (e) {
+        final truncated = e.message.length > 200 ? e.message.substring(0, 200) : e.message;
+        _attempts.add('${candidate.name}:fail(${e.kind.name}):$truncated');
+        final decision = decideAfterFailure(
+          e,
+          alreadyTried: _attempts.length,
+          consecutiveFailures: _consecutiveFailures,
+        );
+        switch (decision) {
+          case EpDecision.tryNextEp:
+          case EpDecision.shrinkAndRetry:
+            _consecutiveFailures++;
+            continue;
+          case EpDecision.goCpuPermanently:
+            _ep = OrtEpKind.cpu;
+            _consecutiveFailures = 0;
+            final cpuSession = OrtFfiSession.open(
+              path,
+              ep: OrtEpKind.cpu,
+              intraOpThreads: _intraThreads,
+            );
+            _sessions['$path@cpu'] = cpuSession;
+            return cpuSession;
+        }
+      } catch (e) {
+        _attempts.add('${candidate.name}:fail(other):$e');
+        continue;
+      }
+    }
+
+    _ep = OrtEpKind.cpu;
+    final cpuSession = OrtFfiSession.open(
       path,
-      () => OrtFfiSession.open(path, intraOpThreads: _intraThreads),
+      ep: OrtEpKind.cpu,
+      intraOpThreads: _intraThreads,
     );
+    _sessions['$path@cpu'] = cpuSession;
+    return cpuSession;
   }
 
   void release() {

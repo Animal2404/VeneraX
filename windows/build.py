@@ -1,5 +1,6 @@
 import subprocess
 import os
+import sys
 import time
 import httpx
 
@@ -18,6 +19,16 @@ subprocess.run([
     "-o",
     os.path.join(release_dir, "venera_updater.exe"),
 ], shell=True, check=True)
+
+ort_edition = os.environ.get("VENERA_ORT_EDITION", "directml")
+print(f"Injecting ONNX Runtime ({ort_edition}) into {release_dir}...")
+subprocess.run([
+    sys.executable,
+    "tool/fetch_ort_runtime.py",
+    "--target-dir", release_dir,
+    "--edition", ort_edition,
+    "--apply",
+], check=True)
 
 if os.path.exists("build/app-windows.zip"):
     os.remove("build/app-windows.zip")
