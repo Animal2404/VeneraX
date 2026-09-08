@@ -10,6 +10,7 @@ This document covers the setup steps and controls for each feature. If a setting
   - [Controls while reading](#controls-while-reading)
   - [Adjusting results](#adjusting-results)
   - [Performance and usage](#performance-and-usage)
+  - [GPU acceleration](#gpu-acceleration)
   - [Things to know](#things-to-know)
 - [Collections](#collections)
   - [Creating](#creating)
@@ -90,12 +91,22 @@ If throughput is poor or the provider returns rate-limit errors, adjust:
 
 Most users do not need Advanced settings; changing any performance detail switches the mode to "Custom" automatically. Each text line is erased using a tight region and the translated text is kept inside its own area, reducing damage to characters and backgrounds. Complex artwork, very long sentences and unusual layouts can still need a retry or the "Color patch" fallback.
 
+<!--anchor:gpu-acceleration-->
+### GPU acceleration
+
+On Windows desktop, hardware acceleration is supported via DirectML and CUDA:
+
+- **Automatic detection**: "Automatic" preference detects and activates GPU acceleration if available, falling back gracefully to CPU if unsupported.
+- **DirectML**: Works across modern NVIDIA, AMD, and Intel GPUs without manual setup.
+- **FP16 half precision**: Halves memory usage and speeds up compute on Tensor Core GPUs while maintaining accuracy.
+- **Dynamic batching**: Pools tiles and text lines across pages to maximize GPU utilization.
+
 <!--anchor:translation-limits-->
 ### Things to know
 
 - Marked experimental: recognition and translation can both fail, most visibly on long text and unusual layouts.
 - The Japanese model is large because vertical manga text currently has only one reliable recognition option.
-- Inference is CPU-only, so pre-translating on mobile causes noticeable heat and battery drain. Run it while charging.
+- Desktop supports GPU acceleration; inference is CPU-only on mobile, so pre-translating on mobile causes noticeable heat and battery drain. Run it while charging.
 
 <!--anchor:collections-->
 ## Collections

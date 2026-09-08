@@ -18,6 +18,15 @@ on:
           - windows
           - macos
           - linux
+      ort_edition:
+        description: "ONNX Runtime Windows edition (directml / cuda / cpu)"
+        type: choice
+        default: directml
+        required: false
+        options:
+          - directml
+          - cuda
+          - cpu
 
 permissions:
   contents: write
@@ -29,6 +38,20 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'push' }}
 
 jobs:
+  Test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: "stable"
+          flutter-version-file: pubspec.yaml
+          architecture: x64
+      - name: Run unit tests
+        run: |
+          flutter pub get
+          flutter test test/ocr_batching_test.dart test/ocr_pages_batch_test.dart test/ort_capabilities_test.dart test/native_api_guard_test.dart test/translation_performance_config_test.dart test/translation_worker_policy_test.dart test/translation_store_schema_test.dart test/pre_translation_activity_test.dart test/pre_translation_chapter_test.dart test/ordered_group_committer_test.dart test/guide_document_test.dart
+
   Build_MacOS:
     runs-on: macos-15
     if: ${{ github.event_name == 'push' || inputs.platform == 'all' || inputs.platform == 'macos' }}
@@ -125,7 +148,12 @@ jobs:
           channel: "stable"
           flutter-version-file: pubspec.yaml
           architecture: x64
-      - name: Verify Android signing secrets
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'oracle'
+          java-version: '17'
+      - name: Detect Android signing secrets
+        id: detect
         env:
           KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
@@ -133,11 +161,24 @@ jobs:
           KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
             set -euo pipefail
-            test -n "$KEYSTORE_BASE64" || { echo "ANDROID_KEYSTORE_BASE64 secret is missing"; exit 1; }
-            test -n "$KEYSTORE_PASSWORD" || { echo "ANDROID_KEYSTORE_PASSWORD secret is missing"; exit 1; }
-            test -n "$KEY_ALIAS" || { echo "ANDROID_KEY_ALIAS secret is missing"; exit 1; }
-            test -n "$KEY_PASSWORD" || { echo "ANDROID_KEY_PASSWORD secret is missing"; exit 1; }
+            if [ -n "$KEYSTORE_BASE64" ] && [ -n "$KEYSTORE_PASSWORD" ] && [ -n "$KEY_ALIAS" ] && [ -n "$KEY_PASSWORD" ]; then
+              echo "mode=release" >> "$GITHUB_OUTPUT"
+              echo "Android signing mode: official release"
+            else
+              echo "mode=fallback" >> "$GITHUB_OUTPUT"
+              echo "Android signing secrets missing; generating fallback development keystore"
+              keytool -genkeypair \
+                -alias venerax \
+                -keyalg RSA \
+                -keysize 2048 \
+                -validity 10000 \
+                -keystore android/fallback-release.keystore \
+                -storepass android \
+                -keypass android \
+                -dname "CN=VeneraX Fallback, OU=Dev, O=Venera, L=Local, ST=Local, C=UN"
+            fi
       - name: Decode and install Android signing files
+        if: steps.detect.outputs.mode == 'release'
         env:
           KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
@@ -151,16 +192,12 @@ jobs:
               printf 'keyAlias=%s\n' "$KEY_ALIAS"
               printf 'keyPassword=%s\n' "$KEY_PASSWORD"
             } > android/key.properties
-      - uses: actions/setup-java@v4
-        with:
-          distribution: 'oracle'
-          java-version: '17'
       - name: Check rust-toolchain.toml
         run: rustup show
       - run: flutter pub get
       - run: flutter build apk --release
       - name: Verify Android signature continuity
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' && steps.detect.outputs.mode == 'release'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -246,7 +283,14 @@ jobs:
           channel: "stable"
           flutter-version-file: pubspec.yaml
           architecture: x64
+      - name: Cache ORT runtime downloads
+        uses: actions/cache@v4
+        with:
+          path: .cache/ort
+          key: ort-${{ runner.os }}-${{ inputs.ort_edition || 'directml' }}-v1
       - name: build
+        env:
+          VENERA_ORT_EDITION: ${{ inputs.ort_edition || 'directml' }}
         run: |
           flutter pub get
           python windows/build.py
@@ -333,7 +377,7 @@ jobs:
 
   Release:
     runs-on: ubuntu-22.04
-    needs: [Build_MacOS, Build_IOS, Build_Android, Build_Windows, Build_Linux, Build_Linux_ARM64]
+    needs: [Test, Build_MacOS, Build_IOS, Build_Android, Build_Windows, Build_Linux, Build_Linux_ARM64]
     if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
     outputs:
       prerelease: ${{ steps.release_meta.outputs.prerelease }}
@@ -375,6 +419,11 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+          if compgen -G 'outputs/*-unsigned.apk' > /dev/null; then
+            echo "Error: Refusing to publish unsigned fallback APKs to Release."
+            echo "Official release requires valid Android signing secrets."
+            exit 1
+          fi
           existing_draft=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq .draft 2>/dev/null || true)
           if [[ "$existing_draft" == "false" ]]; then
             echo "Release $TAG is already published; refusing to rebuild it"

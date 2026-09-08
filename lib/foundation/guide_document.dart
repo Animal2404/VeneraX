@@ -21,6 +21,7 @@ enum GuideAnchor {
   translationReading('translation-reading'),
   translationAdjust('translation-adjust'),
   translationPerformance('translation-performance'),
+  gpuAcceleration('gpu-acceleration'),
   translationLimits('translation-limits'),
   collections('collections'),
   collectionCreate('collection-create'),
