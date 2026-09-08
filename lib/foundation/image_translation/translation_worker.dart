@@ -255,6 +255,12 @@ String? strongOcrEngineSignal({
 /// reader's two in-flight pages and the pre-translation pipeline's overlapped
 /// groups get real parallelism on multi-core devices.
 class TranslationWorker {
+  /// Test seam for the DirectML pinning rule (plan D-15). The rule itself
+  /// lives in `_WorkerState`, which is private to this library, and a lost
+  /// backslash there once made it dead code without any test noticing.
+  static bool isCpuOnlyRecPath(String path) =>
+      _WorkerState.isCpuOnlyRecPath(path);
+
   TranslationWorker._();
 
   static final instance = TranslationWorker._();
@@ -1086,9 +1092,26 @@ class _WorkerState {
   /// list is the response if another recognizer starts failing the same way.
   static const _cpuOnlyRecDirs = ['ocr_en', 'ocr_ko'];
 
-  static bool _isCpuOnlyRec(String path) {
-    final norm = path.replaceAll(r'', '/');
-    return _cpuOnlyRecDirs.any((dir) => norm.contains('/$dir/'));
+  /// Whether [path] belongs to a component that must stay on the CPU EP.
+  ///
+  /// Deliberately free of any backslash *literal*: the first version of this
+  /// function was written as `path.replaceAll(r'', '/')`, but the backslash
+  /// did not survive the scripted patch that created it, leaving
+  /// `path.replaceAll(r'', '/')` — which inserts a slash between **every**
+  /// character, so `contains('/ocr_en/')` was false for every path and the
+  /// pinning was dead code from the day it shipped (plan D-15). Splitting on
+  /// both separators via `codeUnit 92` cannot be silently mangled the same way,
+  /// and comparing whole segments also avoids the substring trap that would
+  /// match a directory merely named like `ocr_enhanced`.
+  /// Public only so a regression test can pin it (see test/ocr_cpu_pinning_test.dart).
+  static bool isCpuOnlyRecPath(String path) {
+    final buffer = StringBuffer();
+    for (final unit in path.codeUnits) {
+      // 92 is the backslash; written as a number so no escaping can corrupt it.
+      buffer.write(unit == 92 ? '/' : String.fromCharCode(unit));
+    }
+    final segments = buffer.toString().split('/');
+    return segments.any(_cpuOnlyRecDirs.contains);
   }
 
   /// Opens (or reuses) a session for [path]. All of the interesting policy —
@@ -1721,7 +1744,7 @@ class _WorkerState {
     if (lineItems.isEmpty) return const [];
     final modelPath = paths.recModels[lang];
     if (modelPath == null) return List.filled(lineItems.length, '');
-    final session = _session(modelPath, forceCpu: _isCpuOnlyRec(modelPath));
+    final session = _session(modelPath, forceCpu: isCpuOnlyRecPath(modelPath));
     final height = paths.recHeights[lang] ?? 48;
     // Dead-validation fix: `_charsetFor` has always accepted an
     // `expectedClasses`, but the batch path never passed one, so the
