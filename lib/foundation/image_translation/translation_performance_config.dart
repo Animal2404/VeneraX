@@ -4,6 +4,25 @@ import 'package:venera/foundation/image_translation/ort_capabilities.dart';
 
 enum TranslationPerformancePreset { saver, balanced, fast, custom }
 
+/// Two-stage pipeline topology choice (ruling R-4). The setting key and the
+/// two value names are frozen by the plan's interface table (附录 F:
+/// `imageTranslationPipelineMode`, `throughput` | `freeVram`) — renaming
+/// either silently breaks persistence and cross-device expectations.
+enum PipelineMode {
+  /// Speed first: the OCR worker pool survives a chapter's stage-1 sweep, so
+  /// the next chapter can reuse the loaded sessions while this chapter's
+  /// stage-2 (pure network) is running. Cost: GPU memory stays resident
+  /// during translation — which is exactly what decision gate G2 has **not**
+  /// yet proven safe to keep (see the default below).
+  throughput,
+
+  /// VRAM first: every stage end releases the worker pool through the
+  /// release handshake (the historical behavior). This is the factory
+  /// default until G2 (true release measured by V7-1/V7-2) passes; do not
+  /// flip it on a hunch.
+  freeVram,
+}
+
 class TranslationPerformanceValues {
   const TranslationPerformanceValues({
     required this.batchPages,
@@ -50,6 +69,31 @@ abstract final class TranslationPerformanceConfig {
       _ => EpPreference.auto,
     };
   }
+
+  /// Frozen setting-key name (plan 附录 F). Value domain: `throughput` |
+  /// `freeVram`.
+  static const pipelineModeSettingKey = 'imageTranslationPipelineMode';
+
+  /// The pipeline mode as configured on this device. Unknown or missing
+  /// values fall back to [PipelineMode.freeVram] — the factory default while
+  /// decision gate G2 ("did the release handshake actually give the VRAM
+  /// back?") has not passed. Ruling R-4 wants `throughput` as the eventual
+  /// default, but explicitly defers that flip to G2's evidence; until then a
+  /// resident pool would turn "one leaked round per chapter" into "one leak
+  /// held for the whole book", which is worse than not changing anything.
+  static PipelineMode get pipelineMode =>
+      pipelineModeFromSetting(appdata.settings[pipelineModeSettingKey]);
+
+  /// Pure parse, same shape as [_epSetting]: unknown values keep the safe
+  /// (memory-first) mode.
+  static PipelineMode pipelineModeFromSetting(Object? value) =>
+      switch (value) {
+        'throughput' => PipelineMode.throughput,
+        'freeVram' => PipelineMode.freeVram,
+        // Anything unrecognized (typos, null, a value written by a future
+        // build) falls back to the memory-safe default, never to throughput.
+        _ => PipelineMode.freeVram,
+      };
 
   static TranslationPerformanceValues valuesFor(
     TranslationPerformancePreset preset, {

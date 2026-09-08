@@ -2,6 +2,7 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'ort_capabilities.dart';
+import 'ort_ffi.dart';
 import 'translation_types.dart';
 
 /// Quantize [v] up to the nearest multiple of [q].
@@ -383,6 +384,40 @@ class BatchProfile {
         return desktopCpu;
     }
   }
+}
+
+/// Pure decision for the OOM shrink ladder (plan D-5 / §6.2.3): given the
+/// profile a batch run just used and the kind of failure it hit, return the
+/// profile to retry with, or `null` to give up (the caller must then rethrow
+/// — swallowing an allocation failure would silently drop pages).
+///
+/// * A non-OOM failure is not a batch-size problem: shrinking cannot fix an
+///   unavailable EP, a removed device, or a broken graph, so give up at once.
+/// * OOM at `recBatch == 1` means even a single crop does not fit — that is a
+///   memory-ceiling problem, not a batching problem, so give up here too
+///   rather than looping on [BatchProfile.halve]'s clamp.
+/// * [BatchProfile.halve] halves det/rec/dec together: an OOM proved the
+///   whole page footprint too large, and the detection pass shares it.
+BatchProfile? profileAfterOom(BatchProfile profile, OrtFfiErrorKind kind) {
+  if (kind != OrtFfiErrorKind.outOfMemory) return null;
+  if (profile.recBatch <= 1) return null;
+  return profile.halve();
+}
+
+/// Clamp a freshly built [profile] to a sticky ceiling left by an earlier
+/// OOM shrink in this process, so the next request starts where the last one
+/// retreated to instead of charging the same wall again (plan §6.2.3: the
+/// shrink is sticky within the worker's lifetime). A `null` [ceiling] (never
+/// shrunk) returns [profile] untouched.
+BatchProfile cappedBy(BatchProfile profile, BatchProfile? ceiling) {
+  if (ceiling == null) return profile;
+  return BatchProfile(
+    detBatch: math.min(profile.detBatch, ceiling.detBatch),
+    recBatch: math.min(profile.recBatch, ceiling.recBatch),
+    decBatch: math.min(profile.decBatch, ceiling.decBatch),
+    widthQuantum: profile.widthQuantum,
+    widthBuckets: profile.widthBuckets,
+  );
 }
 
 /// Engine routing group for a batch of clusters.

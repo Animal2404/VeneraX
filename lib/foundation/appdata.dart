@@ -172,6 +172,10 @@ class Appdata with Init {
     "imageTranslationPagesPerOcrCall",
     "imageTranslationIdleEvictionSeconds",
     "imageTranslationSelfHostedSource",
+    // Keeping the OCR pool resident across chapters is a function of THIS
+    // device's VRAM headroom; a desktop's throughput preference must not
+    // push a low-VRAM laptop into out-of-memory territory.
+    "imageTranslationPipelineMode",
   ];
 
   @visibleForTesting
@@ -555,6 +559,14 @@ class Settings with ChangeNotifier {
     // 回顾文档写的是「10 秒自动驱逐」，代码一直是 90 秒 —— 做成设置项以便核对，
     // 而不是继续引用一个不存在的数字（施工图 D-1）。
     'imageTranslationIdleEvictionSeconds': 90,
+    // 两阶段流水线拓扑（裁决 R-4，键名冻结于施工图附录 F）：
+    //   throughput = 极速优先：阶段一收尾不杀 worker，显存常驻给后续章复用；
+    //   freeVram   = 显存归零：每次阶段末尾走释放握手后回收（历史行为）。
+    // **出厂默认必须是 freeVram**：决策门 G2（释放握手真把显存还回去，
+    // V7-1/V7-2 实测通过）尚未通过；泄漏未证明修好之前开常驻，等于把
+    // “每章漏一轮”变成“整本一直漏”。G2 通过后把此默认翻成 throughput 是
+    // R-4 的既定动作，届时改这一行即可（勿提前自作主张）。
+    'imageTranslationPipelineMode': 'freeVram',
     // 本仓库是否真的发布了 models Release。默认关：该 tag 从未存在，
     // 打开才把 {release} 放回下载链首位（施工图 D-10 / 裁决 R-3）。
     'imageTranslationSelfHostedSource': false,

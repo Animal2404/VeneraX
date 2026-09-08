@@ -794,8 +794,11 @@ class PreTranslationTaskManager with ChangeNotifier {
   ///
   /// Extracts text and bubble bounding boxes at maximum GPU batching speed
   /// without waiting for remote LLM responses. Results are saved directly into
-  /// [TranslationStore.putOcr]. Once all pages are OCR'd, [TranslationWorker]
-  /// is disposed to completely free GPU VRAM before translation begins.
+  /// [TranslationStore.putOcr]. How the GPU is handed back afterwards depends
+  /// on [PipelineMode]: `freeVram` releases the worker pool through the
+  /// release handshake at the end of the sweep, `throughput` keeps it warm for
+  /// the next chapter (ruling R-4; the pool is still shut down at task
+  /// end/pause/cancel either way).
   Future<void> _runChapterOcrPass(
     PreTranslationTask task,
     PreTranslationChapter chapter,
@@ -929,11 +932,19 @@ class PreTranslationTaskManager with ChangeNotifier {
     } finally {
       activity?.groups.remove(-1);
       _notifyActivity();
-      // Hand the GPU memory back through the release handshake: awaiting here
-      // means the sessions are provably closed before the next stage starts.
-      // (The previous comment here claimed `dispose()` freed VRAM "immediately";
-      // it killed the isolate instead and stranded the sessions — plan D-1/D-13.)
-      await TranslationWorker.instance.shutdownAll();
+      // freeVram (the factory default): hand the GPU memory back through the
+      // release handshake — awaiting here means the sessions are provably
+      // closed before the next stage starts. (The previous comment here
+      // claimed `dispose()` freed VRAM "immediately"; it killed the isolate
+      // instead and stranded the sessions — plan D-1/D-13.)
+      // throughput: keep the pool warm so the next chapter's sweep reuses the
+      // loaded sessions while this chapter's stage 2 burns network time
+      // (ruling R-4). The default stays freeVram until gate G2 measures that
+      // release really frees VRAM; task end / pause / cancel still shut the
+      // pool down in both modes.
+      if (TranslationPerformanceConfig.pipelineMode == PipelineMode.freeVram) {
+        await TranslationWorker.instance.shutdownAll();
+      }
     }
   }
 

@@ -780,6 +780,14 @@ class _ClusterWork {
   bool isPlausible = false;
 }
 
+/// Debug aid for acceptance criterion V9-5: with
+/// `--dart-define=OCR_DEBUG_FORCE_OOM=true`, the first recognition batch run
+/// in each worker isolate throws a synthetic out-of-memory, so the shrink
+/// ladder (D-5) can be exercised without waiting for a real VRAM exhaustion.
+/// Production builds leave this `false`; it is a const, so the throw sites
+/// fold away and the normal path is byte-for-byte the behavior it always had.
+const bool ocrDebugForceOom = bool.fromEnvironment('OCR_DEBUG_FORCE_OOM');
+
 class _WorkerState {
   final _sessions = <String, OrtFfiSession>{};
   final _charsets = <String, List<String>>{};
@@ -799,6 +807,19 @@ class _WorkerState {
   /// Recorded so the perf log and the diagnostics page can show a real
   /// degradation instead of the previously hard-coded `degraded=none` (D-5).
   final _degradedTrail = <String>[];
+
+  /// The tier the OOM shrink ladder retreated to, sticky for this worker's
+  /// lifetime (plan §6.2.3): the next request starts capped here instead of
+  /// re-discovering the same VRAM wall. Reset in [release], which is this
+  /// codebase's reconfigure point (sessions and arenas are torn down there —
+  /// after a model/EP switch the old ceiling no longer describes the memory
+  /// picture). `shutdownAll` kills the isolate, which discards the state
+  /// wholesale, so it needs no extra hook.
+  BatchProfile? _oomCeiling;
+
+  /// V9-5 acceptance aid, see [ocrDebugForceOom]. Armed once per worker
+  /// lifetime; re-armed by [release] so a settings switch re-proves the ladder.
+  bool _forceOomPending = ocrDebugForceOom;
 
   /// Called by the batch paths when they back off. Sticky for the process:
   /// retrying the size that just failed would only fail again.
@@ -897,6 +918,13 @@ class _WorkerState {
     _jaVocab = null;
     _arena.free();
     _hiddenArena.free();
+    // This is the reconfigure point: sessions/arenas are gone and will be
+    // rebuilt (possibly on another EP or another model tier), so the memory
+    // ceiling that produced the last OOM no longer describes the situation.
+    // Keep the shrink sticky past here and a one-off OOM on the 8 GB card
+    // setting would punish every later configuration that could batch again.
+    _oomCeiling = null;
+    _forceOomPending = ocrDebugForceOom;
   }
 
   // -------------------------------------------------------------------------
@@ -954,12 +982,18 @@ class _WorkerState {
     }
 
     final baseProfile = BatchProfile.forEp(_ep, isDesktop: App.isDesktop);
-    final effectiveProfile = BatchProfile(
-      detBatch: req.detBatch > 0 ? req.detBatch : baseProfile.detBatch,
-      recBatch: req.recBatch > 0 ? req.recBatch : baseProfile.recBatch,
-      decBatch: req.recBatch > 0 ? req.recBatch : baseProfile.decBatch,
-      widthQuantum: baseProfile.widthQuantum,
-      widthBuckets: baseProfile.widthBuckets,
+    // Sticky OOM retreat (D-5): a previous shrink in this worker's lifetime
+    // caps what this request may attempt. Width bucketing is deliberately
+    // not capped — it is a shape choice, not an occupancy knob.
+    final effectiveProfile = cappedBy(
+      BatchProfile(
+        detBatch: req.detBatch > 0 ? req.detBatch : baseProfile.detBatch,
+        recBatch: req.recBatch > 0 ? req.recBatch : baseProfile.recBatch,
+        decBatch: req.recBatch > 0 ? req.recBatch : baseProfile.decBatch,
+        widthQuantum: baseProfile.widthQuantum,
+        widthBuckets: baseProfile.widthBuckets,
+      ),
+      _oomCeiling,
     );
 
     var detTilesCount = 0;
@@ -1465,68 +1499,106 @@ class _WorkerState {
     final height = paths.recHeights[lang] ?? 48;
 
     final results = List.filled(lineItems.length, '');
-    final batches = planRecBatch(
-      lines: [for (var item in lineItems) item.rect],
-      height: height,
-      widthBuckets: profile.widthBuckets,
-      maxBatch: profile.recBatch,
-    );
+    // OOM shrink ladder (plan D-5 / §6.2.3): when a run below reports an
+    // allocation failure, the whole plan is re-planned at the halved profile
+    // and retried; the retreat is sticky for this worker until [release]
+    // (the reconfigure point). Stop rules live in the pure [profileAfterOom]:
+    // non-OOM errors and recBatch==1 rethrow — the exception is never
+    // swallowed, a page that genuinely cannot fit must still fail loudly.
+    var runProfile = profile;
+    List<RecBatch> batches;
+    for (;;) {
+      batches = planRecBatch(
+        lines: [for (var item in lineItems) item.rect],
+        height: height,
+        widthBuckets: runProfile.widthBuckets,
+        maxBatch: runProfile.recBatch,
+      );
+      try {
+        for (var batch in batches) {
+          final n = batch.rows.length;
+          final targetW = batch.maxWidth;
+          final targetH = batch.height;
+          final totalElements = n * 3 * targetH * targetW;
+          final offset = _arena.ensure(0, totalElements);
+          _arena.view.fillRange(offset, offset + totalElements, 0.0);
 
-    onStats?.call(batches.length, lineItems.length);
-
-    for (var batch in batches) {
-      final n = batch.rows.length;
-      final targetW = batch.maxWidth;
-      final targetH = batch.height;
-      final totalElements = n * 3 * targetH * targetW;
-      final offset = _arena.ensure(0, totalElements);
-      _arena.view.fillRange(offset, offset + totalElements, 0.0);
-
-      final plane = targetH * targetW;
-      for (var b = 0; b < n; b++) {
-        final row = batch.rows[b];
-        final item = lineItems[row.originalIndex];
-        final resized = _resizeRegion(item.image, row.rect, row.width, targetH);
-        final bOffset = offset + b * 3 * plane;
-        for (var y = 0; y < targetH; y++) {
-          final rowIn = y * row.width;
-          final rowOut = y * targetW;
-          for (var x = 0; x < row.width; x++) {
-            final srcIdx = (rowIn + x) * 4;
-            final dstIdx = rowOut + x;
-            for (var c = 0; c < 3; c++) {
-              _arena.view[bOffset + c * plane + dstIdx] =
-                  (resized[srcIdx + c] / 255.0 - 0.5) / 0.5;
+          final plane = targetH * targetW;
+          for (var b = 0; b < n; b++) {
+            final row = batch.rows[b];
+            final item = lineItems[row.originalIndex];
+            final resized = _resizeRegion(item.image, row.rect, row.width, targetH);
+            final bOffset = offset + b * 3 * plane;
+            for (var y = 0; y < targetH; y++) {
+              final rowIn = y * row.width;
+              final rowOut = y * targetW;
+              for (var x = 0; x < row.width; x++) {
+                final srcIdx = (rowIn + x) * 4;
+                final dstIdx = rowOut + x;
+                for (var c = 0; c < 3; c++) {
+                  _arena.view[bOffset + c * plane + dstIdx] =
+                      (resized[srcIdx + c] / 255.0 - 0.5) / 0.5;
+                }
+              }
             }
           }
+
+          if (_forceOomPending) {
+            // V9-5: pretend this exact run hit the VRAM wall — once per
+            // worker lifetime (re-armed by [release]). Thrown inside the try
+            // so the debug path walks the same ladder as real OOM. With the
+            // dart-define absent, both writes to `_forceOomPending` are the
+            // const-false `ocrDebugForceOom`, so this branch can never be
+            // taken and the production path is unchanged.
+            _forceOomPending = false;
+            throw const OrtFfiException(
+              'forced out-of-memory (OCR_DEBUG_FORCE_OOM)',
+              OrtFfiErrorKind.outOfMemory,
+            );
+          }
+
+          final argmax = session.runArgmaxGrid(
+            {
+              session.inputNames.first: OrtInput.nativeFloat32(
+                _arena.pointerAt(offset),
+                totalElements,
+                [n, 3, targetH, targetW],
+              ),
+            },
+            session.outputNames.first,
+            batch: n,
+            steps: targetW ~/ 8,
+            classes: charset.length,
+          );
+
+          final steps = argmax.length ~/ n;
+          final decodedTexts = ctcGreedyCollapse(
+            argmax: argmax,
+            batch: n,
+            steps: steps,
+            charset: charset,
+          );
+
+          for (var b = 0; b < n; b++) {
+            final origIdx = batch.rows[b].originalIndex;
+            results[origIdx] = decodedTexts[b];
+          }
         }
-      }
-
-      final argmax = session.runArgmaxGrid(
-        {
-          session.inputNames.first: OrtInput.nativeFloat32(
-            _arena.pointerAt(offset),
-            totalElements,
-            [n, 3, targetH, targetW],
-          ),
-        },
-        session.outputNames.first,
-        batch: n,
-        steps: targetW ~/ 8,
-        classes: charset.length,
-      );
-
-      final steps = argmax.length ~/ n;
-      final decodedTexts = ctcGreedyCollapse(
-        argmax: argmax,
-        batch: n,
-        steps: steps,
-        charset: charset,
-      );
-
-      for (var b = 0; b < n; b++) {
-        final origIdx = batch.rows[b].originalIndex;
-        results[origIdx] = decodedTexts[b];
+        // Stats describe the plan that actually produced this page's texts;
+        // failed attempts are deliberately not counted twice.
+        onStats?.call(batches.length, lineItems.length);
+        break;
+      } on OrtFfiException catch (e) {
+        final next = profileAfterOom(runProfile, e.kind);
+        if (next == null) rethrow;
+        final prev = runProfile.recBatch;
+        runProfile = next;
+        _oomCeiling = cappedBy(next, _oomCeiling);
+        noteDegraded('rec${next.recBatch}<-$prev');
+        Log.warning('OCR Perf', 'OOM: recBatch $prev->${next.recBatch}');
+        // Rows decoded before the throw are recomputed by the retry: results
+        // are written per originalIndex and recognition is deterministic, so
+        // re-running costs a little and corrupts nothing.
       }
     }
 

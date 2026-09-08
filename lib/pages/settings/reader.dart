@@ -1097,6 +1097,27 @@ class _ReaderSettingsState extends State<ReaderSettings> {
                 );
               },
             ),
+            SelectSetting(
+              title: "Pipeline mode".tl,
+              // Ruling R-4: which half of the wall clock to sacrifice. Not
+              // part of the preset value table, so changing it must NOT mark
+              // the preset custom (same pattern as "Text removal" below).
+              settingKey:
+                  TranslationPerformanceConfig.pipelineModeSettingKey,
+              help:
+                  "How the two translation stages share the graphics card. Speed first keeps the OCR engine loaded between chapters, so the next chapter is recognized while the current one is being translated. Free VRAM releases the graphics memory after every recognition sweep; it is the default until the release path is proven to actually free VRAM."
+                      .tl,
+              optionTranslation: {
+                "throughput": "Speed first".tl,
+                "freeVram": "Free VRAM (default)".tl,
+              },
+              onChanged: () {
+                setState(() {});
+                widget.onChanged?.call(
+                  TranslationPerformanceConfig.pipelineModeSettingKey,
+                );
+              },
+            ),
             ListTile(
               leading: const Icon(Icons.tune),
               title: Text("Advanced settings".tl),
