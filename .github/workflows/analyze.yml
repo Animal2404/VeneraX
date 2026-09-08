@@ -13,7 +13,14 @@ jobs:
       - uses: subosito/flutter-action@v2
         with:
           channel: "stable"
-          flutter-version-file: pubspec.yaml
+          # No version pin here on purpose. `flutter-version-file: pubspec.yaml`
+          # made this workflow fail 100% of the time: it reads pubspec's
+          # `environment: sdk: ">=3.44.3 <4.0.0"` and hands that *range* to the
+          # action, which only accepts an exact version —
+          # "Unable to determine Flutter version for channel: stable".
+          # main.yml resolves the same channel successfully, so this now matches
+          # the sibling workflow that actually works; a permanently red check is
+          # worse than no check, because it trains everyone to ignore the light.
           architecture: x64
       - run: flutter pub get
       - uses: invertase/github-action-dart-analyzer@v3
