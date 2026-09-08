@@ -45,7 +45,6 @@ jobs:
       - uses: subosito/flutter-action@v2
         with:
           channel: "stable"
-          flutter-version-file: pubspec.yaml
           architecture: x64
       - name: Run unit tests
         run: |
@@ -60,7 +59,6 @@ jobs:
       - uses: subosito/flutter-action@v2
         with:
           channel: "stable"
-          flutter-version-file: pubspec.yaml
           architecture: x64
       - run: sudo xcode-select --switch /Applications/Xcode_16.4.app
       - run: flutter pub get
@@ -118,7 +116,6 @@ jobs:
       - uses: subosito/flutter-action@v2
         with:
           channel: "stable"
-          flutter-version-file: pubspec.yaml
           architecture: x64
       - run: sudo xcode-select --switch /Applications/Xcode_16.4.app
       - run: flutter pub get
@@ -146,7 +143,6 @@ jobs:
       - uses: subosito/flutter-action@v2
         with:
           channel: "stable"
-          flutter-version-file: pubspec.yaml
           architecture: x64
       - uses: actions/setup-java@v4
         with:
@@ -281,7 +277,6 @@ jobs:
       - uses: subosito/flutter-action@v2
         with:
           channel: "stable"
-          flutter-version-file: pubspec.yaml
           architecture: x64
       - name: Cache ORT runtime downloads
         uses: actions/cache@v4
@@ -306,7 +301,6 @@ jobs:
       - uses: subosito/flutter-action@v2
         with:
           channel: 'stable'
-          flutter-version-file: pubspec.yaml
           architecture: x64
       - run: |
           sudo apt-get update -y
@@ -352,7 +346,6 @@ jobs:
       - uses: subosito/flutter-action@v2
         with:
           channel: 'master'
-          flutter-version-file: pubspec.yaml
       - run: |
           flutter pub get
           sudo apt-get update -y
