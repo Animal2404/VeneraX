@@ -542,6 +542,7 @@ class Settings with ChangeNotifier {
     'imageTranslationInpaintMode': 'smart', // patch, smart
     // 推理执行提供者：auto, directml, cuda, cpu
     'imageTranslationExecutionProvider': 'auto',
+    'imageTranslationModelQuality': 'fast', // fast, high
     'imageTranslationOcrDetBatch': 1,
     'imageTranslationOcrRecBatch': 1,
   };

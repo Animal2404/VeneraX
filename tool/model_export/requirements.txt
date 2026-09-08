@@ -1,0 +1,11 @@
+# Offline model conversion and export toolchain for VeneraX OCR
+# NOTE: This requirements file is for offline model export and verification only.
+# None of these packages are bundled into the VeneraX application runtime.
+
+onnx==1.17.0
+onnxconverter-common==1.14.0
+onnxruntime>=1.17.0
+paddle2onnx>=1.0.8
+torch>=2.2.0
+transformers>=4.40.0
+optimum>=1.19.0

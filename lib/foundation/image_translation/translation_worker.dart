@@ -11,6 +11,7 @@ import 'package:venera/foundation/image_translation/ort_ffi.dart';
 import 'package:venera/foundation/image_translation/translation_types.dart';
 import 'package:venera/foundation/image_translation/translation_performance_config.dart';
 import 'package:venera/foundation/image_translation/worker_pool_selection.dart';
+import 'package:venera/foundation/log.dart';
 import 'package:venera/utils/io.dart';
 
 /// Model file paths handed to the worker with each request; the worker has no
@@ -450,6 +451,54 @@ void _workerMain(SendPort mainPort) {
   });
 }
 
+/// Parameters for DBNet text detection.
+class DetParams {
+  static const double unclipRatio = 1.8;
+  static const double binaryThreshold = 0.3;
+  static const double scoreThreshold = 0.5;
+}
+
+/// Parameters for text recognition padding and line expansion.
+class RecParams {
+  /// Base line padding in pixels.
+  static const int padPx = 4;
+
+  /// Direction-aware line inflation for horizontal and vertical lines.
+  static IntRect inflateLine(IntRect line, int imgW, int imgH) {
+    final isVertical = line.height > line.width * 1.3;
+    final dx = padPx;
+    final dy = isVertical ? padPx * 3 : padPx;
+    return line.inflated(dx, dy, imgW, imgH);
+  }
+}
+
+/// Exception thrown when model output class count does not match dictionary size + 2.
+class DictMismatchException implements Exception {
+  DictMismatchException(this.message);
+  final String message;
+
+  @override
+  String toString() => 'DictMismatchException: $message';
+}
+
+/// Reads dictionary lines and returns charset with blank (index 0) and space (last index).
+/// Validates that total classes equals [expectedClasses] if provided.
+List<String> loadCharset(String dictPath, {int? expectedClasses}) {
+  final file = File(dictPath);
+  if (!file.existsSync()) {
+    throw DictMismatchException('Dictionary file not found: $dictPath');
+  }
+  final lines = file.readAsLinesSync();
+  final charset = ['', ...lines.map((l) => l.isEmpty ? ' ' : l), ' '];
+  if (expectedClasses != null && charset.length != expectedClasses) {
+    throw DictMismatchException(
+      'Model output classes ($expectedClasses) does not match charset length (${charset.length}) '
+      'from dict $dictPath. Expected ${expectedClasses - 2} dict lines but got ${lines.length}.',
+    );
+  }
+  return charset;
+}
+
 class _ClusterWork {
   _ClusterWork({
     required this.index,
@@ -458,6 +507,7 @@ class _ClusterWork {
     required this.eraseBounds,
     required this.eraseLines,
     required this.colors,
+    required this.lineHeight,
   });
 
   final int index;
@@ -466,6 +516,7 @@ class _ClusterWork {
   final IntRect eraseBounds;
   final List<IntRect> eraseLines;
   final (int, int) colors;
+  final int lineHeight;
 
   String text = '';
   String lang = '';
@@ -622,7 +673,9 @@ class _WorkerState {
           for (var line in cluster)
             line.inflated(0, 0, image.width, image.height),
         ];
-        var bounds = detectedBounds.inflated(4, 4, image.width, image.height);
+        var lineHeight = _medianLineHeight(cluster);
+        var pad = math.max(4, (0.06 * lineHeight).round().clamp(4, 8));
+        var bounds = detectedBounds.inflated(pad, pad, image.width, image.height);
         if (bounds.width < 8 || bounds.height < 8) continue;
         var colors = _sampleColors(image, bounds);
         var recognized = _recognizeBlock(
@@ -643,7 +696,6 @@ class _WorkerState {
             isVertical: bounds.height > bounds.width * 1.3,
           );
         }
-        var lineHeight = _medianLineHeight(cluster);
         blocks.add(
           OcrBlock(
             rect: bounds,
@@ -674,7 +726,9 @@ class _WorkerState {
         for (var line in cluster)
           line.inflated(0, 0, image.width, image.height),
       ];
-      final bounds = detectedBounds.inflated(4, 4, image.width, image.height);
+      final lineHeight = _medianLineHeight(cluster);
+      final pad = math.max(4, (0.06 * lineHeight).round().clamp(4, 8));
+      final bounds = detectedBounds.inflated(pad, pad, image.width, image.height);
       if (bounds.width < 8 || bounds.height < 8) continue;
       final colors = _sampleColors(image, bounds);
       workItems.add(
@@ -685,6 +739,7 @@ class _WorkerState {
           eraseBounds: eraseBounds,
           eraseLines: eraseLines,
           colors: colors,
+          lineHeight: lineHeight,
         ),
       );
     }
@@ -722,7 +777,7 @@ class _WorkerState {
           final t = targets[i];
           final sortedLines = [
             for (var l in t.cluster)
-              l.inflated(2, 2, image.width, image.height),
+              RecParams.inflateLine(l, image.width, image.height),
           ]..sort((a, b) => a.top.compareTo(b.top));
           final validLines = sortedLines.where((r) => r.width >= 8 && r.height >= 8).toList();
           for (var l in validLines) {
@@ -1040,9 +1095,9 @@ class _WorkerState {
     required int tileWidth,
     required int tileHeight,
   }) {
-    const binaryThreshold = 0.3;
-    const scoreThreshold = 0.5;
-    const unclipRatio = 1.8;
+    const binaryThreshold = DetParams.binaryThreshold;
+    const scoreThreshold = DetParams.scoreThreshold;
+    const unclipRatio = DetParams.unclipRatio;
     var labels = Int32List(w * h);
     var boxes = <IntRect>[];
     var stack = <int>[];
@@ -1119,7 +1174,13 @@ class _WorkerState {
     final modelPath = paths.recModels[lang];
     if (modelPath == null) return List.filled(lines.length, '');
     final session = _session(modelPath);
-    final charset = _charsetFor(lang, paths);
+    final List<String> charset;
+    try {
+      charset = _charsetFor(lang, paths);
+    } on DictMismatchException catch (e) {
+      Log.error('OCR Worker', 'Skipping batch for $lang due to dict mismatch: $e');
+      return List.filled(lines.length, '');
+    }
     final height = paths.recHeights[lang] ?? 48;
 
     final results = List.filled(lines.length, '');
@@ -1272,11 +1333,25 @@ class _WorkerState {
     return results;
   }
 
-  List<String> _charsetFor(String lang, WorkerModelPaths paths) {
-    return _charsets.putIfAbsent(lang, () {
-      var dict = File(paths.recDicts[lang]!).readAsLinesSync();
-      return ['', ...dict.map((line) => line.isEmpty ? ' ' : line), ' '];
-    });
+  List<String> _charsetFor(
+    String lang,
+    WorkerModelPaths paths, {
+    int? expectedClasses,
+  }) {
+    var charset = _charsets[lang];
+    if (charset == null) {
+      final dictPath = paths.recDicts[lang];
+      if (dictPath == null) {
+        throw DictMismatchException('No dictionary registered for $lang');
+      }
+      charset = loadCharset(dictPath, expectedClasses: expectedClasses);
+      _charsets[lang] = charset;
+    } else if (expectedClasses != null && charset.length != expectedClasses) {
+      throw DictMismatchException(
+        'Model output classes ($expectedClasses) does not match cached charset length (${charset.length}) for $lang',
+      );
+    }
+    return charset;
   }
 
   // ----- Japanese OCR (manga-ocr) -----
@@ -1353,15 +1428,18 @@ class _WorkerState {
   ) {
     var modelPath = paths.recModels[lang]!;
     var session = _session(modelPath);
-    var charset = _charsets.putIfAbsent(lang, () {
-      var dict = File(paths.recDicts[lang]!).readAsLinesSync();
-      return ['', ...dict.map((line) => line.isEmpty ? ' ' : line), ' '];
-    });
+    final List<String> charset;
+    try {
+      charset = _charsetFor(lang, paths);
+    } on DictMismatchException catch (e) {
+      Log.error('OCR Worker', 'Skipping recognition for $lang due to dict mismatch: $e');
+      return '';
+    }
     var height = paths.recHeights[lang] ?? 48;
     var sorted = [...lines]..sort((a, b) => a.top.compareTo(b.top));
     var parts = <String>[];
     for (var line in sorted) {
-      var rect = line.inflated(2, 2, image.width, image.height);
+      var rect = RecParams.inflateLine(line, image.width, image.height);
       if (rect.width < 8 || rect.height < 8) continue;
       var outW = (rect.width * height / math.max(1, rect.height)).round().clamp(
         16,

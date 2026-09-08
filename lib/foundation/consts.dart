@@ -15,3 +15,9 @@ const firstPage = 1;
 
 /// Chapters for all comics is started from this value.
 const firstChapter = 1;
+
+/// GitHub repository this build belongs to. Single edit point for a fork: the
+/// update check, the update package download, the changelog fetch, the
+/// repository link, and model release downloads all resolve through these.
+const kUpdateRepoOwner = 'Kyosee';
+const kUpdateRepoName = 'VeneraX';

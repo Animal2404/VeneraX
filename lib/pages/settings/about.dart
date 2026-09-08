@@ -1,12 +1,8 @@
-﻿part of 'settings_page.dart';
+part of 'settings_page.dart';
 
-/// GitHub repository this build belongs to. Single edit point for a fork: the
-/// update check, the update package download, the changelog fetch and the
-/// repository link all resolve through these. Left pointing upstream, a fork
-/// would compare against upstream releases and offer the upstream build as its
-/// own update.
-const kUpdateRepoOwner = 'Kyosee';
-const kUpdateRepoName = 'VeneraX';
+/// GitHub repository constants (kUpdateRepoOwner, kUpdateRepoName) are defined
+/// in `lib/foundation/consts.dart` as the single edit point for forks.
+
 
 class AboutSettings extends StatefulWidget {
   const AboutSettings({super.key});

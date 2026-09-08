@@ -31,15 +31,11 @@ class _TranslationModelsPageState extends State<TranslationModelsPage> {
     if (mounted) setState(() {});
   }
 
-  static String _componentName(String id) {
-    return switch (id) {
-      'text_detector' => "Text detector".tl,
-      'ocr_ja' => "Japanese OCR (manga)".tl,
-      'ocr_zh' => "Chinese / Latin OCR".tl,
-      'ocr_en' => "English OCR".tl,
-      'ocr_ko' => "Korean OCR".tl,
-      _ => id,
-    };
+  static String _componentName(ModelComponent component) {
+    if (component.displayNameKey != null) {
+      return component.displayNameKey!.tl;
+    }
+    return component.id;
   }
 
   static String _formatSize(int bytes) {
@@ -57,11 +53,43 @@ class _TranslationModelsPageState extends State<TranslationModelsPage> {
     var requiredIds = TranslationModels.requiredFor(
       widget.sourceLang ?? TranslationConfig.global.sourceLang,
     ).map((c) => c.id).toSet();
+
+    final hasGpuBackend = TranslationWorker.instance.lastReport?.active != null &&
+        TranslationWorker.instance.lastReport?.active != OrtEpKind.cpu;
+
+    final detComponents = TranslationModels.all
+        .where((c) => c.kind == ModelKind.detector)
+        .toList();
+    final recComponents = TranslationModels.all
+        .where((c) =>
+            c.kind != ModelKind.detector &&
+            !c.requiresGpuEp &&
+            c.tier != ModelTier.high)
+        .toList();
+    final highAndGpuComponents = TranslationModels.all
+        .where((c) =>
+            c.kind != ModelKind.detector &&
+            (c.requiresGpuEp || c.tier == ModelTier.high))
+        .toList();
+
     return Scaffold(
       body: SmoothCustomScrollView(
         scrollbarTopPadding: context.padding.top + 56,
         slivers: [
           SliverAppbar(title: Text("Translation models".tl)),
+          SelectSetting(
+            title: "Model quality".tl,
+            settingKey: "imageTranslationModelQuality",
+            optionTranslation: {
+              'fast': "Fast".tl,
+              'high': "High accuracy".tl,
+            },
+            onChanged: () {
+              TranslationModels.invalidateReadyCache();
+              TranslationWorker.instance.release();
+              _update();
+            },
+          ).toSliver(),
           SelectSetting(
             title: "Model download source".tl,
             settingKey: "imageTranslationHfEndpoint",
@@ -77,13 +105,18 @@ class _TranslationModelsPageState extends State<TranslationModelsPage> {
             ),
           ).toSliver(),
           _buildSectionHeader(context, "Text detection".tl).toSliver(),
-          for (var component in TranslationModels.all)
-            if (component.id == 'text_detector')
-              _buildComponent(context, component, requiredIds).toSliver(),
+          for (var component in detComponents)
+            _buildComponent(context, component, requiredIds, hasGpuBackend)
+                .toSliver(),
           _buildSectionHeader(context, "Text recognition".tl).toSliver(),
-          for (var component in TranslationModels.all)
-            if (component.id != 'text_detector')
-              _buildComponent(context, component, requiredIds).toSliver(),
+          for (var component in recComponents)
+            _buildComponent(context, component, requiredIds, hasGpuBackend)
+                .toSliver(),
+          _buildSectionHeader(context, "High-accuracy & GPU variants".tl)
+              .toSliver(),
+          for (var component in highAndGpuComponents)
+            _buildComponent(context, component, requiredIds, hasGpuBackend)
+                .toSliver(),
           const SliverPadding(padding: EdgeInsets.only(bottom: 16)),
         ],
       ),
@@ -106,12 +139,20 @@ class _TranslationModelsPageState extends State<TranslationModelsPage> {
     BuildContext context,
     ModelComponent component,
     Set<String> requiredIds,
+    bool hasGpuBackend,
   ) {
     var store = TranslationModelStore.instance;
     var state = store.stateOf(component);
     var installed = component.isInstalled;
+    final isGpuBlocked = component.requiresGpuEp && !hasGpuBackend;
+
     Widget trailing;
-    if (state.downloading) {
+    if (!component.enabled) {
+      trailing = Text(
+        "Coming soon".tl,
+        style: TextStyle(color: context.colorScheme.outline),
+      );
+    } else if (state.downloading) {
       trailing = Row(
         mainAxisSize: MainAxisSize.min,
         children: [
@@ -152,22 +193,50 @@ class _TranslationModelsPageState extends State<TranslationModelsPage> {
           ),
         ],
       );
+    } else if (isGpuBlocked) {
+      trailing = Button.outlined(
+        color: context.colorScheme.outline.withValues(alpha: 0.4),
+        onPressed: () {},
+        child: Text(
+          "Download".tl,
+          style: TextStyle(color: context.colorScheme.outline),
+        ),
+      ).fixHeight(32);
     } else {
       trailing = Button.filled(
         onPressed: () => store.download(component),
         child: Text("Download".tl),
       ).fixHeight(32);
     }
+
     String subtitle = _formatSize(component.approxSizeBytes);
-    if (requiredIds.contains(component.id) && !installed) {
+    if (component.requiresGpuEp) {
+      if (isGpuBlocked) {
+        subtitle += " · ${"Unavailable: no GPU backend detected".tl}";
+      } else {
+        subtitle += " · ${"Requires GPU backend".tl}";
+      }
+    }
+    if (requiredIds.contains(component.id) && !installed && component.enabled) {
       subtitle += " · ${"Required by current settings".tl}";
     }
     if (state.error != null) {
       subtitle += "\n${"Download failed".tl}: ${state.error}";
     }
+
     return ListTile(
-      title: Text(_componentName(component.id)),
-      subtitle: Text(subtitle),
+      title: Text(
+        _componentName(component),
+        style: component.enabled
+            ? null
+            : TextStyle(color: context.colorScheme.outline),
+      ),
+      subtitle: Text(
+        subtitle,
+        style: component.enabled
+            ? null
+            : TextStyle(color: context.colorScheme.outline),
+      ),
       isThreeLine: state.error != null,
       trailing: trailing,
     );
