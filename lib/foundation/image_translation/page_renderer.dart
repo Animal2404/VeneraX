@@ -23,6 +23,17 @@ import 'package:venera/utils/translations.dart';
 /// A region whose translation cannot be placed legibly is **not** painted: it
 /// keeps the original artwork (Phase 11-S1, [decideOverflow]). Use
 /// [renderTranslatedPageWithReport] to learn which ones, and why.
+///
+/// Phase 11-S4 makes the outline part of the deal: a block that will be drawn
+/// with a stroke *pays for that stroke in its fit budget* (both orientations),
+/// and the stroke is as thick, relative to the glyphs, as the source
+/// lettering's own outline measured on the artwork ([estimateStrokeRatio]) —
+/// falling back to [kDefaultStrokeRatio] of the font size when the probe
+/// cannot say anything about the block.
+///
+/// Phase 11-S5 harmonises blocks that share a bubble: [unifyPlacementGroups]
+/// gives every member of a cluster one size — the largest the whole group can
+/// carry — instead of letting each line pick a size off its own box.
 Future<Uint8List> renderTranslatedPage(
   Uint8List originalBytes,
   RgbaImage decoded,
@@ -46,13 +57,22 @@ Future<PageRenderResult> renderTranslatedPageWithReport(
   InpaintMode mode = InpaintMode.smart,
 }) async {
   final page = ui.Size(decoded.width.toDouble(), decoded.height.toDouble());
+  final outlined = mode != InpaintMode.patch;
+  // Phase 11-S4: weigh the source lettering's outline before budgeting ours.
+  // The probe reads the untouched artwork (`decoded` has already been erased
+  // in the smart modes), so a page whose source bytes cannot be re-read
+  // simply gets the default stroke ratio — the pre-probe behaviour.
+  final strokeRatios = outlined
+      ? await detectStrokeRatios(originalBytes, decoded, regions)
+      : const <int, double>{};
   final placements = planRegions(
     regions,
     page,
-    outlined: mode != InpaintMode.patch,
+    outlined: outlined,
     // A patch plate covers more than its region's box, so the neighbour's
     // plate — not just the neighbour's box — is the obstacle to keep clear of.
     obstacleInflate: mode == InpaintMode.patch ? _patchPlateCoverage : null,
+    strokeRatios: strokeRatios,
   );
   final report = PageRenderReport.build(placements, regions);
 
@@ -269,11 +289,18 @@ enum OverflowDecision {
   keepOriginal,
 }
 
-/// Answers "would this region's text fit in that box, painted this way?".
+/// Answers "would this region's text fit in that box, painted this way?" —
+/// outline included, because an outline that is not paid for in the budget is
+/// how lettering gets clipped (Phase 11-S4).
 ///
 /// Injected into [decideOverflow] so the policy stays a pure function: the
 /// real implementation runs the layout engines below, a test answers with a
-/// closure.
+/// closure. The production oracle *is* stroke-aware — [planRegions] closes it
+/// over the block's resolved stroke ratio (see [strokeWidthForSize] and
+/// [fitsRegionAt]), so a grown box that only "fits" by ignoring the outline
+/// never wins an expansion. The signature deliberately does not carry the
+/// stroke width itself: S1's fixtures inject two-argument closures, and what
+/// the oracle needs to know about the stroke is its own private business.
 typedef FitsTest = bool Function(ui.Rect box, bool vertical);
 
 /// A region's final layout, decided before a single pixel is touched.
@@ -285,6 +312,8 @@ class Placement {
     required this.vertical,
     required this.decision,
     this.skips = false,
+    this.sourceStrokeRatio,
+    this.layoutGroup = -1,
   });
 
   /// Index into the page's region list.
@@ -313,6 +342,27 @@ class Placement {
   bool get keptOriginal =>
       !skips && decision == OverflowDecision.keepOriginal;
 
+  /// Stroke thickness of the source lettering, as a fraction of its own glyph
+  /// size, as measured by [estimateStrokeRatio]; `null` when the probe could
+  /// not say anything about this block (default ratio applies).
+  final double? sourceStrokeRatio;
+
+  /// Index of the first region this block's font size was harmonised with
+  /// (Phase 11-S5), or `-1` when the block stands alone.
+  final int layoutGroup;
+
+  /// The same placement re-measured at one harmonised size.
+  Placement sized(double newSize, int group) => Placement(
+    index: index,
+    box: box,
+    size: newSize,
+    vertical: vertical,
+    decision: decision,
+    skips: skips,
+    sourceStrokeRatio: sourceStrokeRatio,
+    layoutGroup: group,
+  );
+
   /// A degenerate region (tiny box, empty text): never entered layout, so it
   /// is not an overflow either — and never painted.
   Placement.of(this.index, TranslatedRegion region)
@@ -320,7 +370,9 @@ class Placement {
       size = 0,
       vertical = false,
       decision = OverflowDecision.keepOriginal,
-      skips = true;
+      skips = true,
+      sourceStrokeRatio = null,
+      layoutGroup = -1;
 }
 
 /// How much of the clear gutter between two bubbles may be taken for text.
@@ -336,7 +388,7 @@ const double kGutterGrowFraction = 0.4;
 const double kDefaultMinReadableGlyphSize = 8.0;
 
 /// Nothing is ever painted below this size; see [OverflowDecision.keepOriginal]
-/// and [_fitFontSize].
+/// and [_fitRegion].
 ///
 /// It is a mutable setting rather than a `const` so the settings layer can
 /// expose it without this renderer importing `appdata` (which is on the other
@@ -496,11 +548,22 @@ double _gapTo(
 /// A block's safe growth depends on where its neighbours are, so all decisions
 /// share one page context — and painting has to wait for the last of them,
 /// because kept-original restores go down before any lettering.
+///
+/// [strokeRatios] carries the source lettering's measured outline weight
+/// (region index → ratio, from [detectStrokeRatios]); blocks absent from it
+/// fall back to [kDefaultStrokeRatio]. Every fit test on this page — the
+/// search, [decideOverflow]'s oracle, and the later group harmonisation —
+/// budgets the stroke that will actually be painted.
+///
+/// [normalizeGroups] turns Phase 11-S5's per-page harmonisation off; see
+/// [unifyPlacementGroups].
 List<Placement> planRegions(
   List<TranslatedRegion> regions,
   ui.Size page, {
   bool outlined = true,
   double Function(ui.Rect rect)? obstacleInflate,
+  Map<int, double>? strokeRatios,
+  bool normalizeGroups = true,
 }) {
   final placements = <Placement>[];
   for (var i = 0; i < regions.length; i++) {
@@ -510,6 +573,7 @@ List<Placement> planRegions(
       placements.add(Placement.of(i, region));
       continue;
     }
+    final ratio = strokeRatios?[i];
     final obstacles = <ui.Rect>[];
     for (var j = 0; j < regions.length; j++) {
       if (j == i) continue;
@@ -517,7 +581,13 @@ List<Placement> planRegions(
     }
     final eraseBounds = _eraseBoundsOf(region);
     var vertical = _prefersVertical(region.text, rect);
-    var fit = _fitRegion(region, rect, vertical, outlined: outlined);
+    var fit = _fitRegion(
+      region,
+      rect,
+      vertical,
+      outlined: outlined,
+      sourceStrokeRatio: ratio,
+    );
     var box = rect;
     var decision = fit.fits
         ? OverflowDecision.shrinkToFit
@@ -532,8 +602,15 @@ List<Placement> planRegions(
             minReadable: minReadableGlyphSize,
             vertical: vertical,
             cjkRatio: fullWidthRatio(region.text),
-            fitsIn: (candidate, mode) =>
-                _fitRegion(region, candidate, mode, outlined: outlined).fits,
+            // Stroke-aware by capture: whatever the chosen size paints, the
+            // oracle paid for in the budget.
+            fitsIn: (candidate, mode) => _fitRegion(
+              region,
+              candidate,
+              mode,
+              outlined: outlined,
+              sourceStrokeRatio: ratio,
+            ).fits,
           );
 
     if (decision == OverflowDecision.expandRect) {
@@ -544,10 +621,22 @@ List<Placement> planRegions(
         pageWidth: page.width,
         pageHeight: page.height,
       );
-      fit = _fitRegion(region, box, vertical, outlined: outlined);
+      fit = _fitRegion(
+        region,
+        box,
+        vertical,
+        outlined: outlined,
+        sourceStrokeRatio: ratio,
+      );
     } else if (decision == OverflowDecision.switchOrientation) {
       vertical = true;
-      fit = _fitRegion(region, box, vertical, outlined: outlined);
+      fit = _fitRegion(
+        region,
+        box,
+        vertical,
+        outlined: outlined,
+        sourceStrokeRatio: ratio,
+      );
     }
     // Reality gate: a policy recommendation the layout oracle cannot honour is
     // not a placement. This is what makes "drawn and then clipped" impossible
@@ -561,10 +650,15 @@ List<Placement> planRegions(
         size: fit.fits ? fit.size : 0,
         vertical: vertical,
         decision: decision,
+        sourceStrokeRatio: ratio,
       ),
     );
   }
-  return placements;
+  if (!normalizeGroups) return placements;
+  // S5: the per-block decisions are made; sizes within a shared bubble are not
+  // yet agreed. Harmonisation only ever *shrinks* (to a size every member was
+  // itself measured to fit), so no decision can be invalidated by it.
+  return unifyPlacementGroups(placements, regions, outlined: outlined);
 }
 
 ui.Rect _obstacleOf(
@@ -596,6 +690,106 @@ double _patchPlateCoverage(ui.Rect rect) {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 11-S4: the stroke is part of the layout, not a garnish on it
+// ---------------------------------------------------------------------------
+
+/// Default outline weight when the source block's own lettering cannot be
+/// measured: 14% of the glyph size — the ratio every block used before S4.
+const double kDefaultStrokeRatio = 0.14;
+
+/// Outlines are drawn at least this many px wide, whatever the ratio says:
+/// below it the ink simply stops being visible at manga page sizes.
+const double kMinStrokeWidth = 1.5;
+
+/// Plausible bounds for a *detected* source stroke ratio. Outside them the
+/// measurement is saying more about screentone or a black blob than about
+/// lettering, so the ratio is clamped back into this range before it reaches
+/// either the fit budget or the pen.
+const double kStrokeRatioFloor = 0.03;
+const double kStrokeRatioCeil = 0.35;
+
+/// The ratio to paint and budget with: the source lettering's measured
+/// weight when [estimateStrokeRatio] could say something about the block,
+/// [kDefaultStrokeRatio] otherwise, always clamped into the plausible band.
+double strokeRatioFor(double? detectedSourceRatio) =>
+    detectedSourceRatio == null || !detectedSourceRatio.isFinite
+    ? kDefaultStrokeRatio
+    : detectedSourceRatio.clamp(kStrokeRatioFloor, kStrokeRatioCeil);
+
+/// How thick an outline this block draws at this glyph size.
+///
+/// The single place that answer exists — the fit budget, the horizontal pen
+/// and the vertical column geometry all ask here, so they can never disagree
+/// about how much ink hangs off a glyph.
+double strokeWidthForSize(double fontSize, {double? sourceStrokeRatio}) =>
+    math.max(kMinStrokeWidth, fontSize * strokeRatioFor(sourceStrokeRatio));
+
+/// What a fit budget must reserve beyond the fixed 4px of breathing room:
+/// the outline that extends past the measured glyph box on every side.
+double strokeInset(
+  double fontSize,
+  bool outlined, {
+  double? sourceStrokeRatio,
+}) => 4.0 + (outlined ? strokeWidthForSize(fontSize, sourceStrokeRatio: sourceStrokeRatio) : 0.0);
+
+/// Cell pitch down a column: 15% leading plus the outline — two stacked
+/// ideographs each ringed in ink need the stroke width between them or their
+/// rings touch and the column reads as one smear.
+double columnPitchFor(double size, double strokeWidth) =>
+    size * 1.15 + strokeWidth;
+
+/// Distance between two columns: a hair wider than a cell, plus the outline
+/// for the same reason.
+double columnWidthFor(double size, double strokeWidth) =>
+    size * 1.2 + strokeWidth;
+
+/// Measure one block at one exact size, stroke included.
+///
+/// The one question every layer asks, phrased once: the fit search, S1's
+/// [decideOverflow] oracle and S5's group harmonisation all answer through
+/// here, so "measured to fit", "grew because it fits" and "painted at this
+/// size" cannot drift apart. [size] is not judged against the legibility
+/// floor — that is the caller's decision — only against what the box and the
+/// stroke leave for it.
+bool fitsRegionAt(
+  TranslatedRegion region,
+  ui.Rect box, {
+  required bool vertical,
+  required double size,
+  bool outlined = true,
+  double? sourceStrokeRatio,
+}) {
+  if (size <= 0 || box.width <= 0 || box.height <= 0) return false;
+  final stroke = outlined
+      ? strokeWidthForSize(size, sourceStrokeRatio: sourceStrokeRatio)
+      : 0.0;
+  final inset = 4.0 + stroke;
+  final availW = box.width - inset;
+  final availH = box.height - inset;
+  if (availW <= 0 || availH <= 0) return false;
+  if (vertical) {
+    final spans = layoutVerticalSpans(region.text);
+    if (spans.isEmpty) return false;
+    final cells = spans.fold<int>(0, (sum, span) => sum + span.cells);
+    final pitch = columnPitchFor(size, stroke);
+    final columnW = columnWidthFor(size, stroke);
+    if (pitch > availH || columnW > availW) return false;
+    final perColumn = math.max(1, (availH / pitch).floor());
+    final columns = (cells / perColumn).ceil();
+    return columns * columnW <= availW;
+  }
+  final painter = _layoutBlock(
+    region.text,
+    size,
+    _fillStyle(const ui.Color(0xFF000000), size),
+    availW,
+  );
+  final fits = painter.height <= availH && painter.width <= availW;
+  painter.dispose();
+  return fits;
+}
+
+// ---------------------------------------------------------------------------
 // Fitting
 // ---------------------------------------------------------------------------
 
@@ -605,89 +799,30 @@ double _patchPlateCoverage(ui.Rect rect) {
 /// the answer is `(size: 0, fits: false)` — **not** the floor. The old version
 /// returned the 4px floor on failure, callers painted it anyway, and the page
 /// ended up with unreadable lettering or a half sentence cut off by the clip.
+///
+/// Every candidate size is tested with the outline that size would draw —
+/// heavier stroke, smaller lettering, which is the whole point of S4: a
+/// translation that only "fits" by leaving its stroke to overflow the box was
+/// never legible to begin with.
 ({double size, bool fits}) _fitRegion(
   TranslatedRegion region,
   ui.Rect box,
   bool vertical, {
   bool outlined = true,
+  double? sourceStrokeRatio,
 }) {
-  if (vertical) {
-    return _fitVerticalFontSize(
-      region.text,
-      box.width,
-      box.height,
-      lineHeight: region.lineHeight,
-    );
-  }
-  return _fitFontSize(
-    region.text,
-    box.width,
-    box.height,
-    lineHeight: region.lineHeight,
-    outlined: outlined,
-  );
-}
-
-/// Largest font size whose wrapped horizontal layout fits the box.
-///
-/// [lineHeight] is the original lettering's approximate size (px, 0 = unknown).
-/// When known it caps the glyph size so the translation stays close to the
-/// source scale — a small caption stays small instead of being blown up to fill
-/// the detected box. The detector's line box already spans the full line with
-/// leading and CJK glyphs fill the em, so the cap sits slightly *below* the box
-/// height (0.9x) to keep the translation from reading larger than the source.
-({double size, bool fits}) _fitFontSize(
-  String text,
-  double maxWidth,
-  double maxHeight, {
-  int lineHeight = 0,
-  bool outlined = true,
-}) {
-  var size = _upperBound(maxHeight, lineHeight);
+  var size = _upperBound(box.height, region.lineHeight);
   final floor = minReadableGlyphSize;
   while (size >= floor) {
-    final inset = _insetSize(size, outlined);
-    final availW = maxWidth - inset;
-    final availH = maxHeight - inset;
-    if (availW > 0 && availH > 0) {
-      final painter = _layoutBlock(
-        text,
-        size,
-        _fillStyle(const ui.Color(0xFF000000), size),
-        availW,
-      );
-      final fits = painter.height <= availH && painter.width <= availW;
-      painter.dispose();
-      if (fits) return (size: size, fits: true);
-    }
-    size *= 0.8;
-  }
-  return (size: 0, fits: false);
-}
-
-/// The same question for a column layout: is there a size at or above the
-/// legibility floor that runs the text down [maxHeight] in columns narrow
-/// enough for [maxWidth]?
-({double size, bool fits}) _fitVerticalFontSize(
-  String text,
-  double maxWidth,
-  double maxHeight, {
-  int lineHeight = 0,
-}) {
-  final spans = layoutVerticalSpans(text);
-  if (spans.isEmpty) return (size: 0, fits: false);
-  final cells = spans.fold<int>(0, (sum, span) => sum + span.cells);
-  var size = _upperBound(maxHeight, lineHeight);
-  final floor = minReadableGlyphSize;
-  while (size >= floor) {
-    final pitch = _columnPitch(size);
-    final columnW = _columnWidth(size);
-    final availH = maxHeight - 4.0;
-    final availW = maxWidth - 4.0;
-    if (pitch <= availH && columnW <= availW) {
-      final perColumn = math.max(1, (availH / pitch).floor());
-      final columns = (cells / perColumn).ceil();
-      if (columns * columnW <= availW) return (size: size, fits: true);
+    if (fitsRegionAt(
+      region,
+      box,
+      vertical: vertical,
+      size: size,
+      outlined: outlined,
+      sourceStrokeRatio: sourceStrokeRatio,
+    )) {
+      return (size: size, fits: true);
     }
     size *= 0.8;
   }
@@ -704,13 +839,358 @@ double _upperBound(double maxHeight, int lineHeight) {
   return math.max(10.0, math.min(cap, maxHeight * 0.8));
 }
 
-/// Cell pitch down a column: 15% leading, enough that two stacked ideographs
-/// read as separate cells without a visible gap.
-double _columnPitch(double size) => size * 1.15;
+// ---------------------------------------------------------------------------
+// Phase 11-S5: one size per bubble
+// ---------------------------------------------------------------------------
 
-/// Distance between two columns: a hair wider than a cell so neighbouring
-/// columns (and their outlines) do not touch.
-double _columnWidth(double size) => size * 1.2;
+/// Two boxes share a bubble when the clear gap between them is at most this
+/// many line heights (the shorter box's) — one line of breathing room between
+/// stacked lines of the same bubble, and far less than the space between
+/// separate bubbles.
+const double kGroupGapFactor = 0.55;
+
+/// Floor for the same test: never split lines that are only a few pixels
+/// apart just because the OCR boxes were short.
+const double kGroupMinGap = 6.0;
+
+/// How much of the narrower box's width the overlap must cover before
+/// vertical closeness counts as "same bubble": two captions at the bottom of
+/// *different* bubbles stacked in the page's y-range must not merge through
+/// a side-by-side layout.
+const double kGroupMinWidthOverlap = 0.3;
+
+/// Blocks whose source line heights differ by more than this factor are not
+/// the same lettering — a huge SFX word sitting on a small caption is two
+/// groups by definition, however close their boxes are.
+const double kGroupScaleTolerance = 0.4;
+
+/// Connected components of "looks like the same bubble".
+///
+/// Pure geometry over the boxes (indices into [boxes], groups ordered by
+/// first member). Pairwise link: stacked with a small vertical gap and real
+/// horizontal overlap, or inline with a small horizontal gap and near-full
+/// vertical overlap — plus a [sourceGlyphSizes] compatibility check so
+/// different lettering scales never merge.
+List<List<int>> clusterLayoutGroups({
+  required List<ui.Rect> boxes,
+  List<double?> sourceGlyphSizes = const [],
+  double gapFactor = kGroupGapFactor,
+  double minGap = kGroupMinGap,
+  double minOverlap = kGroupMinWidthOverlap,
+}) {
+  final n = boxes.length;
+  final parent = List<int>.generate(n, (i) => i);
+  int find(int x) {
+    while (parent[x] != x) {
+      parent[x] = parent[parent[x]];
+      x = parent[x];
+    }
+    return x;
+  }
+
+  for (var i = 0; i < n; i++) {
+    for (var j = i + 1; j < n; j++) {
+      if (!_sharesBubble(
+        boxes[i],
+        boxes[j],
+        sourceGlyphSizes.length > i ? sourceGlyphSizes[i] : null,
+        sourceGlyphSizes.length > j ? sourceGlyphSizes[j] : null,
+        gapFactor: gapFactor,
+        minGap: minGap,
+        minOverlap: minOverlap,
+      )) {
+        continue;
+      }
+      final ri = find(i), rj = find(j);
+      if (ri != rj) parent[rj] = ri;
+    }
+  }
+
+  final roots = <int, List<int>>{};
+  for (var i = 0; i < n; i++) {
+    (roots[find(i)] ??= <int>[]).add(i);
+  }
+  final groups = roots.values.toList()
+    ..sort((a, b) => a.first.compareTo(b.first));
+  return groups;
+}
+
+bool _sharesBubble(
+  ui.Rect a,
+  ui.Rect b,
+  double? sizeA,
+  double? sizeB, {
+  required double gapFactor,
+  required double minGap,
+  required double minOverlap,
+}) {
+  if (sizeA != null && sizeB != null && sizeA > 0 && sizeB > 0) {
+    final ratio = sizeA > sizeB ? sizeA / sizeB : sizeB / sizeA;
+    if (ratio > 1.0 + kGroupScaleTolerance) return false;
+  }
+  final base = math.min(a.height, b.height);
+  if (base <= 0) return false;
+  final reach = math.max(minGap, gapFactor * base);
+  // Stacked: close vertically, and wide enough side-by-side that a bubble
+  // sitting *next to* this one (same y, no x overlap) is not a neighbour.
+  final vGap = math.max(0.0, math.max(a.top, b.top) - math.min(a.bottom, b.bottom));
+  final xOverlap = math.min(a.right, b.right) - math.max(a.left, b.left);
+  if (vGap <= reach && xOverlap >= minOverlap * math.min(a.width, b.width)) {
+    return true;
+  }
+  // Inline: one visual line the detector split into pieces.
+  final hGap = math.max(0.0, math.max(a.left, b.left) - math.min(a.right, b.right));
+  final yOverlap = math.min(a.bottom, b.bottom) - math.max(a.top, b.top);
+  return hGap <= reach && yOverlap >= 0.75 * base;
+}
+
+/// The size every member of a group can be drawn at, or `null` when the
+/// group cannot agree above the legibility floor.
+///
+/// Starts at the largest member size and steps ×0.8 — the same ladder as the
+/// per-block search — down to the first size at which [fitsAll] (each member
+/// re-measured in its own box at this size) is true. Under a size-monotone
+/// fits predicate this always lands at or above the smallest member's own
+/// fitted size, so harmonising never pushes a block below what it chose for
+/// itself; [fitsAll] is *not* assumed monotone, which is why the descent, not
+/// a simple `min`, is the search, and why it can still refuse (`null`) rather
+/// than force a size one member would overflow — S1's keepOriginal stays
+/// reachable through the caller's reality gate.
+double? unifyGroupSize({
+  required List<double> soloSizes,
+  required bool Function(double size) fitsAll,
+  double? minReadable,
+}) {
+  if (soloSizes.isEmpty) return null;
+  final floor = minReadable ?? minReadableGlyphSize;
+  var size = soloSizes.reduce(math.max);
+  while (size >= floor) {
+    if (fitsAll(size)) return size;
+    size *= 0.8;
+  }
+  return null;
+}
+
+/// One page of placements with every bubble-sized group harmonised.
+///
+/// Only sizes shrink and only to sizes every member was independently
+/// measured to fit, so no [Placement] can flip from `shrinkToFit` to
+/// overflow, and a member that is already `keepOriginal` never drags its
+/// group down (it is not paintable, so it is not in any group). A group that
+/// cannot agree on a size keeps its members' own sizes — coordinated
+/// *upwards* is not on the table, coordinated *forcing* least of all.
+List<Placement> unifyPlacementGroups(
+  List<Placement> placements,
+  List<TranslatedRegion> regions, {
+  bool outlined = true,
+  double? minReadable,
+}) {
+  final paintable = placements.where((p) => p.paints).toList();
+  if (paintable.length < 2) return placements;
+  final groups = clusterLayoutGroups(
+    boxes: [for (final p in paintable) p.box],
+    sourceGlyphSizes: [
+      for (final p in paintable)
+        regions[p.index].lineHeight > 0
+            ? regions[p.index].lineHeight.toDouble()
+            : null,
+    ],
+  );
+  final result = placements.toList();
+  for (final group in groups) {
+    if (group.length < 2) continue;
+    final members = [for (final g in group) paintable[g]];
+    final unified = unifyGroupSize(
+      soloSizes: [for (final m in members) m.size],
+      minReadable: minReadable,
+      fitsAll: (size) => members.every(
+        (m) => fitsRegionAt(
+          regions[m.index],
+          m.box,
+          vertical: m.vertical,
+          size: size,
+          outlined: outlined,
+          sourceStrokeRatio: m.sourceStrokeRatio,
+        ),
+      ),
+    );
+    if (unified == null) continue;
+    final groupId = members.first.index;
+    for (final m in members) {
+      result[m.index] = m.sized(unified, groupId);
+    }
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 11-S4 probe: how thick is the lettering we are replacing?
+// ---------------------------------------------------------------------------
+
+/// Stroke weight of the source ink, measured from raw pixels — pure, no
+/// image I/O, so a unit test can hand it a synthetic bubble.
+///
+/// Pixels inside [box] are classified as ink when far enough (RGB distance
+/// over [inkDistance]) from [backgroundArgb] (0xAARRGGBB of the sampled
+/// bubble interior). One erosion pass then measures the stroke: a stroke of
+/// thickness t holds ≈ t × P ink pixels (P = midline length) and loses ≈ 2 × P
+/// of them to the pass (both edges), so t ≈ 2·ink/lost. The returned ratio is
+/// t relative to [referenceSizePx] — the source lettering's own size.
+///
+/// `ratio` is null when the sample cannot speak: too little ink to be
+/// lettering, an undifferentiated fill (erosion removes nothing), or a
+/// thickness implausible for glyph ink (outside 0.02–0.6 of the source size).
+/// A solid-filled *stem* (no outline at all) measures as its half-width,
+/// which is exactly what "this block's ink is heavy" should mean for the
+/// replacement's outline weight — the probe is a visual-weight meter, not a
+/// segmentation of text from its outline.
+({double? ratio, double thicknessPx, int inkArea}) estimateStrokeRatio({
+  required Uint8List rgba,
+  required int width,
+  required int height,
+  required IntRect box,
+  required int backgroundArgb,
+  required double referenceSizePx,
+  int maxSamples = 120000,
+  double inkDistance = 60,
+}) {
+  final empty = (ratio: null, thicknessPx: 0.0, inkArea: 0);
+  if (referenceSizePx < 4 || width < 2 || height < 2) return empty;
+  if (rgba.length < width * height * 4) return empty;
+  final left = box.left.clamp(0, math.max(0, width - 1)).toInt();
+  final top = box.top.clamp(0, math.max(0, height - 1)).toInt();
+  final right = box.right.clamp(left + 1, width).toInt();
+  final bottom = box.bottom.clamp(top + 1, height).toInt();
+  final bw = right - left, bh = bottom - top;
+  if (bw < 8 || bh < 8) return empty;
+
+  // Big blocks get a coarser grid; thickness scales back to real pixels.
+  final stride = bw * bh > maxSamples
+      ? math.max(1, math.sqrt(bw * bh / maxSamples).ceil())
+      : 1;
+  final gw = (bw - 1) ~/ stride + 1;
+  final gh = (bh - 1) ~/ stride + 1;
+  final ink = Uint8List(gw * gh);
+  // rawRgba bytes are R,G,B,A; background arrives as 0xAARRGGBB.
+  final br = (backgroundArgb >> 16) & 0xFF;
+  final bg = (backgroundArgb >> 8) & 0xFF;
+  final bb = backgroundArgb & 0xFF;
+  final limit = inkDistance * inkDistance;
+  var inkArea = 0;
+  for (var y = 0; y < gh; y++) {
+    final py = top + y * stride;
+    for (var x = 0; x < gw; x++) {
+      final i = ((py * width) + left + x * stride) * 4;
+      final dr = rgba[i] - br, dg = rgba[i + 1] - bg, db = rgba[i + 2] - bb;
+      if (dr * dr + dg * dg + db * db > limit) {
+        ink[y * gw + x] = 1;
+        inkArea++;
+      }
+    }
+  }
+  if (inkArea < 24) return empty;
+
+  var boundary = 0;
+  for (var y = 0; y < gh; y++) {
+    for (var x = 0; x < gw; x++) {
+      final g = y * gw + x;
+      if (ink[g] == 0) continue;
+      final edge = x == 0 ||
+          y == 0 ||
+          x == gw - 1 ||
+          y == gh - 1 ||
+          ink[g - 1] == 0 ||
+          ink[g + 1] == 0 ||
+          ink[g - gw] == 0 ||
+          ink[g + gw] == 0;
+      if (edge) boundary++;
+    }
+  }
+  if (boundary == 0) return empty; // a fill with no shape inside it at all
+
+  final thicknessPx = 2 * inkArea / boundary * stride;
+  final ratio = thicknessPx / referenceSizePx;
+  if (ratio < 0.02 || ratio > 0.6) {
+    return (ratio: null, thicknessPx: thicknessPx, inkArea: inkArea);
+  }
+  return (ratio: ratio, thicknessPx: thicknessPx, inkArea: inkArea);
+}
+
+/// Measure every block's source outline weight in one pass over the page.
+///
+/// Reads the *original* bytes (in the smart erase modes [decoded] has already
+/// been cleaned, so its pixels would report "no ink" everywhere), scales them
+/// to the working resolution, and runs [estimateStrokeRatio] on each region's
+/// tight source area. Anything unreadable yields `{}` — the renderer then
+/// falls back to [kDefaultStrokeRatio] per block, exactly the pre-S4
+/// behaviour. Never throws: a broken probe must not take a page down.
+Future<Map<int, double>> detectStrokeRatios(
+  Uint8List originalBytes,
+  RgbaImage decoded,
+  List<TranslatedRegion> regions,
+) async {
+  if (originalBytes.isEmpty || regions.isEmpty) return const {};
+  final pristine = await _tryDecodeScaled(originalBytes, decoded);
+  if (pristine == null) return const {};
+  try {
+    final data = await pristine.toByteData(format: ui.ImageByteFormat.rawRgba);
+    if (data == null) return const {};
+    final bytes = data.buffer.asUint8List();
+    final out = <int, double>{};
+    for (var i = 0; i < regions.length; i++) {
+      final region = regions[i];
+      final sample = _sourceSampleOf(region);
+      if (sample == null) continue;
+      final reference = region.lineHeight > 0
+          ? region.lineHeight.toDouble()
+          : sample.height.toDouble();
+      final est = estimateStrokeRatio(
+        rgba: bytes,
+        width: pristine.width,
+        height: pristine.height,
+        box: sample,
+        backgroundArgb: region.backgroundColor,
+        referenceSizePx: reference,
+      );
+      final ratio = est.ratio;
+      if (ratio != null) out[i] = ratio;
+    }
+    if (out.isNotEmpty) {
+      final sorted = out.values.toList()..sort();
+      Log.info(
+        'OCR Layout',
+        'stroke probe: ${out.length} of ${regions.length} blocks measured,'
+        ' median ratio ${sorted[sorted.length ~/ 2].toStringAsFixed(3)}',
+      );
+    }
+    return out;
+  } catch (e) {
+    Log.warning('OCR Layout', 'stroke probe failed: $e');
+    return const {};
+  } finally {
+    pristine.dispose();
+  }
+}
+
+/// Union of a region's per-line source boxes — where the original glyphs
+/// actually are, not the looser layout rect the translation may grow into.
+IntRect? _sourceSampleOf(TranslatedRegion region) {
+  int? left, top, right, bottom;
+  void add(IntRect r) {
+    if (r.width <= 0 || r.height <= 0) return;
+    left = left == null ? r.left : math.min(left!, r.left);
+    top = top == null ? r.top : math.min(top!, r.top);
+    right = right == null ? r.right : math.max(right!, r.right);
+    bottom = bottom == null ? r.bottom : math.max(bottom!, r.bottom);
+  }
+
+  add(region.eraseRect);
+  for (final rect in region.eraseRects) {
+    add(rect);
+  }
+  if (left == null) return region.rect.width > 0 && region.rect.height > 0 ? region.rect : null;
+  return IntRect(left!, top!, right!, bottom!);
+}
 
 // ---------------------------------------------------------------------------
 // Painting
@@ -887,18 +1367,25 @@ void _placeText(
         rect,
         outline: outline,
         size: placement.size,
+        sourceStrokeRatio: placement.sourceStrokeRatio,
       );
       return;
     }
     final size = placement.size;
-    final inset = _insetSize(size, outline != null);
+    final stroke = strokeWidthForSize(
+      size,
+      sourceStrokeRatio: placement.sourceStrokeRatio,
+    );
+    // The same reservation the fit search made at this size, down to the
+    // px: what was measured is what is painted.
+    final inset = strokeInset(size, outline != null, sourceStrokeRatio: placement.sourceStrokeRatio);
     final availW = math.max(_minLayoutWidth, rect.width - inset);
     if (outline != null) {
       _paintBlock(
         canvas,
         region.text,
         size,
-        _strokeStyle(outline, size),
+        _strokeStyle(outline, size, stroke),
         availW,
         rect,
       );
@@ -939,16 +1426,6 @@ void _paintBlock(
   painter.dispose();
 }
 
-/// Stroke width scales with the glyph so the outline reads at any size.
-double _strokeWidth(double fontSize) => math.max(1.5, fontSize * 0.14);
-
-/// What a laid-out block loses to inner padding plus the outline that extends
-/// past the glyph box. Measured by the fit and applied by the paint with the
-/// same numbers — a stroke hanging outside the measured box is how lettering
-/// used to get clipped, so the search reserves room for it up front.
-double _insetSize(double fontSize, bool outlined) =>
-    4.0 + (outlined ? _strokeWidth(fontSize) : 0.0);
-
 TextStyle _fillStyle(ui.Color color, double fontSize) => TextStyle(
   color: color,
   fontSize: fontSize,
@@ -956,13 +1433,20 @@ TextStyle _fillStyle(ui.Color color, double fontSize) => TextStyle(
   fontWeight: FontWeight.w500,
 );
 
-TextStyle _strokeStyle(ui.Color outline, double fontSize) => TextStyle(
+/// The outline paint for one glyph run. [strokeWidth] comes from
+/// [strokeWidthForSize] — the same number the fit budget reserved — and the
+/// round join keeps the ring continuous around corners instead of spiking.
+TextStyle _strokeStyle(
+  ui.Color outline,
+  double fontSize,
+  double strokeWidth,
+) => TextStyle(
   fontSize: fontSize,
   height: 1.2,
   fontWeight: FontWeight.w500,
   foreground: ui.Paint()
     ..style = ui.PaintingStyle.stroke
-    ..strokeWidth = _strokeWidth(fontSize)
+    ..strokeWidth = strokeWidth
     ..strokeJoin = ui.StrokeJoin.round
     ..color = outline,
 );
@@ -1063,16 +1547,27 @@ void _drawVerticalText(
   ui.Rect rect, {
   required double size,
   ui.Color? outline,
+  double? sourceStrokeRatio,
 }) {
   final spans = layoutVerticalSpans(text);
   if (spans.isEmpty || size <= 0) return;
 
-  final availH = rect.height - 4.0;
-  final pitch = _columnPitch(size);
-  final columnW = _columnWidth(size);
+  // Column geometry from the same numbers [fitsRegionAt] measured the fit
+  // with — before S4 the outline extended past every reservation the search
+  // had made and the clip ate whatever crossed the box edge.
+  final stroke = outline == null
+      ? 0.0
+      : strokeWidthForSize(size, sourceStrokeRatio: sourceStrokeRatio);
+  final inset = 4.0 + stroke;
+  final availH = rect.height - inset;
+  final availW = rect.width - inset;
+  if (availH <= 0 || availW <= 0) return;
+  final pitch = columnPitchFor(size, stroke);
+  final columnW = columnWidthFor(size, stroke);
   final perColumn = math.max(1, (availH / pitch).floor());
   final cells = spans.fold<int>(0, (sum, span) => sum + span.cells);
   final columns = (cells / perColumn).ceil();
+  if (columns * columnW > availW) return; // mirrors the fit; never force
 
   final blockW = columns * columnW;
   final blockH = math.min(availH, perColumn * pitch);
@@ -1096,6 +1591,7 @@ void _drawVerticalText(
       size,
       color,
       outline,
+      sourceStrokeRatio,
     );
     cell += span.cells;
   }
@@ -1110,6 +1606,7 @@ void _paintVerticalSpan(
   double size,
   ui.Color fill,
   ui.Color? outline,
+  double? sourceStrokeRatio,
 ) {
   // Tate-chu-yoko: the run keeps its horizontal shape, so it is scaled down
   // until `runeCount` glyphs fit into the cells it was allotted.
@@ -1117,6 +1614,9 @@ void _paintVerticalSpan(
       ? math.min(1.0, (slot * 0.96) / math.max(1.0, size * span.runeCount))
       : 1.0;
   final glyphSize = size * scale;
+  final stroke = outline == null
+      ? 0.0
+      : strokeWidthForSize(glyphSize, sourceStrokeRatio: sourceStrokeRatio);
 
   canvas.save();
   canvas.translate(center.dx + span.dxRatio * size, center.dy + span.dyRatio * size);
@@ -1126,8 +1626,11 @@ void _paintVerticalSpan(
       canvas,
       span.text,
       glyphSize,
-      _strokeStyle(outline, glyphSize).copyWith(height: 1.0),
-      outline.toARGB32(),
+      _strokeStyle(outline, glyphSize, stroke).copyWith(height: 1.0),
+      // The weight must be part of the key: two blocks of one page can share
+      // glyph, size and colour yet carry different source strokes.
+      '${span.text}|${glyphSize.toStringAsFixed(2)}'
+      '|${outline.toARGB32()}|sw${stroke.toStringAsFixed(2)}',
     );
   }
   _paintCachedGlyph(
@@ -1135,7 +1638,7 @@ void _paintVerticalSpan(
     span.text,
     glyphSize,
     _fillStyle(fill, glyphSize).copyWith(height: 1.0),
-    fill.toARGB32(),
+    '${span.text}|${glyphSize.toStringAsFixed(2)}|${fill.toARGB32()}',
   );
   canvas.restore();
 }
@@ -1145,11 +1648,10 @@ void _paintCachedGlyph(
   String glyph,
   double size,
   TextStyle style,
-  int colorKey,
+  String cacheKey,
 ) {
   final painter = _verticalPainters.obtain(
-    // `TextStyle` compares its `Paint` by identity, so it can never be the key.
-    '$glyph|${size.toStringAsFixed(2)}|$colorKey',
+    cacheKey,
     () {
       var painter = TextPainter(
         text: TextSpan(text: glyph, style: style),
