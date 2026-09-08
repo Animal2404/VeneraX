@@ -452,13 +452,32 @@ abstract class TranslationModels {
   ///
   /// CRITICAL (F3): When [gpuEpActive] is false, components with [requiresGpuEp]
   /// are NEVER returned, guaranteeing safe CPU fallback without crashing.
+  /// Conservative "is a GPU execution provider even available here?" answer
+  /// for the window before the first session exists: checks the loaded
+  /// onnxruntime.dll for the DML/CUDA entry points. Never throws — a failed
+  /// probe means "assume CPU", which is the safe direction.
+  static bool gpuEpLikely() {
+    try {
+      final probe = probeOrtRuntime();
+      return probe.hasDmlSymbol || probe.hasCudaSymbol;
+    } catch (_) {
+      return false;
+    }
+  }
+
   static WorkerModelPaths workerPaths({
     ModelTier? tier,
     bool? gpuEpActive,
   }) {
     tier ??= currentModelTier;
-    gpuEpActive ??= (TranslationWorker.instance.lastReport?.active != null &&
-        TranslationWorker.instance.lastReport?.active != OrtEpKind.cpu);
+    // Three-stage resolution (plan D-3): the live report if a session has run,
+    // otherwise a cheap symbol probe. The old two-stage version assumed CPU
+    // whenever no report existed yet, so the *first* request on a GPU machine
+    // always picked the fp32 components and the FP16/high path could never be
+    // selected before something else happened to populate the report.
+    gpuEpActive ??= TranslationWorker.instance.lastReport != null
+        ? TranslationWorker.instance.lastReport!.active != OrtEpKind.cpu
+        : gpuEpLikely();
 
     ModelComponent? pickRecZh() {
       final wantHigh = tier == ModelTier.high &&

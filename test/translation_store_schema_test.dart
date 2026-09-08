@@ -194,6 +194,79 @@ void main() {
     });
   });
 
+  group('TranslationStore.migrateOcrSchema', () {
+    late CommonDatabase ocrDb;
+
+    setUp(() {
+      ocrDb = sqlite3.open(':memory:');
+    });
+    tearDown(() => ocrDb.dispose());
+
+    List<String> ocrColumns() => ocrDb
+        .select("PRAGMA table_info(translated_ocr_page);")
+        .map((r) => r['name'] as String)
+        .toList();
+
+    test('backfills the fingerprint column on a pre-Phase-8 database', () {
+      // Exactly what a user upgrading from 2.3.2 has on disk.
+      ocrDb.execute("""
+        create table translated_ocr_page (
+          cache_key text primary key,
+          ocr_data text not null,
+          time int not null
+        );
+      """);
+      ocrDb.execute(
+        "insert into translated_ocr_page values (?, ?, ?);",
+        ['k1', '{"pending":[],"ready":[],"votes":{}}', 1],
+      );
+
+      TranslationStore.migrateOcrSchema(ocrDb);
+
+      expect(ocrColumns(), contains('fingerprint'));
+      // The old row survives structurally but carries the empty fingerprint,
+      // which matches no current fingerprint -> it is re-recognised, not served.
+      final row = ocrDb.select(
+        "select fingerprint from translated_ocr_page where cache_key = ?;",
+        ['k1'],
+      ).single;
+      expect(row['fingerprint'], '');
+    });
+
+    test('is a no-op when the column already exists', () {
+      ocrDb.execute("""
+        create table translated_ocr_page (
+          cache_key text primary key,
+          ocr_data text not null,
+          time int not null,
+          fingerprint text not null default ''
+        );
+      """);
+      ocrDb.execute(
+        "insert into translated_ocr_page values (?, ?, ?, ?);",
+        ['k1', '{}', 1, 'abc'],
+      );
+
+      TranslationStore.migrateOcrSchema(ocrDb);
+      TranslationStore.migrateOcrSchema(ocrDb); // idempotent
+
+      expect(ocrColumns().where((c) => c == 'fingerprint').length, 1);
+      expect(
+        ocrDb
+            .select("select fingerprint from translated_ocr_page;")
+            .single['fingerprint'],
+        'abc',
+      );
+    });
+
+    test('does nothing when the table is absent (fresh database)', () {
+      // init() creates the table before migrating; a missing table must not
+      // make the migration throw.
+      TranslationStore.migrateOcrSchema(ocrDb);
+      expect(ocrColumns(), isEmpty);
+    });
+  });
+
   // Mirrors TranslationStore.countByPrefix against a raw in-memory db (the
   // store itself needs DatabaseGateway + IO). Guards the two properties the
   // chapter-picker "already translated" fallback relies on: a chapter prefix

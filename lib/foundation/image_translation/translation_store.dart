@@ -114,6 +114,7 @@ class TranslationStore with ChangeNotifier {
     _db.execute(_createIndexTableSql);
     _db.execute(_createOcrTableSql);
     _migrateSchema();
+    migrateOcrSchema(_db);
     migrateLegacyKeys(_db);
     _backfillChapterIndex();
     isInitialized = true;
@@ -221,7 +222,8 @@ class TranslationStore with ChangeNotifier {
       create table if not exists translated_ocr_page (
         cache_key text primary key,
         ocr_data text not null,
-        time int not null
+        time int not null,
+        fingerprint text not null default ''
       );
     """;
 
@@ -298,6 +300,25 @@ class TranslationStore with ChangeNotifier {
   };
 
   void _migrateSchema() => migrateSchema(_db);
+
+  /// Adds the `fingerprint` column to an OCR table created by an earlier build.
+  ///
+  /// Old rows keep `fingerprint = ''`, which matches no current fingerprint,
+  /// so they stop being read immediately and get overwritten on the next
+  /// `putOcr`. That is the point: a row produced by a different model tier,
+  /// model file or execution provider must never be served as if it were
+  /// current (plan D-2).
+  @visibleForTesting
+  static void migrateOcrSchema(CommonDatabase db) {
+    final rows = db.select("PRAGMA table_info(translated_ocr_page);");
+    if (rows.isEmpty) return; // created fresh by _createOcrTableSql
+    final existing = rows.map((c) => c["name"] as String).toSet();
+    if (!existing.contains('fingerprint')) {
+      db.execute(
+        "alter table translated_ocr_page add column fingerprint text not null default '';",
+      );
+    }
+  }
 
   /// Normalize the on-disk `translated_page` table to our canonical schema — a
   /// restore/merge can meet a file a foreign app happens to name the same.
@@ -388,28 +409,40 @@ class TranslationStore with ChangeNotifier {
   }
 
   static const _insertReplaceOcrSql = """
-    insert or replace into translated_ocr_page (cache_key, ocr_data, time)
-    values (?, ?, ?);
+    insert or replace into translated_ocr_page
+      (cache_key, ocr_data, time, fingerprint)
+    values (?, ?, ?, ?);
   """;
 
   /// Stores the intermediate [ocr] result of a page before LLM translation.
-  void putOcr(String cacheKey, PageOcr ocr) {
+  ///
+  /// [fingerprint] identifies the model set and pipeline that produced it;
+  /// see [getOcr].
+  void putOcr(String cacheKey, PageOcr ocr, {required String fingerprint}) {
     if (!isInitialized) return;
     var timestamp = DateTime.now().millisecondsSinceEpoch;
     _db.execute(_insertReplaceOcrSql, [
       cacheKey,
       jsonEncode(ocr.toJson()),
       timestamp,
+      fingerprint,
     ]);
   }
 
-  /// The cached [PageOcr] for a page, or null when never OCR'd or evicted.
-  PageOcr? getOcr(String cacheKey) {
+  /// The cached [PageOcr] for [cacheKey], or null when it was never produced
+  /// **by this exact model set / tier / execution provider**.
+  ///
+  /// Matching on the fingerprint is what stops a page OCR'd with the fast
+  /// model from being served after the user switches to the high-accuracy one
+  /// (plan D-2). Rows written before the column existed carry `''` and never
+  /// match, so they are re-recognised once and then overwritten.
+  PageOcr? getOcr(String cacheKey, {required String fingerprint}) {
     if (!isInitialized) return null;
     try {
       var rows = _db.select(
-        "select ocr_data from translated_ocr_page where cache_key = ?;",
-        [cacheKey],
+        "select ocr_data from translated_ocr_page "
+        "where cache_key = ? and fingerprint = ?;",
+        [cacheKey, fingerprint],
       );
       if (rows.isEmpty) return null;
       var data = jsonDecode(rows.first["ocr_data"] as String);
@@ -423,13 +456,14 @@ class TranslationStore with ChangeNotifier {
     }
   }
 
-  /// Whether intermediate OCR results already exist for [cacheKey].
-  bool hasOcr(String cacheKey) {
+  /// Whether an OCR result produced by **this** model set exists for [cacheKey].
+  bool hasOcr(String cacheKey, {required String fingerprint}) {
     if (!isInitialized) return false;
     try {
       var rows = _db.select(
-        "select 1 from translated_ocr_page where cache_key = ? limit 1;",
-        [cacheKey],
+        "select 1 from translated_ocr_page "
+        "where cache_key = ? and fingerprint = ? limit 1;",
+        [cacheKey, fingerprint],
       );
       return rows.isNotEmpty;
     } catch (_) {

@@ -70,5 +70,13 @@ class TranslationConfig {
   // Generation 2 stores per-line erase rectangles and uses stricter OCR block
   // grouping. Reusing generation-1 rows would keep their broad erase boxes and
   // could still remove artwork even though the renderer itself was fixed.
-  String get cachePrefix => 'pageTranslation@2@$sourceLang>$targetLang@';
+  String get cachePrefix =>
+      'pageTranslation@$kOcrSchemaGeneration@$sourceLang>$targetLang@';
 }
+
+/// Cache generation for the OCR pipeline, shared by the rendered-page key
+/// ([TranslationConfig.cachePrefix]) and the OCR-intermediate fingerprint
+/// (`ocr_fingerprint.dart`). Bump it when detection, grouping, padding or
+/// decode semantics change; keeping the two in one constant is what stops the
+/// rendered cache and the intermediate cache from disagreeing.
+const int kOcrSchemaGeneration = 2;

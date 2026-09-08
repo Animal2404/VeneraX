@@ -6,6 +6,8 @@ import 'package:flutter/painting.dart';
 import 'package:venera/foundation/appdata.dart';
 import 'package:venera/foundation/cache_manager.dart';
 import 'package:venera/foundation/image_translation/llm_translator.dart';
+import 'package:venera/foundation/image_translation/ocr_fingerprint.dart';
+import 'package:venera/foundation/image_translation/ort_capabilities.dart';
 import 'package:venera/foundation/image_translation/rate_limiter.dart';
 import 'package:venera/foundation/image_translation/translation_config.dart';
 import 'package:venera/foundation/image_translation/translation_models.dart';
@@ -13,6 +15,7 @@ import 'package:venera/foundation/image_translation/translation_performance_conf
 import 'package:venera/foundation/image_translation/translation_pipeline.dart';
 import 'package:venera/foundation/image_translation/translation_store.dart';
 import 'package:venera/foundation/image_translation/translation_types.dart';
+import 'package:venera/foundation/image_translation/translation_worker.dart';
 import 'package:venera/foundation/log.dart';
 import 'package:venera/foundation/source_platform.dart';
 import 'package:venera/utils/io.dart';
@@ -319,6 +322,25 @@ class ImageTranslationService with ChangeNotifier {
     return '${chapterScopePrefix(sourceKey, cid, eid)}$imageKey';
   }
 
+  /// Fingerprint of the OCR pipeline and model set currently in effect.
+  ///
+  /// Every reader and writer of `translated_ocr_page` goes through here so a
+  /// tier switch, a swapped model file or a CPU↔GPU change cannot keep serving
+  /// stale recognition results (plan D-2). [effectiveLang] must be the
+  /// *resolved* language — passing `auto` through would defeat the purpose.
+  static String ocrFingerprintFor(String effectiveLang) {
+    return ocrFingerprintOf(
+      OcrInputs(
+        schemaGen: kOcrSchemaGeneration,
+        effectiveLang: effectiveLang,
+        tier: TranslationModels.currentModelTier,
+        epKind: TranslationWorker.instance.lastReport?.active ??
+            OrtEpKind.cpu,
+        componentStamps: componentStampsFor(TranslationModels.workerPaths()),
+      ),
+    );
+  }
+
   /// Removes the rendered-image cache AND the durable stored text for every
   /// page under [scopePrefix], so the next view/pre-translate re-runs from
   /// scratch. Also clears the in-memory "done/empty/failed" markers for those
@@ -599,6 +621,9 @@ class ImageTranslationService with ChangeNotifier {
     final perf = TranslationPerformanceConfig.effective;
 
     // Stage 1 — resolve each page as far as possible without the LLM.
+    // Computed once per group: it stats the selected model files, and every
+    // reader of the OCR cache must agree on the same value (plan §5.3).
+    final ocrFp = ocrFingerprintFor(sourceLang);
     var ocrNeededIndices = <int>[];
     for (var i = 0; i < pages.length; i++) {
       if (shouldCancel?.call() ?? false) throw const PipelineCanceled();
@@ -616,7 +641,10 @@ class ImageTranslationService with ChangeNotifier {
           regionsOf[i] = stored;
           continue;
         }
-        var cachedOcr = TranslationStore().getOcr(p.cacheKey);
+        var cachedOcr = TranslationStore().getOcr(
+          p.cacheKey,
+          fingerprint: ocrFp,
+        );
         if (cachedOcr != null) {
           pendingOcr[i] = cachedOcr;
           freshOcr[i] = true;

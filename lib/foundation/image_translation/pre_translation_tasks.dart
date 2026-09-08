@@ -805,6 +805,9 @@ class PreTranslationTaskManager with ChangeNotifier {
     final store = TranslationStore();
     final perf = TranslationPerformanceConfig.effective;
     final sourceLang = service.effectiveSourceFor(task.comicKey, task.config);
+    // One fingerprint for the whole sweep: it stats the selected model files,
+    // and every OCR-cache reader must agree on the same value (plan §5.3).
+    final ocrFp = ImageTranslationService.ocrFingerprintFor(sourceLang);
 
     // 1. Identify which page indices still need OCR
     final ocrNeeded = <int>[];
@@ -823,7 +826,7 @@ class PreTranslationTaskManager with ChangeNotifier {
       if (store.get(cacheKey) != null) {
         continue;
       }
-      if (store.hasOcr(cacheKey)) {
+      if (store.hasOcr(cacheKey, fingerprint: ocrFp)) {
         continue;
       }
       ocrNeeded.add(i);
@@ -882,7 +885,11 @@ class PreTranslationTaskManager with ChangeNotifier {
             );
             for (var c = 0; c < chunkData.length; c++) {
               if (c < results.length && !results[c].hasError) {
-                store.putOcr(chunkData[c].cacheKey, results[c]);
+                store.putOcr(
+                  chunkData[c].cacheKey,
+                  results[c],
+                  fingerprint: ocrFp,
+                );
               }
             }
           } catch (e, s) {
