@@ -10,6 +10,7 @@ import 'package:venera/foundation/comic_source/comic_source.dart';
 import 'package:venera/foundation/comic_type.dart';
 import 'package:venera/foundation/image_translation/ordered_group_committer.dart';
 import 'package:venera/foundation/image_translation/ort_capabilities.dart';
+import 'package:venera/foundation/image_translation/page_prefetcher.dart';
 import 'package:venera/foundation/image_translation/rate_limiter.dart';
 import 'package:venera/foundation/image_translation/translation_config.dart';
 import 'package:venera/foundation/image_translation/translation_models.dart';
@@ -848,57 +849,82 @@ class PreTranslationTaskManager with ChangeNotifier {
     try {
       final chunkSize = math.max<int>(1, perf.pagesPerOcrCall);
       final pipeline = service.pipeline;
+      // Fetch ahead while the GPU is busy, instead of alternating download and
+      // inference per chunk (plan D-7). Concurrency still flows through
+      // `_fetchPageBytes`, which holds the per-source rate limit, so no second
+      // uncoordinated gate is introduced here.
+      final prefetcher = PagePrefetcher(
+        depth: (perf.imageConcurrency * 2).clamp(2, 8),
+        fetch: (idx) => _fetchPageBytes(task, chapter.eid, pageKeys[idx]),
+      );
+      final pending = <({int index, String cacheKey, Uint8List bytes})>[];
+      var processed = 0;
 
-      for (var i = 0; i < ocrNeeded.length; i += chunkSize) {
+      Future<void> runChunk(
+        List<({int index, String cacheKey, Uint8List bytes})> chunkData,
+      ) async {
+        if (chunkData.isEmpty) return;
+        try {
+          final results = await pipeline.ocrPages(
+            chunkData.map((e) => e.bytes).toList(),
+            sourceLang: sourceLang,
+            targetLang: task.config.targetLang,
+          );
+          for (var c = 0; c < chunkData.length; c++) {
+            if (c < results.length && !results[c].hasError) {
+              store.putOcr(
+                chunkData[c].cacheKey,
+                results[c],
+                fingerprint: ocrFp,
+              );
+            }
+          }
+        } catch (e, s) {
+          Log.warning('Pre-translation', 'GPU OCR sweep chunk failed: $e\n$s');
+        }
+        processed += chunkData.length;
+        ocrSlot.completedPages = processed * 0.55;
+        _notifyActivity();
+      }
+
+      await for (final page in prefetcher.run(ocrNeeded)) {
         if (_canceledIds.contains(task.id) || chapter.canceled) return;
         await _waitWhilePaused(task);
         if (_canceledIds.contains(task.id) || chapter.canceled) return;
-
-        final chunkIndices = ocrNeeded.sublist(
-          i,
-          math.min<int>(i + chunkSize, ocrNeeded.length),
-        );
-
-        final chunkData = <({int index, String cacheKey, Uint8List bytes})>[];
-        for (final idx in chunkIndices) {
-          final imageKey = pageKeys[idx];
-          final cacheKey = ImageTranslationService.cacheKeyFor(
+        final fetchError = page.error;
+        if (fetchError != null) {
+          // Stage 2 still visits this page (it has no OCR row), so nothing is
+          // lost — but the sweep must say so instead of going quiet (D-12).
+          Log.warning(
+            'Pre-translation',
+            'Fetch failed in OCR sweep (page ${page.index}): $fetchError',
+          );
+          processed++;
+          ocrSlot.completedPages = processed * 0.55;
+          _notifyActivity();
+          continue;
+        }
+        final imageKey = pageKeys[page.index];
+        pending.add((
+          index: page.index,
+          cacheKey: ImageTranslationService.cacheKeyFor(
             imageKey,
             task.sourceKey,
             task.cid,
             chapter.eid,
-          );
-          try {
-            final bytes = await _fetchPageBytes(task, chapter.eid, imageKey);
-            chunkData.add((index: idx, cacheKey: cacheKey, bytes: bytes));
-          } catch (e, s) {
-            Log.warning('Pre-translation', 'Fetch failed in OCR sweep: $e\n$s');
-          }
+          ),
+          bytes: page.bytes!,
+        ));
+        if (pending.length >= chunkSize) {
+          await runChunk(List.of(pending));
+          pending.clear();
         }
-
-        if (chunkData.isNotEmpty) {
-          try {
-            final results = await pipeline.ocrPages(
-              chunkData.map((e) => e.bytes).toList(),
-              sourceLang: sourceLang,
-              targetLang: task.config.targetLang,
-            );
-            for (var c = 0; c < chunkData.length; c++) {
-              if (c < results.length && !results[c].hasError) {
-                store.putOcr(
-                  chunkData[c].cacheKey,
-                  results[c],
-                  fingerprint: ocrFp,
-                );
-              }
-            }
-          } catch (e, s) {
-            Log.warning('Pre-translation', 'GPU OCR sweep chunk failed: $e\n$s');
-          }
-        }
-
-        ocrSlot.completedPages = (i + chunkIndices.length) * 0.55;
-        _notifyActivity();
+      }
+      // The tail is a real chunk. Dropping it would silently skip the last
+      // pages of every chapter whose length is not a multiple of chunkSize.
+      if (pending.isNotEmpty) {
+        await runChunk(List.of(pending));
+        pending.clear();
       }
     } finally {
       activity?.groups.remove(-1);

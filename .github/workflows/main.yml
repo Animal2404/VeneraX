@@ -49,7 +49,7 @@ jobs:
       - name: Run unit tests
         run: |
           flutter pub get
-          flutter test test/ocr_batching_test.dart test/ocr_pages_batch_test.dart test/ort_capabilities_test.dart test/native_api_guard_test.dart test/translation_performance_config_test.dart test/translation_worker_policy_test.dart test/translation_store_schema_test.dart test/pre_translation_activity_test.dart test/pre_translation_chapter_test.dart test/ordered_group_committer_test.dart test/guide_document_test.dart test/golden_ocr_corpus_test.dart test/init_mixin_test.dart test/ocr_fingerprint_test.dart
+          flutter test test/ocr_batching_test.dart test/ocr_pages_batch_test.dart test/ort_capabilities_test.dart test/native_api_guard_test.dart test/translation_performance_config_test.dart test/translation_worker_policy_test.dart test/translation_store_schema_test.dart test/pre_translation_activity_test.dart test/pre_translation_chapter_test.dart test/ordered_group_committer_test.dart test/guide_document_test.dart test/golden_ocr_corpus_test.dart test/init_mixin_test.dart test/ocr_fingerprint_test.dart test/page_prefetcher_test.dart
       # test/golden_ocr_corpus_test.dart enforces the corpus (presence, licence,
       # size budget). Timing is deliberately NOT asserted: these runners have no
       # GPU, and a GPU benchmark on a CPU runner measures nothing (plan §3.8).
