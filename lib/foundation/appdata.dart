@@ -167,6 +167,9 @@ class Appdata with Init {
     "imageTranslationOcrWorkers",
     "imageTranslationImageConcurrency",
     "imageTranslationLlmConcurrency",
+    "imageTranslationOcrDetBatch",
+    "imageTranslationOcrRecBatch",
+    "imageTranslationPagesPerOcrCall",
   ];
 
   @visibleForTesting
@@ -545,6 +548,7 @@ class Settings with ChangeNotifier {
     'imageTranslationModelQuality': 'fast', // fast, high
     'imageTranslationOcrDetBatch': 1,
     'imageTranslationOcrRecBatch': 1,
+    'imageTranslationPagesPerOcrCall': 2,
   };
 
   operator [](String key) {

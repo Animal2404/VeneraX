@@ -1179,9 +1179,19 @@ class _ReaderSettingsState extends State<ReaderSettings> {
                   settingsIndex: "imageTranslationOcrRecBatch",
                   interval: 1,
                   min: 1,
-                  max: 8,
+                  max: App.isDesktop ? 32 : 4,
                   onChanged: () {
                     _markTranslationCustom("imageTranslationOcrRecBatch");
+                  },
+                ),
+                _SliderSetting(
+                  title: "Pages per OCR call".tl,
+                  settingsIndex: "imageTranslationPagesPerOcrCall",
+                  interval: 1,
+                  min: 1,
+                  max: 8,
+                  onChanged: () {
+                    _markTranslationCustom("imageTranslationPagesPerOcrCall");
                   },
                 ),
               ],
@@ -1224,6 +1234,14 @@ class _ReaderSettingsState extends State<ReaderSettings> {
               actionTitle: "Manage".tl,
               callback: () => context.to(
                 () => TranslationModelsPage(sourceLang: _effectiveSourceLang()),
+              ),
+            ),
+            _CallbackSetting(
+              title: "Inference diagnostics".tl,
+              subtitle: "View execution provider, input shapes, and OCR performance logs".tl,
+              actionTitle: "View".tl,
+              callback: () => context.to(
+                () => const TranslationDiagnosticsPage(),
               ),
             ),
             _CallbackSetting(

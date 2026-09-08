@@ -1,5 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:venera/foundation/appdata.dart';
+import 'package:venera/foundation/image_translation/ort_capabilities.dart';
 import 'package:venera/foundation/image_translation/translation_performance_config.dart';
 import 'package:venera/foundation/image_translation/pre_translation_tasks.dart';
 
@@ -124,6 +125,44 @@ void main() {
     );
   });
 
+  test('GPU EP clamps pre-translation pipeline concurrency to at most 2', () {
+    var performance = TranslationPerformanceConfig.valuesFor(
+      TranslationPerformancePreset.fast,
+      isDesktop: true,
+    );
+    expect(performance.llmConcurrency, 4);
+    expect(
+      PreTranslationTaskManager.pipelineConcurrencyFor(
+        performance,
+        isMobile: false,
+        sourceLang: 'ja',
+        hasJapaneseModel: true,
+        ep: OrtEpKind.directml,
+      ),
+      2,
+    );
+    expect(
+      PreTranslationTaskManager.pipelineConcurrencyFor(
+        performance,
+        isMobile: false,
+        sourceLang: 'ja',
+        hasJapaneseModel: true,
+        ep: OrtEpKind.cuda,
+      ),
+      2,
+    );
+    expect(
+      PreTranslationTaskManager.pipelineConcurrencyFor(
+        performance,
+        isMobile: false,
+        sourceLang: 'ja',
+        hasJapaneseModel: true,
+        ep: OrtEpKind.cpu,
+      ),
+      4,
+    );
+  });
+
   test('performance tuning is excluded from cross-device sync', () {
     var disabled = Appdata.syncDisabledFields(const []);
     expect(disabled, contains(TranslationPerformanceConfig.settingKey));
@@ -131,5 +170,8 @@ void main() {
     expect(disabled, contains('imageTranslationOcrWorkers'));
     expect(disabled, contains('imageTranslationImageConcurrency'));
     expect(disabled, contains('imageTranslationLlmConcurrency'));
+    expect(disabled, contains('imageTranslationOcrDetBatch'));
+    expect(disabled, contains('imageTranslationOcrRecBatch'));
+    expect(disabled, contains('imageTranslationPagesPerOcrCall'));
   });
 }

@@ -9,12 +9,14 @@ import 'package:venera/foundation/background_keepalive.dart';
 import 'package:venera/foundation/comic_source/comic_source.dart';
 import 'package:venera/foundation/comic_type.dart';
 import 'package:venera/foundation/image_translation/ordered_group_committer.dart';
+import 'package:venera/foundation/image_translation/ort_capabilities.dart';
 import 'package:venera/foundation/image_translation/rate_limiter.dart';
 import 'package:venera/foundation/image_translation/translation_config.dart';
 import 'package:venera/foundation/image_translation/translation_models.dart';
 import 'package:venera/foundation/image_translation/translation_performance_config.dart';
 import 'package:venera/foundation/image_translation/translation_service.dart';
 import 'package:venera/foundation/image_translation/translation_types.dart';
+import 'package:venera/foundation/image_translation/translation_worker.dart';
 import 'package:venera/foundation/local.dart';
 import 'package:venera/foundation/log.dart';
 import 'package:venera/network/images.dart';
@@ -682,6 +684,7 @@ class PreTranslationTaskManager with ChangeNotifier {
       isMobile: App.isMobile,
       sourceLang: task.config.sourceLang,
       hasJapaneseModel: TranslationModels.workerPaths().jaEncoder != null,
+      ep: TranslationWorker.instance.lastReport?.active ?? OrtEpKind.cpu,
     );
     var next = 0;
     // Self-removing set: each launched future removes itself on completion, so
@@ -797,12 +800,19 @@ class PreTranslationTaskManager with ChangeNotifier {
     required bool isMobile,
     required String sourceLang,
     required bool hasJapaneseModel,
+    OrtEpKind ep = OrtEpKind.cpu,
   }) {
     if (isMobile &&
         (sourceLang == 'ja' || (sourceLang == 'auto' && hasJapaneseModel))) {
       return 1;
     }
-    return performance.llmConcurrency.clamp(1, 4);
+    final base = performance.llmConcurrency.clamp(1, 4);
+    if (ep != OrtEpKind.cpu) {
+      // GPU is serialized; overlap > 2 just causes more pages to hold decoded
+      // RGBA buffers and queue for VRAM, raising VRAM pressure and OOM risk.
+      return math.min(base, 2);
+    }
+    return base;
   }
 
   /// Re-runs only the pages that failed, across every chapter that has any.

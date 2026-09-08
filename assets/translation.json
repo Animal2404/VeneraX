@@ -1321,7 +1321,20 @@
     "OCR detection batch size": "文字检测批大小 (Batch Size)",
     "OCR recognition batch size": "文字识别批大小 (Batch Size)",
     "Runtime backend status": "当前运行后端状态",
-    "Not initialized (will detect on first translation)": "尚未初始化（将在首次翻译时探测）"
+    "Not initialized (will detect on first translation)": "尚未初始化（将在首次翻译时探测）",
+    "Pages per OCR call": "单次 OCR 跨页批处理数",
+    "Inference diagnostics": "推理诊断",
+    "View execution provider, input shapes, and OCR performance logs": "查看执行提供者、模型输入尺寸与 OCR 性能日志",
+    "Diagnostics copied to clipboard": "诊断信息已复制到剪贴板",
+    "Execution Provider": "执行提供者",
+    "Active Provider": "当前提供者",
+    "Dynamic Batching": "动态批处理",
+    "Fixed Batch": "固定批处理",
+    "Provider Attempts": "提供者探测尝试",
+    "Model Input Shapes": "模型输入形状",
+    "Recent OCR Performance Logs": "最近 OCR 性能日志",
+    "No OCR performance logs yet": "暂无 OCR 性能日志",
+    "Copy diagnostics": "复制诊断信息"
   },
   "zh_TW": {
     "Reading Statistics": "閱讀統計",
@@ -2645,6 +2658,19 @@
     "OCR detection batch size": "文字檢測批次大小 (Batch Size)",
     "OCR recognition batch size": "文字識別批次大小 (Batch Size)",
     "Runtime backend status": "當前運行後端狀態",
-    "Not initialized (will detect on first translation)": "尚未初始化（將在首次翻譯時探測）"
+    "Not initialized (will detect on first translation)": "尚未初始化（將在首次翻譯時探測）",
+    "Pages per OCR call": "單次 OCR 跨頁批次處理數",
+    "Inference diagnostics": "推理診斷",
+    "View execution provider, input shapes, and OCR performance logs": "查看執行提供者、模型輸入尺寸與 OCR 效能日誌",
+    "Diagnostics copied to clipboard": "診斷資訊已複製到剪貼簿",
+    "Execution Provider": "執行提供者",
+    "Active Provider": "目前提供者",
+    "Dynamic Batching": "動態批次處理",
+    "Fixed Batch": "固定批次處理",
+    "Provider Attempts": "提供者探測嘗試",
+    "Model Input Shapes": "模型輸入形狀",
+    "Recent OCR Performance Logs": "最近 OCR 效能日誌",
+    "No OCR performance logs yet": "暫無 OCR 效能日誌",
+    "Copy diagnostics": "複製診斷資訊"
   }
 }

@@ -11,19 +11,14 @@ import 'package:venera/utils/io.dart';
 /// text, and lookup of special/added tokens (language codes, eos, ...).
 class HfTokenizer {
   HfTokenizer._({
-    required Map<String, int> vocab,
-    required Map<String, int> mergeRanks,
-    required List<double> scores,
-    required Map<String, int> addedTokens,
-    required Set<int> specialIds,
+    required this._vocab,
+    required this._mergeRanks,
+    required this._scores,
+    required this._addedTokens,
+    required this._specialIds,
     required this.unkId,
-    required bool isUnigram,
-  }) : _vocab = vocab,
-       _mergeRanks = mergeRanks,
-       _scores = scores,
-       _addedTokens = addedTokens,
-       _specialIds = specialIds,
-       _isUnigram = isUnigram {
+    required this._isUnigram,
+  }) {
     _idToToken = <int, String>{};
     _vocab.forEach((token, id) => _idToToken[id] = token);
     _addedTokens.forEach((token, id) => _idToToken[id] = token);

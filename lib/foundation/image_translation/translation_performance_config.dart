@@ -13,6 +13,7 @@ class TranslationPerformanceValues {
     this.ep = EpPreference.auto,
     this.detBatch = 1,
     this.recBatch = 1,
+    this.pagesPerOcrCall = 2,
   });
 
   final int batchPages;
@@ -22,6 +23,7 @@ class TranslationPerformanceValues {
   final EpPreference ep;
   final int detBatch;
   final int recBatch;
+  final int pagesPerOcrCall;
 }
 
 abstract final class TranslationPerformanceConfig {
@@ -62,6 +64,7 @@ abstract final class TranslationPerformanceConfig {
       ep: EpPreference.cpu,
       detBatch: 1,
       recBatch: 1,
+      pagesPerOcrCall: 1,
     ),
     TranslationPerformancePreset.balanced => TranslationPerformanceValues(
       batchPages: isDesktop ? 4 : 2,
@@ -70,7 +73,8 @@ abstract final class TranslationPerformanceConfig {
       llmConcurrency: 2,
       ep: EpPreference.auto,
       detBatch: 1,
-      recBatch: 1,
+      recBatch: isDesktop ? 8 : 4,
+      pagesPerOcrCall: 2,
     ),
     TranslationPerformancePreset.fast => TranslationPerformanceValues(
       batchPages: isDesktop ? 8 : 4,
@@ -78,8 +82,9 @@ abstract final class TranslationPerformanceConfig {
       imageConcurrency: isDesktop ? 6 : 3,
       llmConcurrency: isDesktop ? 4 : 3,
       ep: EpPreference.auto,
-      detBatch: 1,
-      recBatch: 1,
+      detBatch: 4,
+      recBatch: 16,
+      pagesPerOcrCall: 4,
     ),
     TranslationPerformancePreset.custom => TranslationPerformanceValues(
       batchPages: _intSetting(
@@ -100,7 +105,8 @@ abstract final class TranslationPerformanceConfig {
       ).clamp(1, isDesktop ? 4 : 3),
       ep: _epSetting(),
       detBatch: _intSetting('imageTranslationOcrDetBatch', 1).clamp(1, 16),
-      recBatch: _intSetting('imageTranslationOcrRecBatch', 1).clamp(1, 64),
+      recBatch: _intSetting('imageTranslationOcrRecBatch', 1).clamp(1, isDesktop ? 32 : 4),
+      pagesPerOcrCall: _intSetting('imageTranslationPagesPerOcrCall', 2).clamp(1, 8),
     ),
   };
 
@@ -114,6 +120,9 @@ abstract final class TranslationPerformanceConfig {
           values.imageConcurrency;
       appdata.settings['imageTranslationLlmConcurrency'] =
           values.llmConcurrency;
+      appdata.settings['imageTranslationOcrDetBatch'] = values.detBatch;
+      appdata.settings['imageTranslationOcrRecBatch'] = values.recBatch;
+      appdata.settings['imageTranslationPagesPerOcrCall'] = values.pagesPerOcrCall;
     }
     appdata.saveData();
   }

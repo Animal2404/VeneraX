@@ -32,7 +32,7 @@ class PageAnalysis {
 /// then fold the results back per page. [ready] holds regions that need no LLM
 /// (an already-target-language block converted zh→zh-TW).
 class PageOcr {
-  PageOcr(this.ready, this.pending, this.languageVotes);
+  PageOcr(this.ready, this.pending, this.languageVotes, {this.error});
 
   /// Regions already finalized without translation (e.g. zh→zh-TW conversion).
   final List<TranslatedRegion> ready;
@@ -42,6 +42,10 @@ class PageOcr {
   final List<OcrBlock> pending;
 
   final Map<String, int> languageVotes;
+
+  final String? error;
+
+  bool get hasError => error != null;
 
   bool get isEmpty => ready.isEmpty && pending.isEmpty;
 }
@@ -87,6 +91,64 @@ class PageTranslationPipeline {
   /// seconds on the first page.
   bool get ocrIsWarm => TranslationWorker.instance.isWarm;
 
+  /// Super-batched OCR across multiple pages. Decodes images, groups tiles/crops
+  /// into unified GPU/CPU batches, votes on language, applies zh->zh-TW conversion,
+  /// and returns per-page [PageOcr] results.
+  Future<List<PageOcr>> ocrPages(
+    List<Uint8List> imageBytesList, {
+    required String sourceLang,
+    required String targetLang,
+  }) async {
+    if (imageBytesList.isEmpty) return const [];
+    final images = await Future.wait([
+      for (var bytes in imageBytesList) _decode(bytes),
+    ]);
+    final paths = TranslationModels.workerPaths();
+    final pageResults = await TranslationWorker.instance.ocrPages(
+      images,
+      sourceLang: sourceLang,
+      paths: paths,
+    );
+
+    final output = <PageOcr>[];
+    final targetBase = targetLang == 'zh-TW' ? 'zh' : targetLang;
+
+    for (var res in pageResults) {
+      if (res.error != null) {
+        output.add(PageOcr(const [], const [], const {}, error: res.error));
+        continue;
+      }
+      var blocks = (res.blocks ?? const [])
+          .where((b) => _isTranslatable(b.text))
+          .toList();
+      var votes = <String, int>{};
+      for (var block in blocks) {
+        votes[block.language] = (votes[block.language] ?? 0) + 1;
+      }
+      if (blocks.isEmpty) {
+        output.add(PageOcr(const [], const [], votes));
+        continue;
+      }
+
+      var ready = <TranslatedRegion>[];
+      var pending = <OcrBlock>[];
+      for (var block in blocks) {
+        if (block.language == targetBase) {
+          if (targetLang == 'zh-TW' && block.language == 'zh') {
+            var converted = OpenCC.simplifiedToTraditional(block.text);
+            if (converted != block.text) {
+              ready.add(_region(block, converted));
+            }
+          }
+          continue;
+        }
+        pending.add(block);
+      }
+      output.add(PageOcr(ready, pending, votes));
+    }
+    return output;
+  }
+
   /// OCR-only stage: decode, recognize, vote on language and apply the
   /// no-LLM zh→zh-TW conversion, returning the blocks still awaiting the model.
   /// Shared by [analyzePage] (reader, one page) and the batch pre-translation
@@ -96,40 +158,18 @@ class PageTranslationPipeline {
     required String sourceLang,
     required String targetLang,
   }) async {
-    var image = await _decode(imageBytes);
-    var paths = TranslationModels.workerPaths();
-    var blocks = await TranslationWorker.instance.ocrPage(
-      image,
+    final results = await ocrPages(
+      [imageBytes],
       sourceLang: sourceLang,
-      paths: paths,
+      targetLang: targetLang,
     );
-    blocks = blocks.where((b) => _isTranslatable(b.text)).toList();
-    var votes = <String, int>{};
-    for (var block in blocks) {
-      votes[block.language] = (votes[block.language] ?? 0) + 1;
+    if (results.isEmpty) {
+      throw StateError('OCR produced no result');
     }
-    if (blocks.isEmpty) {
-      return PageOcr(const [], const [], votes);
+    if (results.first.hasError) {
+      throw StateError(results.first.error!);
     }
-
-    var targetBase = targetLang == 'zh-TW' ? 'zh' : targetLang;
-    var ready = <TranslatedRegion>[];
-    var pending = <OcrBlock>[];
-    for (var block in blocks) {
-      if (block.language == targetBase) {
-        // Already in the target language. The only useful transform left is
-        // the simplified/traditional conversion.
-        if (targetLang == 'zh-TW' && block.language == 'zh') {
-          var converted = OpenCC.simplifiedToTraditional(block.text);
-          if (converted != block.text) {
-            ready.add(_region(block, converted));
-          }
-        }
-        continue;
-      }
-      pending.add(block);
-    }
-    return PageOcr(ready, pending, votes);
+    return results.first;
   }
 
   /// Turns [pending] blocks and their aligned [texts] into render-ready

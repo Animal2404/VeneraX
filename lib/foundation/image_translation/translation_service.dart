@@ -1,12 +1,15 @@
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/painting.dart';
 import 'package:venera/foundation/appdata.dart';
 import 'package:venera/foundation/cache_manager.dart';
 import 'package:venera/foundation/image_translation/llm_translator.dart';
+import 'package:venera/foundation/image_translation/rate_limiter.dart';
 import 'package:venera/foundation/image_translation/translation_config.dart';
 import 'package:venera/foundation/image_translation/translation_models.dart';
+import 'package:venera/foundation/image_translation/translation_performance_config.dart';
 import 'package:venera/foundation/image_translation/translation_pipeline.dart';
 import 'package:venera/foundation/image_translation/translation_store.dart';
 import 'package:venera/foundation/image_translation/translation_types.dart';
@@ -585,7 +588,10 @@ class ImageTranslationService with ChangeNotifier {
       return total;
     }
 
+    final perf = TranslationPerformanceConfig.effective;
+
     // Stage 1 — resolve each page as far as possible without the LLM.
+    var ocrNeededIndices = <int>[];
     for (var i = 0; i < pages.length; i++) {
       if (shouldCancel?.call() ?? false) throw const PipelineCanceled();
       var p = pages[i];
@@ -602,22 +608,64 @@ class ImageTranslationService with ChangeNotifier {
           regionsOf[i] = stored;
           continue;
         }
-        onStage?.call(
-          pipeline.ocrIsWarm
-              ? TranslationStage.recognizing
-              : TranslationStage.loadingModel,
-          completedPages(),
-        );
-        pendingOcr[i] = await pipeline.ocrPage(
-          p.imageBytes,
-          sourceLang: sourceLang,
-          targetLang: config.targetLang,
-        );
-        freshOcr[i] = true;
+        ocrNeededIndices.add(i);
       } catch (e, s) {
         Log.warning('Image Translation', 'Batch OCR failed: $e\n$s');
         settled[i] = true; // failed; success[i] stays false
       }
+    }
+
+    if (ocrNeededIndices.isNotEmpty) {
+      final chunkSize = math.max<int>(1, perf.pagesPerOcrCall);
+      final chunks = <List<int>>[];
+      for (var i = 0; i < ocrNeededIndices.length; i += chunkSize) {
+        chunks.add(ocrNeededIndices.sublist(
+          i,
+          math.min<int>(i + chunkSize, ocrNeededIndices.length),
+        ));
+      }
+
+      final workerLimit = perf.ocrWorkers > 0 ? perf.ocrWorkers : 1;
+      final ocrGate = ConcurrencyGate(
+        (_) => math.max<int>(1, math.min<int>(workerLimit, chunks.length)),
+      );
+
+      await Future.wait(chunks.map((chunkIndices) async {
+        await ocrGate.acquire('ocr');
+        try {
+          if (shouldCancel?.call() ?? false) throw const PipelineCanceled();
+          onStage?.call(
+            pipeline.ocrIsWarm
+                ? TranslationStage.recognizing
+                : TranslationStage.loadingModel,
+            completedPages(),
+          );
+          final chunkBytes =
+              chunkIndices.map((idx) => pages[idx].imageBytes).toList();
+          final results = await pipeline.ocrPages(
+            chunkBytes,
+            sourceLang: sourceLang,
+            targetLang: config.targetLang,
+          );
+          for (var c = 0; c < chunkIndices.length; c++) {
+            final idx = chunkIndices[c];
+            if (c < results.length && !results[c].hasError) {
+              pendingOcr[idx] = results[c];
+              freshOcr[idx] = true;
+            } else {
+              settled[idx] = true;
+            }
+          }
+        } catch (e, s) {
+          if (e is PipelineCanceled) rethrow;
+          Log.warning('Image Translation', 'Batch OCR chunk failed: $e\n$s');
+          for (var idx in chunkIndices) {
+            settled[idx] = true;
+          }
+        } finally {
+          ocrGate.release('ocr');
+        }
+      }));
     }
 
     // Stage 2 — one request for the whole group's pending bubbles. Language
@@ -676,43 +724,54 @@ class ImageTranslationService with ChangeNotifier {
       ];
     }
 
-    // Stage 3 — render + cache each resolved page.
+    // Stage 3 — render + cache each resolved page with bounded concurrency.
+    final renderGate =
+        ConcurrencyGate((_) => math.max(1, perf.imageConcurrency));
+    final renderFutures = <Future<void>>[];
+
     for (var i = 0; i < pages.length; i++) {
       if (settled[i]) continue;
       var regions = regionsOf[i];
       if (regions == null) continue;
-      if (shouldCancel?.call() ?? false) throw const PipelineCanceled();
       var p = pages[i];
-      onStage?.call(TranslationStage.rendering, completedPages());
-      try {
-        if (freshOcr[i]) {
-          TranslationStore().put(p.cacheKey, regions, chapter: chapter);
+
+      renderFutures.add(() async {
+        await renderGate.acquire('render');
+        try {
+          if (shouldCancel?.call() ?? false) throw const PipelineCanceled();
+          onStage?.call(TranslationStage.rendering, completedPages());
+          if (freshOcr[i]) {
+            TranslationStore().put(p.cacheKey, regions, chapter: chapter);
+          }
+          if (regions.isEmpty) {
+            _noContent.add(p.cacheKey);
+            success[i] = true; // no translatable text still counts as handled
+            return;
+          }
+          var rendered = await pipeline.renderPage(
+            p.imageBytes,
+            regions,
+            mode: config.mode,
+          );
+          var renderKey = renderedKey(p.cacheKey, config.mode);
+          await CacheManager().writeCache(
+            renderKey,
+            rendered,
+            _imageCacheDuration,
+          );
+          _completed.add(renderKey);
+          success[i] = true;
+        } catch (e, s) {
+          if (e is PipelineCanceled) rethrow;
+          Log.warning('Image Translation', 'Batch render failed: $e\n$s');
+          settled[i] = true;
+        } finally {
+          renderGate.release('render');
         }
-        if (regions.isEmpty) {
-          _noContent.add(p.cacheKey);
-          success[i] = true; // no translatable text still counts as handled
-          continue;
-        }
-        var rendered = await pipeline.renderPage(
-          p.imageBytes,
-          regions,
-          mode: config.mode,
-        );
-        var renderKey = renderedKey(p.cacheKey, config.mode);
-        await CacheManager().writeCache(
-          renderKey,
-          rendered,
-          _imageCacheDuration,
-        );
-        _completed.add(renderKey);
-        success[i] = true;
-      } catch (e, s) {
-        Log.warning('Image Translation', 'Batch render failed: $e\n$s');
-        // success[i] stays false; mark it resolved so the group's reported
-        // completion does not stall at this page's partial weight.
-        settled[i] = true;
-      }
+      }());
     }
+
+    await Future.wait(renderFutures);
     onStage?.call(TranslationStage.rendering, completedPages());
     return success;
   }

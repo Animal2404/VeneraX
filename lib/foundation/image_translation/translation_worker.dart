@@ -38,6 +38,55 @@ class WorkerModelPaths {
   final Map<String, int> recHeights;
 }
 
+/// The OCR result for a single page within a super-batched group request.
+class OcrPageResult {
+  const OcrPageResult({
+    required this.pageIndex,
+    this.blocks,
+    this.error,
+  });
+
+  final int pageIndex;
+  final List<OcrBlock>? blocks;
+  final String? error;
+}
+
+class _PageInput {
+  const _PageInput({
+    required this.pageIndex,
+    required this.pixels,
+    required this.width,
+    required this.height,
+  });
+
+  final int pageIndex;
+  final TransferableTypedData pixels;
+  final int width;
+  final int height;
+}
+
+class _OcrPagesRequest {
+  _OcrPagesRequest(
+    this.id,
+    this.pages,
+    this.sourceLang,
+    this.paths,
+    this.intraThreads, {
+    this.epPref = EpPreference.auto,
+    this.detBatch = 1,
+    this.recBatch = 1,
+  });
+
+  final int id;
+  final List<_PageInput> pages;
+  final String sourceLang;
+  final WorkerModelPaths paths;
+  final int intraThreads;
+  final EpPreference epPref;
+  final int detBatch;
+  final int recBatch;
+}
+
 class _OcrPageRequest {
   _OcrPageRequest(
     this.id,
@@ -46,11 +95,8 @@ class _OcrPageRequest {
     this.height,
     this.sourceLang,
     this.paths,
-    this.intraThreads, {
-    this.epPref = EpPreference.auto,
-    this.detBatch = 1,
-    this.recBatch = 1,
-  });
+    this.intraThreads,
+  );
 
   final int id;
   final TransferableTypedData pixels;
@@ -61,9 +107,9 @@ class _OcrPageRequest {
   final String sourceLang;
   final WorkerModelPaths paths;
   final int intraThreads;
-  final EpPreference epPref;
-  final int detBatch;
-  final int recBatch;
+  EpPreference epPref = EpPreference.auto;
+  int detBatch = 1;
+  int recBatch = 1;
 }
 
 class _ProbeRequest {
@@ -78,12 +124,13 @@ class _ReleaseRequest {
 }
 
 class _WorkerResponse {
-  _WorkerResponse(this.id, this.result, this.error, [this.report]);
+  _WorkerResponse(this.id, this.result, this.error, [this.report, this.perfLog]);
 
   final int id;
   final Object? result;
   final String? error;
   final EpReport? report;
+  final String? perfLog;
 }
 
 /// Resolves the OCR worker count without touching platform or settings state.
@@ -237,21 +284,36 @@ class TranslationWorker {
     );
   }
 
-  Future<List<OcrBlock>> ocrPage(
-    RgbaImage image, {
+  final _recentPerfLogs = <String>[];
+
+  /// The 20 most recent structured OCR performance timing logs.
+  List<String> get recentPerfLogs => List.unmodifiable(_recentPerfLogs);
+
+  void addPerfLog(String log) {
+    _recentPerfLogs.add(log);
+    if (_recentPerfLogs.length > 20) {
+      _recentPerfLogs.removeAt(0);
+    }
+  }
+
+  /// Super-batched OCR across multiple images simultaneously.
+  Future<List<OcrPageResult>> ocrPages(
+    List<RgbaImage> images, {
     required String sourceLang,
     required WorkerModelPaths paths,
+    List<int>? pageIndices,
   }) {
+    if (images.isEmpty) return Future.value(const []);
     var poolSize = _poolSize(sourceLang, paths);
     _trimIdleWorkers(poolSize);
-    // Keep total ONNX intra-op threads ~= cores: dividing by the pool size
-    // avoids oversubscribing the CPU (which would make more workers slower).
     var intraThreads = (Platform.numberOfProcessors ~/ poolSize).clamp(1, 4);
     var worker = _pickWorker(poolSize);
     final perf = TranslationPerformanceConfig.effective;
+    final indices = pageIndices ?? List.generate(images.length, (i) => i);
     return worker
-        .ocrPage(
-          image,
+        .ocrPages(
+          images,
+          indices,
           sourceLang: sourceLang,
           paths: paths,
           intraThreads: intraThreads,
@@ -260,6 +322,25 @@ class TranslationWorker {
           recBatch: perf.recBatch,
         )
         .whenComplete(() => _isWarm = true);
+  }
+
+  Future<List<OcrBlock>> ocrPage(
+    RgbaImage image, {
+    required String sourceLang,
+    required WorkerModelPaths paths,
+  }) async {
+    final results = await ocrPages(
+      [image],
+      sourceLang: sourceLang,
+      paths: paths,
+      pageIndices: const [0],
+    );
+    if (results.isEmpty) return const [];
+    final first = results.first;
+    if (first.error != null) {
+      throw Exception('OCR failed for page: ${first.error}');
+    }
+    return first.blocks ?? const [];
   }
 
   _IsolateWorker _pickWorker(int poolSize) {
@@ -334,6 +415,10 @@ class _IsolateWorker {
         if (message.report != null) {
           TranslationWorker.instance._lastReport = message.report;
         }
+        if (message.perfLog != null) {
+          Log.info('OCR Perf', message.perfLog!);
+          TranslationWorker.instance.addPerfLog(message.perfLog!);
+        }
         var pending = _pending.remove(message.id);
         if (pending == null) return;
         if (message.error != null) {
@@ -374,8 +459,9 @@ class _IsolateWorker {
     return _request<EpReport>((id) => _ProbeRequest(id, pref, paths));
   }
 
-  Future<List<OcrBlock>> ocrPage(
-    RgbaImage image, {
+  Future<List<OcrPageResult>> ocrPages(
+    List<RgbaImage> images,
+    List<int> pageIndices, {
     required String sourceLang,
     required WorkerModelPaths paths,
     required int intraThreads,
@@ -383,12 +469,19 @@ class _IsolateWorker {
     int detBatch = 1,
     int recBatch = 1,
   }) {
-    return _request<List<OcrBlock>>(
-      (id) => _OcrPageRequest(
+    final inputs = [
+      for (var i = 0; i < images.length; i++)
+        _PageInput(
+          pageIndex: pageIndices[i],
+          pixels: TransferableTypedData.fromList([images[i].pixels]),
+          width: images[i].width,
+          height: images[i].height,
+        ),
+    ];
+    return _request<List<OcrPageResult>>(
+      (id) => _OcrPagesRequest(
         id,
-        TransferableTypedData.fromList([image.pixels]),
-        image.width,
-        image.height,
+        inputs,
         sourceLang,
         paths,
         intraThreads,
@@ -397,6 +490,32 @@ class _IsolateWorker {
         recBatch: recBatch,
       ),
     );
+  }
+
+  Future<List<OcrBlock>> ocrPage(
+    RgbaImage image, {
+    required String sourceLang,
+    required WorkerModelPaths paths,
+    required int intraThreads,
+    EpPreference epPref = EpPreference.auto,
+    int detBatch = 1,
+    int recBatch = 1,
+  }) async {
+    final results = await ocrPages(
+      [image],
+      const [0],
+      sourceLang: sourceLang,
+      paths: paths,
+      intraThreads: intraThreads,
+      epPref: epPref,
+      detBatch: detBatch,
+      recBatch: recBatch,
+    );
+    if (results.isEmpty) return const [];
+    if (results.first.error != null) {
+      throw Exception(results.first.error);
+    }
+    return results.first.blocks ?? const [];
   }
 
   void release() {
@@ -426,7 +545,15 @@ void _workerMain(SendPort mainPort) {
   mainPort.send(port.sendPort);
   var state = _WorkerState();
   port.listen((message) {
-    if (message is _OcrPageRequest) {
+    if (message is _OcrPagesRequest) {
+      try {
+        state.currentPref = message.epPref;
+        var (results, perfLog) = state.ocrPagesAll(message);
+        mainPort.send(_WorkerResponse(message.id, results, null, state.report, perfLog));
+      } catch (e, s) {
+        mainPort.send(_WorkerResponse(message.id, null, '$e\n$s', state.report));
+      }
+    } else if (message is _OcrPageRequest) {
       try {
         state.currentPref = message.epPref;
         var blocks = state.ocrPage(message);
@@ -501,6 +628,7 @@ List<String> loadCharset(String dictPath, {int? expectedClasses}) {
 
 class _ClusterWork {
   _ClusterWork({
+    this.pageIndex = 0,
     required this.index,
     required this.cluster,
     required this.bounds,
@@ -510,6 +638,7 @@ class _ClusterWork {
     required this.lineHeight,
   });
 
+  final int pageIndex;
   final int index;
   final List<IntRect> cluster;
   final IntRect bounds;
@@ -633,12 +762,54 @@ class _WorkerState {
   // -------------------------------------------------------------------------
 
   List<OcrBlock> ocrPage(_OcrPageRequest req) {
+    final (results, _) = ocrPagesAll(_OcrPagesRequest(
+      req.id,
+      [
+        _PageInput(
+          pageIndex: 0,
+          pixels: req.pixels,
+          width: req.width,
+          height: req.height,
+        ),
+      ],
+      req.sourceLang,
+      req.paths,
+      req.intraThreads,
+      epPref: req.epPref,
+      detBatch: req.detBatch,
+      recBatch: req.recBatch,
+    ));
+    if (results.isEmpty) return const [];
+    if (results.first.error != null) {
+      throw Exception(results.first.error);
+    }
+    return results.first.blocks ?? const [];
+  }
+
+  (List<OcrPageResult>, String) ocrPagesAll(_OcrPagesRequest req) {
+    final totalSw = Stopwatch()..start();
+    final detSw = Stopwatch();
+    final recSw = Stopwatch();
+    final decSw = Stopwatch();
+
     _intraThreads = req.intraThreads;
-    var image = RgbaImage(
-      req.width,
-      req.height,
-      req.pixels.materialize().asUint8List(),
-    );
+
+    final pageImages = <int, RgbaImage>{};
+    final pageErrors = <int, String>{};
+
+    for (var p in req.pages) {
+      try {
+        final bytes = p.pixels.materialize().asUint8List();
+        if (bytes.length < p.width * p.height * 4) {
+          pageErrors[p.pageIndex] =
+              'Invalid image pixel buffer length: ${bytes.length} for ${p.width}x${p.height}';
+          continue;
+        }
+        pageImages[p.pageIndex] = RgbaImage(p.width, p.height, bytes);
+      } catch (e, s) {
+        pageErrors[p.pageIndex] = '$e\n$s';
+      }
+    }
 
     final baseProfile = BatchProfile.forEp(_ep, isDesktop: App.isDesktop);
     final effectiveProfile = BatchProfile(
@@ -649,226 +820,326 @@ class _WorkerState {
       widthBuckets: baseProfile.widthBuckets,
     );
 
-    var boxes = _detectBoxes(image, req.paths, maxBatch: effectiveProfile.detBatch);
-    if (boxes.isEmpty) return const [];
-    var clusters = clusterOcrBoxes(boxes, image.width, image.height);
-    clusters.sort((a, b) => _boundsOf(a).top.compareTo(_boundsOf(b).top));
-    final pageCropLimit = (effectiveProfile.recBatch * 4).clamp(32, 128);
-    if (clusters.length > pageCropLimit) {
-      clusters = clusters.sublist(0, pageCropLimit);
+    var detTilesCount = 0;
+    var detBatchesCount = 0;
+    final pageBoxes = <int, List<IntRect>>{};
+    for (final pageIdx in pageImages.keys) {
+      pageBoxes[pageIdx] = <IntRect>[];
     }
 
-    if (effectiveProfile.recBatch == 1 && effectiveProfile.detBatch == 1) {
-      var blocks = <OcrBlock>[];
-      var pageHint = OcrPageEngineHint();
-      for (var cluster in clusters) {
-        var detectedBounds = _boundsOf(cluster);
-        var eraseBounds = detectedBounds.inflated(
-          2,
-          2,
-          image.width,
-          image.height,
-        );
-        var eraseLines = [
-          for (var line in cluster)
-            line.inflated(0, 0, image.width, image.height),
-        ];
-        var lineHeight = _medianLineHeight(cluster);
-        var pad = math.max(4, (0.06 * lineHeight).round().clamp(4, 8));
-        var bounds = detectedBounds.inflated(pad, pad, image.width, image.height);
-        if (bounds.width < 8 || bounds.height < 8) continue;
-        var colors = _sampleColors(image, bounds);
-        var recognized = _recognizeBlock(
-          image,
-          cluster,
-          bounds,
-          req,
-          preferredEngine: pageHint.preferredEngine,
-        );
-        var text = recognized.text.trim();
-        if (text.isEmpty) continue;
-        var lang = recognized.language;
-        if (req.sourceLang == 'auto') {
-          pageHint.observe(
-            text: text,
-            language: lang,
-            engine: recognized.engine,
-            isVertical: bounds.height > bounds.width * 1.3,
-          );
+    if (pageImages.isNotEmpty) {
+      detSw.start();
+      const tileHeight = 1280;
+      const tileOverlap = 128;
+      final allTiles = <({int pageIndex, DetTile tile})>[];
+      var tileIdx = 0;
+
+      for (final entry in pageImages.entries) {
+        final pageIdx = entry.key;
+        final img = entry.value;
+        var top = 0;
+        while (top < img.height) {
+          var bottom = math.min(img.height, top + tileHeight);
+          allTiles.add((
+            pageIndex: pageIdx,
+            tile: DetTile(
+              tileIndex: tileIdx++,
+              w: img.width,
+              h: bottom - top,
+              top: top,
+            ),
+          ));
+          if (bottom >= img.height) break;
+          top = bottom - tileOverlap;
         }
-        blocks.add(
-          OcrBlock(
-            rect: bounds,
-            eraseRect: eraseBounds,
-            eraseRects: eraseLines,
-            text: text,
-            language: lang,
-            backgroundColor: colors.$1,
-            textColor: colors.$2,
+      }
+
+      detTilesCount = allTiles.length;
+      final batches = planDetBatch(
+        tiles: [for (var t in allTiles) t.tile],
+        maxBatch: effectiveProfile.detBatch,
+        stride: 32,
+      );
+      detBatchesCount = batches.length;
+
+      var session = _session(req.paths.detector);
+
+      for (var batch in batches) {
+        final n = batch.tiles.length;
+        final targetW = batch.w;
+        final targetH = batch.h;
+        final totalElements = n * 3 * targetH * targetW;
+        final offset = _arena.ensure(0, totalElements);
+        _arena.view.fillRange(offset, offset + totalElements, 0.0);
+
+        final tileInfo = <({int pageIndex, int realW, int realH, int origW, int origH, int top})>[];
+        const maxSide = 1280.0;
+        const mean = [0.485, 0.456, 0.406];
+        const std = [0.229, 0.224, 0.225];
+
+        for (var b = 0; b < n; b++) {
+          final t = batch.tiles[b];
+          final tileMeta = allTiles[t.tileIndex];
+          final img = pageImages[tileMeta.pageIndex]!;
+          final scale = math.min(1.0, maxSide / math.max(t.w, t.h));
+          int round32(double v) => math.max(32, (v / 32).round() * 32);
+          final inW = round32(t.w * scale);
+          final inH = round32(t.h * scale);
+          tileInfo.add((
+            pageIndex: tileMeta.pageIndex,
+            realW: inW,
+            realH: inH,
+            origW: t.w,
+            origH: t.h,
+            top: t.top,
+          ));
+
+          final tilePixels = Uint8List.sublistView(
+            img.pixels,
+            t.top * img.width * 4,
+            (t.top + t.h) * img.width * 4,
+          );
+          final tileImg = RgbaImage(t.w, t.h, tilePixels);
+          final resized = _resizeRegion(tileImg, IntRect(0, 0, t.w, t.h), inW, inH);
+
+          final plane = targetH * targetW;
+          final bOffset = offset + b * 3 * plane;
+          for (var y = 0; y < inH; y++) {
+            final rowIn = y * inW;
+            final rowOut = y * targetW;
+            for (var x = 0; x < inW; x++) {
+              final srcIdx = (rowIn + x) * 4;
+              final dstIdx = rowOut + x;
+              for (var c = 0; c < 3; c++) {
+                _arena.view[bOffset + c * plane + dstIdx] =
+                    (resized[srcIdx + c] / 255.0 - mean[c]) / std[c];
+              }
+            }
+          }
+        }
+
+        session.runInPlace(
+          {
+            session.inputNames.first: OrtInput.nativeFloat32(
+              _arena.pointerAt(offset),
+              totalElements,
+              [n, 3, targetH, targetW],
+            ),
+          },
+          session.outputNames.first,
+          (probsPtr, shape, elementCount) {
+            final plane = targetH * targetW;
+            for (var b = 0; b < n; b++) {
+              final info = tileInfo[b];
+              final tileProbs = probsPtr + (b * plane);
+              final tileBoxes = _detPostprocessBatchSingle(
+                tileProbs,
+                w: targetW,
+                h: targetH,
+                realW: info.realW,
+                realH: info.realH,
+                tileWidth: info.origW,
+                tileHeight: info.origH,
+              );
+              final boxesList = pageBoxes[info.pageIndex]!;
+              for (var box in tileBoxes) {
+                box.top += info.top;
+                box.bottom += info.top;
+                if (!boxesList.any((existing) => _iou(existing, box) > 0.5)) {
+                  boxesList.add(box);
+                }
+              }
+            }
+            return null;
+          },
+        );
+      }
+      detSw.stop();
+    }
+
+    final workItems = <_ClusterWork>[];
+    for (final entry in pageBoxes.entries) {
+      final pageIdx = entry.key;
+      final img = pageImages[pageIdx]!;
+      var boxes = entry.value;
+      if (boxes.isEmpty) continue;
+      var clusters = clusterOcrBoxes(boxes, img.width, img.height);
+      clusters.sort((a, b) => _boundsOf(a).top.compareTo(_boundsOf(b).top));
+      final pageCropLimit = (effectiveProfile.recBatch * 4).clamp(32, 128);
+      if (clusters.length > pageCropLimit) {
+        clusters = clusters.sublist(0, pageCropLimit);
+      }
+      for (var i = 0; i < clusters.length; i++) {
+        final cluster = clusters[i];
+        final detectedBounds = _boundsOf(cluster);
+        final eraseBounds = detectedBounds.inflated(2, 2, img.width, img.height);
+        final eraseLines = [
+          for (var line in cluster) line.inflated(0, 0, img.width, img.height),
+        ];
+        final lineHeight = _medianLineHeight(cluster);
+        final pad = math.max(4, (0.06 * lineHeight).round().clamp(4, 8));
+        final bounds = detectedBounds.inflated(pad, pad, img.width, img.height);
+        if (bounds.width < 8 || bounds.height < 8) continue;
+        final colors = _sampleColors(img, bounds);
+        workItems.add(
+          _ClusterWork(
+            pageIndex: pageIdx,
+            index: i,
+            cluster: cluster,
+            bounds: bounds,
+            eraseBounds: eraseBounds,
+            eraseLines: eraseLines,
+            colors: colors,
             lineHeight: lineHeight,
           ),
         );
       }
-      return blocks;
     }
 
-    final workItems = <_ClusterWork>[];
-    for (var i = 0; i < clusters.length; i++) {
-      final cluster = clusters[i];
-      final detectedBounds = _boundsOf(cluster);
-      final eraseBounds = detectedBounds.inflated(
-        2,
-        2,
-        image.width,
-        image.height,
+    var recGroupsCount = 0;
+    var recBatchesCount = 0;
+    var recCropsCount = 0;
+    var decRowsCount = 0;
+    var decStepsCount = 0;
+
+    if (workItems.isNotEmpty) {
+      recSw.start();
+      final hasJa = req.paths.jaEncoder != null;
+      final recLangs = req.paths.recModels.keys.toList();
+
+      void executeMultiEngineBatch(
+        List<_ClusterWork> targets,
+        String engine,
+        WorkerModelPaths paths,
+        BatchProfile profile,
+      ) {
+        if (targets.isEmpty) return;
+        recGroupsCount++;
+        if (engine == 'ja') {
+          final targetInputs = [
+            for (var t in targets) (image: pageImages[t.pageIndex]!, bounds: t.bounds)
+          ];
+          final texts = _mangaOcrBatchMulti(
+            targetInputs,
+            paths,
+            profile: profile,
+            decStopwatch: decSw,
+            onStepStats: (rows, steps) {
+              decRowsCount += rows;
+              decStepsCount += steps;
+            },
+          );
+          for (var i = 0; i < targets.length; i++) {
+            final t = targets[i];
+            final raw = texts[i].trim();
+            if (_isPlausible(raw)) {
+              t.text = raw;
+              t.lang = _detectLanguage(raw, 'ja');
+              t.engine = 'ja';
+              t.isPlausible = true;
+            }
+          }
+        } else {
+          if (!paths.recModels.containsKey(engine)) return;
+          final lineClusterIdx = <int>[];
+          final allLineItems = <({RgbaImage image, IntRect rect})>[];
+          for (var i = 0; i < targets.length; i++) {
+            final t = targets[i];
+            final img = pageImages[t.pageIndex]!;
+            final sortedLines = [
+              for (var l in t.cluster)
+                RecParams.inflateLine(l, img.width, img.height),
+            ]..sort((a, b) => a.top.compareTo(b.top));
+            final validLines = sortedLines.where((r) => r.width >= 8 && r.height >= 8).toList();
+            for (var l in validLines) {
+              lineClusterIdx.add(i);
+              allLineItems.add((image: img, rect: l));
+            }
+          }
+
+          if (allLineItems.isEmpty) return;
+
+          final lineTexts = _recognizeLinesBatchMulti(
+            allLineItems,
+            engine,
+            paths,
+            profile: profile,
+            onStats: (batches, crops) {
+              recBatchesCount += batches;
+              recCropsCount += crops;
+            },
+          );
+
+          final clusterParts = List.generate(targets.length, (_) => <String>[]);
+          for (var l = 0; l < allLineItems.length; l++) {
+            final txt = lineTexts[l].trim();
+            if (txt.isNotEmpty) {
+              clusterParts[lineClusterIdx[l]].add(txt);
+            }
+          }
+
+          for (var i = 0; i < targets.length; i++) {
+            final t = targets[i];
+            final raw = clusterParts[i].join(' ').trim();
+            if (_isPlausible(raw)) {
+              t.text = raw;
+              t.lang = _detectLanguage(raw, engine);
+              t.engine = engine;
+              t.isPlausible = true;
+            }
+          }
+        }
+      }
+
+      // Pass A: Group by preferred engine
+      final engineGroups = planEngineGroups(
+        bounds: [for (var c in workItems) c.bounds],
+        hasJa: hasJa,
+        recLangs: recLangs,
+        sourceLang: req.sourceLang,
       );
-      final eraseLines = [
-        for (var line in cluster)
-          line.inflated(0, 0, image.width, image.height),
-      ];
-      final lineHeight = _medianLineHeight(cluster);
-      final pad = math.max(4, (0.06 * lineHeight).round().clamp(4, 8));
-      final bounds = detectedBounds.inflated(pad, pad, image.width, image.height);
-      if (bounds.width < 8 || bounds.height < 8) continue;
-      final colors = _sampleColors(image, bounds);
-      workItems.add(
-        _ClusterWork(
-          index: i,
-          cluster: cluster,
-          bounds: bounds,
-          eraseBounds: eraseBounds,
-          eraseLines: eraseLines,
-          colors: colors,
-          lineHeight: lineHeight,
-        ),
-      );
-    }
 
-    if (workItems.isEmpty) return const [];
-
-    final hasJa = req.paths.jaEncoder != null;
-    final recLangs = req.paths.recModels.keys.toList();
-
-    void executeEngineBatch(
-      List<_ClusterWork> targets,
-      String engine,
-      WorkerModelPaths paths,
-      BatchProfile profile,
-    ) {
-      if (targets.isEmpty) return;
-      if (engine == 'ja') {
-        final bounds = [for (var t in targets) t.bounds];
-        final texts = _mangaOcrBatch(image, bounds, paths, profile: profile);
-        for (var i = 0; i < targets.length; i++) {
-          final t = targets[i];
-          final raw = texts[i].trim();
-          if (_isPlausible(raw)) {
-            t.text = raw;
-            t.lang = _detectLanguage(raw, 'ja');
-            t.engine = 'ja';
-            t.isPlausible = true;
-          }
-        }
-      } else {
-        if (!paths.recModels.containsKey(engine)) return;
-        final lineClusterIdx = <int>[];
-        final allLines = <IntRect>[];
-        for (var i = 0; i < targets.length; i++) {
-          final t = targets[i];
-          final sortedLines = [
-            for (var l in t.cluster)
-              RecParams.inflateLine(l, image.width, image.height),
-          ]..sort((a, b) => a.top.compareTo(b.top));
-          final validLines = sortedLines.where((r) => r.width >= 8 && r.height >= 8).toList();
-          for (var l in validLines) {
-            lineClusterIdx.add(i);
-            allLines.add(l);
-          }
-        }
-
-        if (allLines.isEmpty) return;
-
-        final lineTexts = _recognizeLinesBatch(
-          image,
-          allLines,
-          engine,
-          paths,
-          profile: profile,
-        );
-
-        final clusterParts = List.generate(targets.length, (_) => <String>[]);
-        for (var l = 0; l < allLines.length; l++) {
-          final txt = lineTexts[l].trim();
-          if (txt.isNotEmpty) {
-            clusterParts[lineClusterIdx[l]].add(txt);
-          }
-        }
-
-        for (var i = 0; i < targets.length; i++) {
-          final t = targets[i];
-          final raw = clusterParts[i].join(' ').trim();
-          if (_isPlausible(raw)) {
-            t.text = raw;
-            t.lang = _detectLanguage(raw, engine);
-            t.engine = engine;
-            t.isPlausible = true;
-          }
-        }
-      }
-    }
-
-    // Pass A: Group by preferred engine
-    final engineGroups = planEngineGroups(
-      bounds: [for (var c in workItems) c.bounds],
-      hasJa: hasJa,
-      recLangs: recLangs,
-      sourceLang: req.sourceLang,
-    );
-
-    for (var group in engineGroups) {
-      final targets = [for (var idx in group.clusterIndices) workItems[idx]];
-      executeEngineBatch(targets, group.engine, req.paths, effectiveProfile);
-    }
-
-    // Pass B: For un-plausible items in auto mode, try fallback engine
-    if (req.sourceLang == 'auto') {
-      final passBJa = <_ClusterWork>[];
-      final passBRec = <_ClusterWork>[];
-      final defaultRec = recLangs.isNotEmpty ? recLangs.first : 'zh';
-
-      for (var item in workItems) {
-        if (!item.isPlausible) {
-          if (item.engine == 'ja') {
-            passBRec.add(item);
-          } else if (hasJa) {
-            passBJa.add(item);
-          }
-        }
+      for (var group in engineGroups) {
+        final targets = [for (var idx in group.clusterIndices) workItems[idx]];
+        executeMultiEngineBatch(targets, group.engine, req.paths, effectiveProfile);
       }
 
-      if (passBJa.isNotEmpty) {
-        executeEngineBatch(passBJa, 'ja', req.paths, effectiveProfile);
+      // Pass B: For un-plausible items in auto mode, try fallback engine
+      if (req.sourceLang == 'auto') {
+        final passBJa = <_ClusterWork>[];
+        final passBRec = <_ClusterWork>[];
+        final defaultRec = recLangs.isNotEmpty ? recLangs.first : 'zh';
+
+        for (var item in workItems) {
+          if (!item.isPlausible) {
+            if (item.engine == 'ja') {
+              passBRec.add(item);
+            } else if (hasJa) {
+              passBJa.add(item);
+            }
+          }
+        }
+
+        if (passBJa.isNotEmpty) {
+          executeMultiEngineBatch(passBJa, 'ja', req.paths, effectiveProfile);
+        }
+        if (passBRec.isNotEmpty) {
+          executeMultiEngineBatch(passBRec, defaultRec, req.paths, effectiveProfile);
+        }
       }
-      if (passBRec.isNotEmpty) {
-        executeEngineBatch(passBRec, defaultRec, req.paths, effectiveProfile);
-      }
+      recSw.stop();
     }
 
-    final blocks = <OcrBlock>[];
-    var pageHint = OcrPageEngineHint();
+    final pageBlocks = <int, List<OcrBlock>>{};
+    for (final pageIdx in pageImages.keys) {
+      pageBlocks[pageIdx] = <OcrBlock>[];
+    }
+
     for (var item in workItems) {
       final text = item.text.trim();
       if (text.isEmpty || !item.isPlausible) continue;
-      if (req.sourceLang == 'auto') {
-        pageHint.observe(
-          text: text,
-          language: item.lang,
-          engine: item.engine,
-          isVertical: item.bounds.height > item.bounds.width * 1.3,
-        );
-      }
       final lineHeight = _medianLineHeight(item.cluster);
-      blocks.add(
+      pageBlocks[item.pageIndex]?.add(
         OcrBlock(
           rect: item.bounds,
           eraseRect: item.eraseBounds,
@@ -881,7 +1152,33 @@ class _WorkerState {
         ),
       );
     }
-    return blocks;
+
+    final results = <OcrPageResult>[];
+    for (var p in req.pages) {
+      final err = pageErrors[p.pageIndex];
+      if (err != null) {
+        results.add(OcrPageResult(pageIndex: p.pageIndex, error: err));
+      } else {
+        results.add(OcrPageResult(
+          pageIndex: p.pageIndex,
+          blocks: pageBlocks[p.pageIndex] ?? const [],
+        ));
+      }
+    }
+
+    totalSw.stop();
+
+    final pagesStr = req.pages.map((p) => p.pageIndex).join(',');
+    final totalArenaBytes = _arena.capacityBytes + _hiddenArena.capacityBytes;
+    final perfLog = 'pages=[$pagesStr] ep=${_ep.name} '
+        'det={tiles:$detTilesCount buckets:$detBatchesCount ms:${detSw.elapsedMilliseconds}} '
+        'rec={groups:$recGroupsCount batches:$recBatchesCount crops:$recCropsCount ms:${recSw.elapsedMilliseconds}} '
+        'dec={rows:$decRowsCount steps:$decStepsCount ms:${decSw.elapsedMilliseconds}} '
+        'total_ms=${totalSw.elapsedMilliseconds} '
+        'bytes_in_arena=${(totalArenaBytes / (1024 * 1024)).toStringAsFixed(1)}MB '
+        'degraded=none';
+
+    return (results, perfLog);
   }
 
   /// Median height of a cluster's line boxes — an estimate of the original
@@ -892,56 +1189,7 @@ class _WorkerState {
     return heights[heights.length ~/ 2];
   }
 
-  /// OCR one block. In 'auto' mode a vertical block prefers the Japanese
-  /// engine and horizontal blocks try the installed engines in order until
-  /// one produces plausible text; the language is then derived from the
-  /// recognized script.
-  ({String text, String language, String engine}) _recognizeBlock(
-    RgbaImage image,
-    List<IntRect> lines,
-    IntRect bounds,
-    _OcrPageRequest req, {
-    String? preferredEngine,
-  }) {
-    var paths = req.paths;
-    var hasJa = paths.jaEncoder != null;
 
-    List<String> engineOrder;
-    if (req.sourceLang != 'auto') {
-      engineOrder = [req.sourceLang];
-    } else {
-      var vertical = bounds.height > bounds.width * 1.3;
-      engineOrder = <String>{
-        if (preferredEngine != null) preferredEngine,
-        if (vertical && hasJa) 'ja',
-        ...paths.recModels.keys,
-        if (!vertical && hasJa) 'ja',
-      }.toList();
-    }
-
-    for (var engine in engineOrder) {
-      String text;
-      if (engine == 'ja') {
-        if (!hasJa) continue;
-        text = _mangaOcr(image, bounds, paths);
-      } else {
-        if (!paths.recModels.containsKey(engine)) continue;
-        text = _recognizeLines(image, lines, engine, paths);
-      }
-      text = text.trim();
-      if (_isPlausible(text)) {
-        return (
-          text: text,
-          language: _detectLanguage(text, engine),
-          engine: engine,
-        );
-      }
-    }
-    // No engine produced plausible text: return empty so the block is dropped
-    // rather than emitting garbled OCR — that region then shows the original
-    // art untouched (no erase, no lettering) instead of a mistranslation.
-    return (text: '', language: 'unknown', engine: 'unknown');
-  }
 
   bool _isPlausible(String text) {
     if (text.length < 2) return false;
@@ -973,118 +1221,7 @@ class _WorkerState {
     return engineLang;
   }
 
-  // ----- detection -----
 
-  List<IntRect> _detectBoxes(
-    RgbaImage image,
-    WorkerModelPaths paths, {
-    int maxBatch = 1,
-  }) {
-    var session = _session(paths.detector);
-    var boxes = <IntRect>[];
-    const tileHeight = 1280;
-    const tileOverlap = 128;
-
-    final tiles = <DetTile>[];
-    var top = 0;
-    var tileIdx = 0;
-    while (top < image.height) {
-      var bottom = math.min(image.height, top + tileHeight);
-      tiles.add(
-        DetTile(
-          tileIndex: tileIdx++,
-          w: image.width,
-          h: bottom - top,
-          top: top,
-        ),
-      );
-      if (bottom >= image.height) break;
-      top = bottom - tileOverlap;
-    }
-
-    final batches = planDetBatch(tiles: tiles, maxBatch: maxBatch, stride: 32);
-    for (var batch in batches) {
-      final n = batch.tiles.length;
-      final targetW = batch.w;
-      final targetH = batch.h;
-      final totalElements = n * 3 * targetH * targetW;
-      final offset = _arena.ensure(0, totalElements);
-      _arena.view.fillRange(offset, offset + totalElements, 0.0);
-
-      final tileInfo = <({int realW, int realH, int origW, int origH, int top})>[];
-      const maxSide = 1280.0;
-      const mean = [0.485, 0.456, 0.406];
-      const std = [0.229, 0.224, 0.225];
-
-      for (var b = 0; b < n; b++) {
-        final t = batch.tiles[b];
-        final scale = math.min(1.0, maxSide / math.max(t.w, t.h));
-        int round32(double v) => math.max(32, (v / 32).round() * 32);
-        final inW = round32(t.w * scale);
-        final inH = round32(t.h * scale);
-        tileInfo.add((realW: inW, realH: inH, origW: t.w, origH: t.h, top: t.top));
-
-        final tilePixels = Uint8List.sublistView(
-          image.pixels,
-          t.top * image.width * 4,
-          (t.top + t.h) * image.width * 4,
-        );
-        final tileImg = RgbaImage(t.w, t.h, tilePixels);
-        final resized = _resizeRegion(tileImg, IntRect(0, 0, t.w, t.h), inW, inH);
-
-        final plane = targetH * targetW;
-        final bOffset = offset + b * 3 * plane;
-        for (var y = 0; y < inH; y++) {
-          final rowIn = y * inW;
-          final rowOut = y * targetW;
-          for (var x = 0; x < inW; x++) {
-            final srcIdx = (rowIn + x) * 4;
-            final dstIdx = rowOut + x;
-            for (var c = 0; c < 3; c++) {
-              _arena.view[bOffset + c * plane + dstIdx] =
-                  (resized[srcIdx + c] / 255.0 - mean[c]) / std[c];
-            }
-          }
-        }
-      }
-
-      session.runInPlace(
-        {
-          session.inputNames.first: OrtInput.nativeFloat32(
-            _arena.pointerAt(offset),
-            totalElements,
-            [n, 3, targetH, targetW],
-          ),
-        },
-        session.outputNames.first,
-        (probsPtr, shape, elementCount) {
-          final plane = targetH * targetW;
-          for (var b = 0; b < n; b++) {
-            final info = tileInfo[b];
-            final tileProbs = probsPtr + (b * plane);
-            final tileBoxes = _detPostprocessBatchSingle(
-              tileProbs,
-              w: targetW,
-              h: targetH,
-              realW: info.realW,
-              realH: info.realH,
-              tileWidth: info.origW,
-              tileHeight: info.origH,
-            );
-            for (var box in tileBoxes) {
-              box.top += info.top;
-              box.bottom += info.top;
-              if (!boxes.any((existing) => _iou(existing, box) > 0.5)) {
-                boxes.add(box);
-              }
-            }
-          }
-          return null;
-        },
-      );
-    }
-    return boxes;
-  }
 
   List<IntRect> _detPostprocessBatchSingle(
     Pointer<Float> probs, {
@@ -1163,33 +1300,35 @@ class _WorkerState {
     return boxes;
   }
 
-  List<String> _recognizeLinesBatch(
-    RgbaImage image,
-    List<IntRect> lines,
+  List<String> _recognizeLinesBatchMulti(
+    List<({RgbaImage image, IntRect rect})> lineItems,
     String lang,
     WorkerModelPaths paths, {
     required BatchProfile profile,
+    void Function(int batches, int crops)? onStats,
   }) {
-    if (lines.isEmpty) return const [];
+    if (lineItems.isEmpty) return const [];
     final modelPath = paths.recModels[lang];
-    if (modelPath == null) return List.filled(lines.length, '');
+    if (modelPath == null) return List.filled(lineItems.length, '');
     final session = _session(modelPath);
     final List<String> charset;
     try {
       charset = _charsetFor(lang, paths);
     } on DictMismatchException catch (e) {
       Log.error('OCR Worker', 'Skipping batch for $lang due to dict mismatch: $e');
-      return List.filled(lines.length, '');
+      return List.filled(lineItems.length, '');
     }
     final height = paths.recHeights[lang] ?? 48;
 
-    final results = List.filled(lines.length, '');
+    final results = List.filled(lineItems.length, '');
     final batches = planRecBatch(
-      lines: lines,
+      lines: [for (var item in lineItems) item.rect],
       height: height,
       widthBuckets: profile.widthBuckets,
       maxBatch: profile.recBatch,
     );
+
+    onStats?.call(batches.length, lineItems.length);
 
     for (var batch in batches) {
       final n = batch.rows.length;
@@ -1202,7 +1341,8 @@ class _WorkerState {
       final plane = targetH * targetW;
       for (var b = 0; b < n; b++) {
         final row = batch.rows[b];
-        final resized = _resizeRegion(image, row.rect, row.width, targetH);
+        final item = lineItems[row.originalIndex];
+        final resized = _resizeRegion(item.image, row.rect, row.width, targetH);
         final bOffset = offset + b * 3 * plane;
         for (var y = 0; y < targetH; y++) {
           final rowIn = y * row.width;
@@ -1249,15 +1389,18 @@ class _WorkerState {
     return results;
   }
 
-  List<String> _mangaOcrBatch(
-    RgbaImage image,
-    List<IntRect> bounds,
+
+
+  List<String> _mangaOcrBatchMulti(
+    List<({RgbaImage image, IntRect bounds})> targets,
     WorkerModelPaths paths, {
     required BatchProfile profile,
+    Stopwatch? decStopwatch,
+    void Function(int rows, int steps)? onStepStats,
   }) {
-    if (bounds.isEmpty) return const [];
+    if (targets.isEmpty) return const [];
     if (paths.jaEncoder == null || paths.jaDecoder == null || paths.jaVocab == null) {
-      return List.filled(bounds.length, '');
+      return List.filled(targets.length, '');
     }
     _jaVocab ??= WordPieceVocab.fromFileSync(paths.jaVocab!);
     final encoder = _session(paths.jaEncoder!);
@@ -1266,16 +1409,17 @@ class _WorkerState {
     final results = <String>[];
     final effectiveBatch = profile.decBatch;
 
-    for (var i = 0; i < bounds.length; i += effectiveBatch) {
-      final end = math.min(i + effectiveBatch, bounds.length);
-      final chunkBounds = bounds.sublist(i, end);
-      final B = chunkBounds.length;
+    for (var i = 0; i < targets.length; i += effectiveBatch) {
+      final end = math.min(i + effectiveBatch, targets.length);
+      final chunkTargets = targets.sublist(i, end);
+      final B = chunkTargets.length;
 
       final totalPixels = B * 3 * 224 * 224;
       final off = _arena.ensure(0, totalPixels);
       const plane = 224 * 224;
       for (var b = 0; b < B; b++) {
-        final resized = _resizeRegion(image, chunkBounds[b], 224, 224);
+        final t = chunkTargets[b];
+        final resized = _resizeRegion(t.image, t.bounds, 224, 224);
         final bOffset = off + b * 3 * plane;
         for (var p = 0; p < plane; p++) {
           final srcIdx = p * 4;
@@ -1307,6 +1451,8 @@ class _WorkerState {
         padToken: MangaOcrTokens.pad,
       );
 
+      decStopwatch?.start();
+      var stepsTaken = 0;
       while (!state.allDone && state.currentStep < MangaOcrTokens.maxTokens) {
         final L = state.currentStep;
         final inputIds = state.flatPrefix(L);
@@ -1324,7 +1470,10 @@ class _WorkerState {
           seqLen: L,
         );
         state.appendAll(nextTokens);
+        stepsTaken++;
       }
+      decStopwatch?.stop();
+      onStepStats?.call(B, stepsTaken);
 
       final chunkTexts = state.textOf((tokens) => _jaVocab!.decode(tokens));
       results.addAll(chunkTexts);
@@ -1352,140 +1501,6 @@ class _WorkerState {
       );
     }
     return charset;
-  }
-
-  // ----- Japanese OCR (manga-ocr) -----
-
-  String _mangaOcr(RgbaImage image, IntRect bounds, WorkerModelPaths paths) {
-    _jaVocab ??= WordPieceVocab.fromFileSync(paths.jaVocab!);
-    var encoder = _session(paths.jaEncoder!);
-    var decoder = _session(paths.jaDecoder!);
-    var pixels = _cropNormalized(image, bounds, 224, 224);
-    var hidden = encoder
-        .run({
-          encoder.inputNames.first: OrtInput.float32(pixels, const [
-            1,
-            3,
-            224,
-            224,
-          ]),
-        })
-        .values
-        .first;
-
-    const startToken = 2;
-    const eosToken = 3;
-    const maxTokens = 80;
-    var ids = <int>[startToken];
-    while (ids.length < maxTokens) {
-      var next = decoder.runArgmaxLastRow({
-        'input_ids': OrtInput.int64(Int64List.fromList(ids), [1, ids.length]),
-        'encoder_hidden_states': OrtInput.float32(hidden.data, hidden.shape),
-      }, decoder.outputNames.first);
-      if (next == eosToken) break;
-      ids.add(next);
-      // Greedy decoding can fall into repetition loops on hard crops
-      // (stylized fonts, screentone backgrounds), which came out as garbage
-      // strings. Cut the sequence when the tail starts repeating.
-      if (_hasRepetitionLoop(ids)) {
-        ids.removeRange(ids.length - 3, ids.length);
-        break;
-      }
-    }
-    return _jaVocab!.decode(ids.sublist(1));
-  }
-
-  /// True when the tail of [ids] repeats: the same trigram twice in a row,
-  /// or four identical tokens.
-  bool _hasRepetitionLoop(List<int> ids) {
-    var n = ids.length;
-    if (n >= 4 &&
-        ids[n - 1] == ids[n - 2] &&
-        ids[n - 2] == ids[n - 3] &&
-        ids[n - 3] == ids[n - 4]) {
-      return true;
-    }
-    if (n >= 6) {
-      var repeated = true;
-      for (var i = 0; i < 3; i++) {
-        if (ids[n - 1 - i] != ids[n - 4 - i]) {
-          repeated = false;
-          break;
-        }
-      }
-      if (repeated) return true;
-    }
-    return false;
-  }
-
-  // ----- Line OCR (PP-OCR CTC) -----
-
-  String _recognizeLines(
-    RgbaImage image,
-    List<IntRect> lines,
-    String lang,
-    WorkerModelPaths paths,
-  ) {
-    var modelPath = paths.recModels[lang]!;
-    var session = _session(modelPath);
-    final List<String> charset;
-    try {
-      charset = _charsetFor(lang, paths);
-    } on DictMismatchException catch (e) {
-      Log.error('OCR Worker', 'Skipping recognition for $lang due to dict mismatch: $e');
-      return '';
-    }
-    var height = paths.recHeights[lang] ?? 48;
-    var sorted = [...lines]..sort((a, b) => a.top.compareTo(b.top));
-    var parts = <String>[];
-    for (var line in sorted) {
-      var rect = RecParams.inflateLine(line, image.width, image.height);
-      if (rect.width < 8 || rect.height < 8) continue;
-      var outW = (rect.width * height / math.max(1, rect.height)).round().clamp(
-        16,
-        960,
-      );
-      outW = (outW / 8).ceil() * 8;
-      var tensor = _cropNormalized(image, rect, outW, height);
-      var output = session
-          .run({
-            session.inputNames.first: OrtInput.float32(tensor, [
-              1,
-              3,
-              height,
-              outW,
-            ]),
-          })
-          .values
-          .first;
-      var text = _ctcDecode(output.data, output.shape.last, charset);
-      if (text.trim().isNotEmpty) {
-        parts.add(text.trim());
-      }
-    }
-    return parts.join(' ');
-  }
-
-  String _ctcDecode(Float32List probs, int classes, List<String> charset) {
-    var steps = probs.length ~/ classes;
-    var buffer = StringBuffer();
-    var prev = 0;
-    for (var t = 0; t < steps; t++) {
-      var best = 0;
-      var bestScore = probs[t * classes];
-      for (var c = 1; c < classes; c++) {
-        var score = probs[t * classes + c];
-        if (score > bestScore) {
-          bestScore = score;
-          best = c;
-        }
-      }
-      if (best != 0 && best != prev && best < charset.length) {
-        buffer.write(charset[best]);
-      }
-      prev = best;
-    }
-    return buffer.toString().trim();
   }
 }
 
@@ -1724,18 +1739,7 @@ IntRect _boundsOf(List<IntRect> boxes) {
   return result;
 }
 
-/// Crops a region and normalizes to (x/255 - 0.5) / 0.5, CHW.
-Float32List _cropNormalized(RgbaImage image, IntRect rect, int outW, int outH) {
-  var resized = _resizeRegion(image, rect, outW, outH);
-  var tensor = Float32List(3 * outH * outW);
-  var plane = outH * outW;
-  for (var i = 0; i < plane; i++) {
-    for (var c = 0; c < 3; c++) {
-      tensor[c * plane + i] = (resized[i * 4 + c] / 255.0 - 0.5) / 0.5;
-    }
-  }
-  return tensor;
-}
+
 
 /// Estimates (backgroundColor, textColor) for a region by separating the two
 /// dominant colour classes inside it.

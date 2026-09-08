@@ -300,6 +300,7 @@ class OrtTensorArena {
   Float32List? _cachedView;
 
   int get capacityElements => _capacityElements;
+  int get capacityBytes => _capacityElements * sizeOf<Float>();
   Pointer<Float> get basePtr => _ptr;
 
   Float32List get view {
