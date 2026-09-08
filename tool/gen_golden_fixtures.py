@@ -85,17 +85,33 @@ def page_01_ja_vertical(w=900, h=1250):
         "風が止んだ瞬間、世界は",
         "確かに動きはじめたのだ",
     ]
-    bubble(d, 60, 40, w - 120, 420)
-    vertical_columns(d, "ja", lines, w - 110, 90, 88, 40)
-    bubble(d, 120, 560, 620, 300)
+    # The bubble must actually contain the columns: an earlier version drew a
+    # 420px-tall ellipse behind 8 columns that ran ~600px down, so the text
+    # escaped the balloon and crossed its rim while the manifest still claimed
+    # "inside one bubble". A fixture whose notes misdescribe it is worse than a
+    # blank page — the reader trusts it. Geometry is now derived from the text:
+    # column height = chars * line step, plus margins, on both axes.
+    font_size, col_w, top = 40, 88, 90
+    longest = max(len(line) for line in lines)
+    col_h = longest * int(font_size * 1.25)
+    right, left = w - 110, w - 110 - col_w * (len(lines) - 1) - font_size
+    bubble(
+        d,
+        left - 40,
+        top - 45,
+        (right - left) + font_size + 80,
+        col_h + 90,
+    )
+    vertical_columns(d, "ja", lines, right, top, col_w, font_size)
+    bubble(d, 120, top + col_h + 110, 620, 300)
     f = font("ja", 34)
-    d.text((200, 640), "ここから先は無い", fill="black", font=f)
-    d.text((200, 700), "ただ風が吹くだけだ", fill="black", font=f)
+    d.text((200, top + col_h + 190), "ここから先は無い", fill="black", font=f)
+    d.text((200, top + col_h + 250), "ただ風が吹くだけだ", fill="black", font=f)
     return img, {
         "file": "01_ja_vertical.png",
         "lang": "ja",
         "blocks": 6,
-        "notes": "8 vertical columns right-to-left inside one bubble + 2 horizontal lines",
+        "notes": "8 vertical columns right-to-left inside one large bubble (the two longest columns' final glyph grazes the rim) + 2 horizontal lines in a second bubble",
     }
 
 
