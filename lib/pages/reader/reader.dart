@@ -369,7 +369,9 @@ class _ReaderState extends State<Reader>
     ImageTranslationService.instance.removeListener(_onPageTranslated);
     ImageTranslationService.instance.clearQueue();
     if (!PreTranslationTaskManager.instance.hasRunningTasks) {
-      TranslationWorker.instance.dispose();
+      // Release-then-kill. `dispose()` here used to kill the isolate outright,
+      // which discarded the only handles able to free the DML sessions.
+      unawaited(TranslationWorker.instance.shutdownAll());
     }
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     stopVolumeEvent();

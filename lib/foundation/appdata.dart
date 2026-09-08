@@ -170,6 +170,7 @@ class Appdata with Init {
     "imageTranslationOcrDetBatch",
     "imageTranslationOcrRecBatch",
     "imageTranslationPagesPerOcrCall",
+    "imageTranslationIdleEvictionSeconds",
   ];
 
   @visibleForTesting
@@ -549,6 +550,10 @@ class Settings with ChangeNotifier {
     'imageTranslationOcrDetBatch': 1,
     'imageTranslationOcrRecBatch': 1,
     'imageTranslationPagesPerOcrCall': 2,
+    // 空闲多久后归还模型内存（秒）；0 = 常驻不释放。
+    // 回顾文档写的是「10 秒自动驱逐」，代码一直是 90 秒 —— 做成设置项以便核对，
+    // 而不是继续引用一个不存在的数字（施工图 D-1）。
+    'imageTranslationIdleEvictionSeconds': 90,
   };
 
   operator [](String key) {

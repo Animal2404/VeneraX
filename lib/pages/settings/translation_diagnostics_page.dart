@@ -10,6 +10,52 @@ class TranslationDiagnosticsPage extends StatefulWidget {
 
 class _TranslationDiagnosticsPageState
     extends State<TranslationDiagnosticsPage> {
+  /// Cached so the resource card does not re-run the native probes on every
+  /// rebuild. `unavailable` renders as N/A, never as 0.
+  ProcessSnapshot _snapshot = ProcessSnapshot.unavailable;
+  bool _releasing = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _refreshSnapshot();
+  }
+
+  Future<void> _refreshSnapshot() async {
+    final snap = await takeProcessSnapshot();
+    if (mounted) setState(() => _snapshot = snap);
+  }
+
+  /// Releases through the handshake and reports what was actually observed.
+  Future<void> _releaseMemory() async {
+    setState(() => _releasing = true);
+    await TranslationWorker.instance.shutdownAll();
+    await _refreshSnapshot();
+    if (mounted) setState(() => _releasing = false);
+    final sessions = TranslationWorker.instance.lastReport?.sessionCount;
+    context.showMessage(
+      message: sessions == 0
+          ? "Memory and VRAM released".tl
+          : "Release requested (no live reading)".tl,
+    );
+  }
+
+  static String _mb(int? bytes) => bytes == null
+      ? "N/A"
+      : "${(bytes / (1024 * 1024)).toStringAsFixed(0)} MB";
+
+  Widget _resourceRow(String label, String value, {String? note}) => ListTile(
+    dense: true,
+    title: Text(label, style: const TextStyle(fontSize: 13)),
+    subtitle: (note == null || note.isEmpty)
+        ? null
+        : Text(note, style: const TextStyle(fontSize: 11)),
+    trailing: Text(
+      value,
+      style: const TextStyle(fontFamily: 'monospace', fontSize: 13),
+    ),
+  );
+
   void _copyDiagnostics(
     BuildContext context,
     EpReport? report,
@@ -62,11 +108,9 @@ class _TranslationDiagnosticsPageState
               IconButton(
                 icon: const Icon(Icons.cleaning_services_outlined),
                 tooltip: "Release memory / VRAM".tl,
-                onPressed: () {
-                  TranslationWorker.instance.dispose();
-                  context.showMessage(message: "Memory and VRAM released".tl);
-                  setState(() {});
-                },
+                // Disabled while in flight: releasing is now a handshake with
+                // the worker, and a second click would race the first.
+                onPressed: _releasing ? null : _releaseMemory,
               ),
               IconButton(
                 icon: const Icon(Icons.copy),
@@ -208,6 +252,47 @@ class _TranslationDiagnosticsPageState
                       ),
                     ),
                   ],
+                  const SizedBox(height: 24),
+                  _buildSectionHeader(context, "Resources".tl),
+                  const SizedBox(height: 8),
+                  Card(
+                    child: Column(
+                      children: [
+                        _resourceRow(
+                          "Live OCR sessions".tl,
+                          report == null
+                              ? "N/A"
+                              : "${report.sessionCount}",
+                          note: "0 after a release proves the handshake ran",
+                        ),
+                        _resourceRow(
+                          "Native arena".tl,
+                          report == null
+                              ? "N/A"
+                              : _mb(
+                                  report.arenaCapacityBytes +
+                                      report.hiddenArenaCapacityBytes,
+                                ),
+                          note: "host RAM, not VRAM",
+                        ),
+                        _resourceRow(
+                          "Process working set".tl,
+                          _mb(_snapshot.workingSetBytes),
+                        ),
+                        _resourceRow(
+                          "GPU memory in use".tl,
+                          _mb(_snapshot.gpuCurrentUsageBytes),
+                          note: _snapshot.sources['nvidia-smi'] ?? '',
+                        ),
+                        _resourceRow(
+                          "Degradations".tl,
+                          (report?.degradedTrail.isEmpty ?? true)
+                              ? "none"
+                              : report!.degradedTrail.join(", "),
+                        ),
+                      ],
+                    ),
+                  ),
                   const SizedBox(height: 24),
                   _buildSectionHeader(context, "Recent OCR Performance Logs".tl),
                   const SizedBox(height: 8),

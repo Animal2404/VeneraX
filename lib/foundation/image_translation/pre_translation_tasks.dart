@@ -490,7 +490,7 @@ class PreTranslationTaskManager with ChangeNotifier {
       _canceledIds.remove(id);
     }
     if (currentTasks.every((t) => !t.isRunning)) {
-      TranslationWorker.instance.dispose();
+      unawaited(TranslationWorker.instance.shutdownAll());
     }
     notifyListeners();
   }
@@ -530,7 +530,7 @@ class PreTranslationTaskManager with ChangeNotifier {
     _saveActive();
     notifyListeners();
     if (currentTasks.every((t) => !t.isRunning)) {
-      TranslationWorker.instance.dispose();
+      unawaited(TranslationWorker.instance.shutdownAll());
     }
   }
 
@@ -584,6 +584,11 @@ class PreTranslationTaskManager with ChangeNotifier {
     );
   }
 
+  /// One lease per running task. While any lease is held, `shutdownAll()`
+  /// degrades to `release()` so that a task finishing cannot kill the worker
+  /// isolates another task is still reading from (plan D-9).
+  final _ocrLeases = <String, OcrLease>{};
+
   Future<void> _run(PreTranslationTask task) async {
     if (_runningIds.contains(task.id)) return;
     if (_canceledIds.contains(task.id) || !currentTasks.contains(task)) {
@@ -591,6 +596,7 @@ class PreTranslationTaskManager with ChangeNotifier {
     }
     _runningIds.add(task.id);
     _activities[task.id] = PreTranslationActivity();
+    _ocrLeases[task.id] = TranslationWorker.instance.acquireLease();
     _refreshKeepAlive(task);
     try {
       for (var chapter in task.chapters) {
@@ -619,6 +625,9 @@ class PreTranslationTaskManager with ChangeNotifier {
     } finally {
       _canceledIds.remove(task.id);
       _runningIds.remove(task.id);
+      // Drop our own lease *before* shutting down: shutdownAll() defers while
+      // any lease is held, so keeping ours here would block our own cleanup.
+      _ocrLeases.remove(task.id)?.release();
       // The coalescing timer is shared by every running job, so it is not this
       // job's to cancel; the notifyListeners below already flushes this one.
       _activities.remove(task.id);
@@ -627,7 +636,7 @@ class PreTranslationTaskManager with ChangeNotifier {
         BackgroundKeepAlive.instance.remove(
           BackgroundKeepAlive.tagPreTranslate,
         );
-        TranslationWorker.instance.dispose();
+        unawaited(TranslationWorker.instance.shutdownAll());
       }
       onTaskFinished?.call(task);
       notifyListeners();
@@ -638,7 +647,11 @@ class PreTranslationTaskManager with ChangeNotifier {
   /// or gets canceled. This frees GPU resources while paused.
   Future<void> _waitWhilePaused(PreTranslationTask task) async {
     if (currentTasks.every((t) => !t.isRunning)) {
-      TranslationWorker.instance.dispose();
+      // Nothing is executing: hand our lease back so the pool can actually be
+      // torn down, and await the handshake instead of firing blind — this is
+      // the "pause frees the GPU" path a user can see in Task Manager.
+      _ocrLeases.remove(task.id)?.release();
+      await TranslationWorker.instance.shutdownAll();
     }
     while (task.status == PreTranslationTaskStatus.paused) {
       if (_canceledIds.contains(task.id)) return;
@@ -646,6 +659,7 @@ class PreTranslationTaskManager with ChangeNotifier {
       // exits immediately.
       await Future.delayed(const Duration(seconds: 1));
     }
+    _ocrLeases[task.id] ??= TranslationWorker.instance.acquireLease();
   }
 
   Future<void> _runChapter(
@@ -882,8 +896,11 @@ class PreTranslationTaskManager with ChangeNotifier {
     } finally {
       activity?.groups.remove(-1);
       _notifyActivity();
-      // Dispose worker to completely free GPU VRAM immediately!
-      TranslationWorker.instance.dispose();
+      // Hand the GPU memory back through the release handshake: awaiting here
+      // means the sessions are provably closed before the next stage starts.
+      // (The previous comment here claimed `dispose()` freed VRAM "immediately";
+      // it killed the isolate instead and stranded the sessions — plan D-1/D-13.)
+      await TranslationWorker.instance.shutdownAll();
     }
   }
 

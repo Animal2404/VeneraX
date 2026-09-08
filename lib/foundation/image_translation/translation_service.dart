@@ -91,7 +91,15 @@ class ImageTranslationService with ChangeNotifier {
   static const _imageCacheDuration = 30 * 24 * 60 * 60 * 1000;
   static const _maxQueueLength = 16;
   static const _failureRetryDelay = Duration(minutes: 5);
-  static const _idleReleaseDelay = Duration(seconds: 90);
+  /// How long the pipeline stays parked before handing model memory back.
+  /// The retrospective writes about a 10-second idle eviction; the code has
+  /// always used 90s. It is a setting now so the number can be checked rather
+  /// than repeated (plan D-1). `0` disables the timer.
+  static Duration get _idleReleaseDelay {
+    final seconds = appdata.settings['imageTranslationIdleEvictionSeconds'];
+    if (seconds is int && seconds >= 0) return Duration(seconds: seconds);
+    return const Duration(seconds: 90);
+  }
 
   final _queue = <_TranslationTask>[];
   final _active = <_TranslationTask>{};
@@ -1180,7 +1188,10 @@ class ImageTranslationService with ChangeNotifier {
   /// Frees model memory after the reader has been idle for a while.
   void _scheduleRelease() {
     _releaseTimer?.cancel();
-    _releaseTimer = Timer(_idleReleaseDelay, () {
+    _releaseTimer = null;
+    final delay = _idleReleaseDelay;
+    if (delay == Duration.zero) return; // setting 0 = keep the pool warm
+    _releaseTimer = Timer(delay, () {
       if (_active.isNotEmpty || _queue.isNotEmpty) return;
       var pipeline = _pipeline;
       _pipeline = null;

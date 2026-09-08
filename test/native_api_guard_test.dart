@@ -49,6 +49,27 @@ void main() {
         'foundation/sqlite_connection.dart',
         allowedIn: ['lib/foundation/sqlite_connection.dart'],
       ),
+      // Killing an OCR isolate discards the only Dart handles that could call
+      // ReleaseSession, while onnxruntime.dll keeps the D3D12 allocations
+      // alive for the life of the process. "Dispose to free VRAM" therefore
+      // leaked; the release must be handed back by the worker itself, over an
+      // ack, before anything is killed.
+      _Rule(
+        RegExp(r'TranslationWorker\.instance\.dispose\(\)'),
+        'use TranslationWorker.instance.shutdownAll() — dispose() kills the '
+        'isolate immediately and strands its ONNX sessions in the process '
+        '(plan D-1)',
+        allowedIn: ['lib/foundation/image_translation/translation_worker.dart'],
+      ),
+      // Only the worker wrapper may kill an isolate, and only from killNow(),
+      // which shutdown() calls after the release ack (or after logging the
+      // timeout). Ad-hoc kills elsewhere reintroduce the same leak.
+      _Rule(
+        RegExp(r'Isolate\.kill\('),
+        'isolates are torn down through _IsolateWorker.shutdown(), which '
+        'waits for the release ack before killing',
+        allowedIn: ['lib/foundation/image_translation/translation_worker.dart'],
+      ),
     ];
 
     final violations = <String>[];

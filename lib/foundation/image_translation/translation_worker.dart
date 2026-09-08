@@ -123,6 +123,16 @@ class _ReleaseRequest {
   const _ReleaseRequest();
 }
 
+/// Sent back by the worker once it has actually run `ReleaseSession` on every
+/// session and freed the native arenas. Without this handshake, killing the
+/// isolate destroys the only Dart handles that could release those native
+/// objects, and the VRAM stays pinned for the life of the process (plan D-1).
+class _ReleaseAck {
+  const _ReleaseAck(this.report);
+
+  final EpReport? report;
+}
+
 class _WorkerResponse {
   _WorkerResponse(this.id, this.result, this.error, [this.report, this.perfLog]);
 
@@ -366,8 +376,26 @@ class TranslationWorker {
   void _trimIdleWorkers(int poolSize) {
     for (var i = _workers.length - 1; i >= poolSize; i--) {
       if (_workers[i].pendingCount != 0) continue;
-      _workers.removeAt(i).dispose();
+      final worker = _workers.removeAt(i);
+      // Shrinking the pool still has to hand the memory back; a bare kill
+      // strands the sessions this worker was holding (plan D-1).
+      unawaited(worker.shutdown());
     }
+  }
+
+  int _leases = 0;
+
+  /// Number of in-flight consumers of the worker pool.
+  int get leaseCount => _leases;
+
+  /// Marks a task as using the pool. While any lease is held, [shutdownAll]
+  /// degrades to [release] so one task finishing cannot kill the isolates
+  /// another task is still reading from (plan D-9).
+  OcrLease acquireLease() {
+    _leases++;
+    return OcrLease._(() {
+      if (_leases > 0) _leases--;
+    });
   }
 
   /// Frees model memory in every worker (sessions re-create lazily).
@@ -379,12 +407,60 @@ class TranslationWorker {
     _isWarm = false;
   }
 
-  /// Kills all worker isolates; they restart lazily on the next request.
+  /// Releases every worker's native sessions and tears the isolates down —
+  /// handshake first, kill second, never the reverse.
+  ///
+  /// Await this from any path whose purpose is "give the memory back": task
+  /// finish, cancel, pause-out, reader close, the diagnostics button.
+  Future<void> shutdownAll({
+    Duration timeout = const Duration(seconds: 8),
+  }) async {
+    if (_leases > 0) {
+      // Someone is still using these sessions; free what is safe to free and
+      // leave the isolates alive rather than pulling them out from under it.
+      release();
+      Log.info('OCR Lifecycle', 'shutdownAll deferred: $_leases lease(s) held');
+      return;
+    }
+    final workers = List.of(_workers);
+    _workers.clear();
+    _isWarm = false;
+    var unconfirmed = 0;
+    for (var w in workers) {
+      if (!await w.shutdown(timeout: timeout)) unconfirmed++;
+    }
+    // Report the observed count, never a hard-coded "0" — a log line that
+    // asserts success unconditionally is how D-13 hid the leak.
+    Log.info(
+      'OCR Lifecycle',
+      'shutdownAll: ${workers.length} worker(s), '
+      'liveSessions=${_lastReport?.sessionCount ?? -1}'
+      '${unconfirmed == 0 ? '' : ', unconfirmed=$unconfirmed'}',
+    );
+  }
+
+  /// Kills all worker isolates without releasing them first. Test-only:
+  /// production code must call [shutdownAll], which releases before killing.
   void dispose() {
     for (var w in _workers) {
-      w.dispose();
+      w.killNow();
     }
     _workers.clear();
+  }
+}
+
+/// Handle returned by [TranslationWorker.acquireLease]; call [release] exactly
+/// once when the task is done with the pool.
+class OcrLease {
+  OcrLease._(this._onRelease);
+
+  final void Function() _onRelease;
+  bool _done = false;
+
+  void release() {
+    if (_done) return;
+    _done = true;
+    _onRelease();
   }
 }
 
@@ -426,6 +502,13 @@ class _IsolateWorker {
         } else {
           pending.complete(message.result);
         }
+      } else if (message is _ReleaseAck) {
+        if (message.report != null) {
+          TranslationWorker.instance._lastReport = message.report;
+        }
+        final ack = _releaseAck;
+        _releaseAck = null;
+        if (ack != null && !ack.isCompleted) ack.complete();
       }
     });
     try {
@@ -522,7 +605,48 @@ class _IsolateWorker {
     _sendPort?.send(const _ReleaseRequest());
   }
 
-  void dispose() {
+  Completer<void>? _releaseAck;
+
+  /// Frees the native sessions inside the isolate, waits for its ack, and only
+  /// then kills it.
+  ///
+  /// The order is the whole point: `Isolate.kill(immediate)` discards the Dart
+  /// heap that held the `OrtSession` handles while the ONNX Runtime library —
+  /// loaded once per process — keeps the D3D12 allocations alive. Killing
+  /// first therefore does not "release memory early", it makes the memory
+  /// permanently unreclaimable (plan D-1).
+  ///
+  /// Returns `false` when the ack never arrived; the isolate is killed anyway
+  /// so a wedged worker cannot hang shutdown, but the caller learns the
+  /// release was not confirmed.
+  Future<bool> shutdown({Duration timeout = const Duration(seconds: 8)}) async {
+    var port = _sendPort;
+    if (port == null) {
+      killNow();
+      return true;
+    }
+    final ack = Completer<void>();
+    _releaseAck = ack;
+    port.send(const _ReleaseRequest());
+    var confirmed = true;
+    try {
+      await ack.future.timeout(timeout);
+    } catch (_) {
+      confirmed = false;
+      // release-ack-timeout: the only place allowed to kill without an ack.
+      Log.error(
+        'OCR Lifecycle',
+        'release ack timeout, force kill (VRAM may stay pinned)',
+      );
+    }
+    _releaseAck = null;
+    killNow();
+    return confirmed;
+  }
+
+  /// Kills the isolate without giving it a chance to release anything.
+  /// Only for crash recovery and tests; production paths use [shutdown].
+  void killNow() {
     _isolate?.kill(priority: Isolate.immediate);
     _isolate = null;
     _sendPort = null;
@@ -574,6 +698,9 @@ void _workerMain(SendPort mainPort) {
       }
     } else if (message is _ReleaseRequest) {
       state.release();
+      // Ack with the post-release report so the caller can confirm sessions
+      // really dropped to zero before it kills this isolate.
+      mainPort.send(_ReleaseAck(state.report));
     }
   });
 }

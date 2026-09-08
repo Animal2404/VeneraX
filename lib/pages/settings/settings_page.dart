@@ -20,6 +20,7 @@ import 'package:venera/foundation/image_enhance_shader.dart';
 import 'package:venera/foundation/image_translation/llm_translator.dart';
 import 'package:venera/foundation/image_translation/ort_capabilities.dart';
 import 'package:venera/foundation/image_translation/pre_translation_tasks.dart';
+import 'package:venera/foundation/image_translation/process_diagnostics.dart';
 import 'package:venera/foundation/image_translation/translation_config.dart';
 import 'package:venera/foundation/image_translation/translation_models.dart';
 import 'package:venera/foundation/image_translation/translation_performance_config.dart';

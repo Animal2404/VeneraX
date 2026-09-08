@@ -543,7 +543,9 @@ class OrtFfiSession {
         OrtApiIdx.sessionGetOutputCount,
         OrtApiIdx.sessionGetOutputName,
       );
-      return OrtFfiSession._(rt, session, inputNames, outputNames, ep);
+      final opened = OrtFfiSession._(rt, session, inputNames, outputNames, ep);
+      liveSessions++;
+      return opened;
     } finally {
       if (options != null) {
         rt._releaser(OrtApiIdx.releaseSessionOptions)(options);
@@ -1068,7 +1070,20 @@ class OrtFfiSession {
     }
   }
 
+  /// Sessions currently open in this isolate's runtime. Reported by the
+  /// diagnostics page and the baseline table; the number is only trustworthy
+  /// because [close] is idempotent and every production path reaches it.
+  static int liveSessions = 0;
+
+  bool _closed = false;
+
   void close() {
+    // Idempotent: the CPU-fallback path can reach close() twice for the same
+    // handle, and a second ReleaseSession on a freed pointer is undefined
+    // behaviour, not a harmless no-op.
+    if (_closed) return;
+    _closed = true;
     _rt._releaser(OrtApiIdx.releaseSession)(_session);
+    if (liveSessions > 0) liveSessions--;
   }
 }
