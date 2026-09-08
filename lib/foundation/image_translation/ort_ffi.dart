@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io';
 import 'dart:typed_data';
@@ -204,10 +205,32 @@ class OrtRuntime {
   /// Throws if [status] is an error; releases it either way.
   void _check(Pointer<Void> status) {
     if (status == nullptr) return;
-    var message = _getErrorMessage(status).toDartString();
+    var message = _statusMessage(status);
     _releaseStatus(status);
     final kind = OrtFfiException.classify(message);
     throw OrtFfiException(message, kind);
+  }
+
+  /// Reads an OrtStatus message without letting the decoder hijack the error.
+  ///
+  /// `toDartString()` decoded strictly and threw `FormatException: Unexpected
+  /// extension byte` on a driver-supplied error blob — so the real ONNX Runtime
+  /// message was lost and every GPU failure surfaced as an unrelated decoding
+  /// error (this is exactly what blocked diagnosing D-15). Scan to the
+  /// terminator, then decode leniently.
+  String _statusMessage(Pointer<Void> status) {
+    final raw = _getErrorMessage(status).cast<Uint8>();
+    if (raw == nullptr) return '(OrtStatus with no message)';
+    var length = 0;
+    while (length < 8192 && raw[length] != 0) {
+      length++;
+    }
+    if (length == 0) return '(empty OrtStatus message)';
+    try {
+      return utf8.decode(raw.asTypedList(length), allowMalformed: true);
+    } catch (_) {
+      return String.fromCharCodes(raw.asTypedList(length));
+    }
   }
 
   Pointer<Void>? _env;

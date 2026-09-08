@@ -86,6 +86,34 @@ build/windows/x64/runner/Release/venera.exe --headless ocr-golden \
 dart run tool/ocr_run_stats.dart /tmp/golden_b0.json   # 直接吐出可粘贴的 B0 行
 ```
 
+## D-15：DirectML 在 en/ko 识别器的 `Softmax_0` 节点返回 E_INVALIDARG（挡住 G1）
+
+D-14 修好后的第一次真实测量（**云端产物** `windows_build` @ `c842b2e`，本机 RTX 3060）在跑到英文/韩文页时崩溃：
+
+```
+[E:onnxruntime] sequential_executor.cc:572 ExecuteKernel
+  Non-zero status code returned while running Softmax node. Name:'Softmax_0'
+  Status Message: ...DmlExecutionProvider...MLOperatorAuthorImpl.cpp(2851)... 80070057   <- E_INVALIDARG
+```
+
+### 归属离线确定（不靠猜）
+扫描本机已下载模型的节点名字符串：`ocr_enec.onnx` 与 `ocr_koec.onnx` **含** `Softmax_0`；
+`ocr_zhec.onnx`、`ocr_ja\{encoder,decoder}.onnx` 无此名；两个检测模型完全无 Softmax。
+=> 崩的是 **PP-OCRv3 英文 / PP-OCRv1 韩文识别器**。也就是说：DirectML 后端下，英/韩 OCR 至少在语料遇到的某个形状上不可用。
+这正是 §9.2.5「改变主意触发条件 ②（DML 算子不支持）」的真实样本 —— 但结论不该是"回去接 CUDA"，
+而应先查清形状触发条件（这三条模型此前从未被新的 rec 桶化/批量喂过）。
+
+### 同时修掉一个"吞错误"缺陷（已提交）
+`OrtRuntime._check` 原先对 ORT 状态文本用**严格** UTF-8 解码；驱动错误块含非法字节时它抛
+`FormatException: Unexpected extension byte (at offset 286)`，于是**真正的 ORT 错误被丢弃**，
+看到的是一条与 GPU 无关的解码异常。已改为扫描终止符 + `allowMalformed` 解码，解码器不再反客为主。
+没有这个修复，D-15 无法定位。
+
+### 下一步（顺序固定）
+1. 以 `--batches 1`（等价改造前的逐条路径）单独跑 en/ko 两页，区分「批量/pad 形状触发」与「本 DML 版本不支持该算子」；
+2. 前者→收紧 en/ko 的 `planRecBatch` 桶分配；后者→该算子走 CPU 回退并在 `LOCK.md` 记为 DML 已知不支持项；
+3. **在此之前 B0 的 en/ko 两列留空，G1 不得宣布通过。**
+
 ## 探针可用性记录（诚实声明）
 
 | 探针 | 状态 | 说明 |
