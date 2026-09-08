@@ -128,6 +128,10 @@ class EpReport {
     required this.attempts,
     required this.modelInputShapes,
     required this.batchCapable,
+    this.sessionCount = 0,
+    this.arenaCapacityBytes = 0,
+    this.hiddenArenaCapacityBytes = 0,
+    this.degradedTrail = const [],
   });
 
   final OrtEpKind active;
@@ -136,11 +140,31 @@ class EpReport {
   final Map<String, List<int>> modelInputShapes;
   final bool batchCapable;
 
+  /// Live `OrtFfiSession` count in the reporting worker. This is what makes
+  /// "did the VRAM actually come back?" observable (plan D-1 / V7-1): a
+  /// shutdown that leaves sessions > 0 released nothing.
+  final int sessionCount;
+
+  /// Capacity of the two native staging arenas, in bytes. These are **host**
+  /// allocations, not VRAM — they cover the isolate-heap half of the story and
+  /// must never be presented as a GPU number (plan §3.6).
+  final int arenaCapacityBytes;
+  final int hiddenArenaCapacityBytes;
+
+  /// Shrink/fallback events for this worker, e.g. `rec16<-32`, `det1<-4`,
+  /// `cpu`. The perf log used to hard-code `degraded=none` and so could never
+  /// show a real fallback (plan D-5).
+  final List<String> degradedTrail;
+
   Map<String, dynamic> toJson() => {
         'active': active.name,
         'runtimeVersion': runtimeVersion,
         'attempts': attempts,
         'modelInputShapes': modelInputShapes,
         'batchCapable': batchCapable,
+        'sessionCount': sessionCount,
+        'arenaCapacityBytes': arenaCapacityBytes,
+        'hiddenArenaCapacityBytes': hiddenArenaCapacityBytes,
+        'degradedTrail': degradedTrail,
       };
 }

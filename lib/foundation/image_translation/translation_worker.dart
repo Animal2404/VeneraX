@@ -668,6 +668,17 @@ class _WorkerState {
   final _arena = OrtTensorArena();
   final _hiddenArena = OrtTensorArena();
 
+  /// Shrink/fallback events observed by this worker, e.g. `rec16<-32`.
+  /// Recorded so the perf log and the diagnostics page can show a real
+  /// degradation instead of the previously hard-coded `degraded=none` (D-5).
+  final _degradedTrail = <String>[];
+
+  /// Called by the batch paths when they back off. Sticky for the process:
+  /// retrying the size that just failed would only fail again.
+  void noteDegraded(String event) {
+    if (!_degradedTrail.contains(event)) _degradedTrail.add(event);
+  }
+
   OrtProbe _getProbe() {
     return _probe ??= probeOrtRuntime();
   }
@@ -679,6 +690,10 @@ class _WorkerState {
         modelInputShapes: Map.unmodifiable(_inputShapes),
         batchCapable: _inputShapes.values.isNotEmpty &&
             _inputShapes.values.every((s) => s.isNotEmpty && s[0] <= 0),
+        sessionCount: _sessions.length,
+        arenaCapacityBytes: _arena.capacityBytes,
+        hiddenArenaCapacityBytes: _hiddenArena.capacityBytes,
+        degradedTrail: List.unmodifiable(_degradedTrail),
       );
 
   OrtFfiSession _session(String path) {
@@ -1171,12 +1186,14 @@ class _WorkerState {
     final pagesStr = req.pages.map((p) => p.pageIndex).join(',');
     final totalArenaBytes = _arena.capacityBytes + _hiddenArena.capacityBytes;
     final perfLog = 'pages=[$pagesStr] ep=${_ep.name} '
+        'batch={det:${req.detBatch},rec:${req.recBatch}} '
         'det={tiles:$detTilesCount buckets:$detBatchesCount ms:${detSw.elapsedMilliseconds}} '
         'rec={groups:$recGroupsCount batches:$recBatchesCount crops:$recCropsCount ms:${recSw.elapsedMilliseconds}} '
         'dec={rows:$decRowsCount steps:$decStepsCount ms:${decSw.elapsedMilliseconds}} '
         'total_ms=${totalSw.elapsedMilliseconds} '
         'bytes_in_arena=${(totalArenaBytes / (1024 * 1024)).toStringAsFixed(1)}MB '
-        'degraded=none';
+        'sessions=${_sessions.length} '
+        'degraded=${_degradedTrail.isEmpty ? "none" : _degradedTrail.join(",")}';
 
     return (results, perfLog);
   }
