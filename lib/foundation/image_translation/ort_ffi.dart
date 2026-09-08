@@ -27,6 +27,18 @@ class OrtFfiException implements Exception {
 
   static OrtFfiErrorKind classify(String message) {
     final lower = message.toLowerCase();
+    // Order matters. A DirectML `Run` failure mentions `DmlExecutionProvider`,
+    // which the broad 'provider' test below would label `epUnavailable` — and
+    // an out-of-memory inside a provider would then be "fixable" by switching
+    // providers instead of shrinking the batch. Genuine resource exhaustion is
+    // decided first so the batch ladder gets the error it can actually act on.
+    if (lower.contains('out of memory') ||
+        lower.contains('e_outofmemory') ||
+        lower.contains('failed to allocate') ||
+        lower.contains('cuda out of memory') ||
+        lower.contains('bad_alloc')) {
+      return OrtFfiErrorKind.outOfMemory;
+    }
     if (lower.contains('not registered') ||
         lower.contains('provider') ||
         lower.contains('does not implement') ||
@@ -35,13 +47,6 @@ class OrtFfiException implements Exception {
         lower.contains('loadlibrary') ||
         lower.contains('no available device')) {
       return OrtFfiErrorKind.epUnavailable;
-    }
-    if (lower.contains('out of memory') ||
-        lower.contains('e_outofmemory') ||
-        lower.contains('failed to allocate') ||
-        lower.contains('cuda out of memory') ||
-        lower.contains('bad_alloc')) {
-      return OrtFfiErrorKind.outOfMemory;
     }
     if (lower.contains('device side assert') ||
         lower.contains('device_removed') ||

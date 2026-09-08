@@ -844,13 +844,45 @@ class _WorkerState {
         degradedTrail: List.unmodifiable(_degradedTrail),
       );
 
-  OrtFfiSession _session(String path) {
-    final key = '$path@${_ep.name}';
+  /// Rec recognizers that DirectML cannot execute (plan D-15).
+  ///
+  /// On the pinned stack (ORT DirectML 1.22.0 + DirectML 1.15.4, RTX 3060) the
+  /// English PP-OCRv3 and Korean PP-OCRv1 recognizers fail *inside* `Run` at
+  /// their `Softmax_0` node with E_INVALIDARG (80070057). `Softmax_0` exists in
+  /// no other asset we ship: not in the zh rec, not in either manga-ocr graph,
+  /// not in the two detectors. A `Run`-time failure has no execution-provider
+  /// fallback — the retry state machine only guards session creation — so these
+  /// two are pinned to the CPU EP, where 8.9 MB and 3.3 MB models cost nothing
+  /// measurable, instead of failing the page.
+  ///
+  /// This is containment, not a cure: the shape predicate inside the closed
+  /// `MLOperatorAuthorImpl` could not be determined from the repository, so the
+  /// model directory names are the (data, not logic) boundary. Extending the
+  /// list is the response if another recognizer starts failing the same way.
+  static const _cpuOnlyRecDirs = ['ocr_en', 'ocr_ko'];
+
+  static bool _isCpuOnlyRec(String path) {
+    final norm = path.replaceAll(r'', '/');
+    return _cpuOnlyRecDirs.any((dir) => norm.contains('/$dir/'));
+  }
+
+  /// Opens (or reuses) a session for [path].
+  ///
+  /// [forceCpu] pins the model to the CPU EP. The cache key must then name
+  /// `cpu` explicitly: `_ep` is a worker-wide field that each successful open
+  /// rewrites, so a CPU-pinned session created while `_ep == directml` would be
+  /// stored under a key nobody looks up again — re-opening the same file on the
+  /// failing provider and leaving the good session stranded in the map.
+  OrtFfiSession _session(String path, {bool forceCpu = false}) {
+    final key =
+        '$path@${forceCpu ? OrtEpKind.cpu.name : _ep.name}';
     final existing = _sessions[key];
     if (existing != null) return existing;
 
     final probe = _getProbe();
-    final order = planEpOrder(currentPref, probe);
+    final order = forceCpu
+        ? const [OrtEpKind.cpu]
+        : planEpOrder(currentPref, probe);
 
     for (final candidate in order) {
       try {
@@ -859,7 +891,10 @@ class _WorkerState {
           ep: candidate,
           intraOpThreads: _intraThreads,
         );
-        _ep = candidate;
+        // A CPU-pinned model must not rewrite the worker-wide provider: doing
+        // so would make every later key claim `cpu` and re-open unrelated
+        // models on the wrong EP.
+        if (!forceCpu) _ep = candidate;
         _attempts.add('${candidate.name}:ok');
         _sessions[key] = session;
         try {
@@ -1488,7 +1523,7 @@ class _WorkerState {
     if (lineItems.isEmpty) return const [];
     final modelPath = paths.recModels[lang];
     if (modelPath == null) return List.filled(lineItems.length, '');
-    final session = _session(modelPath);
+    final session = _session(modelPath, forceCpu: _isCpuOnlyRec(modelPath));
     final List<String> charset;
     try {
       charset = _charsetFor(lang, paths);
