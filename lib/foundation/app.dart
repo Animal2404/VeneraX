@@ -12,6 +12,7 @@ import 'package:venera/foundation/image_translation/translation_store.dart';
 import 'package:venera/foundation/read_later.dart';
 
 import 'appdata.dart';
+import 'headless_trace.dart';
 import 'domain_database.dart';
 import 'favorites.dart';
 import 'local.dart';
@@ -111,23 +112,29 @@ class _App {
   }
 
   Future<void> initComponents() async {
-    final futures = <Future<void>>[
-      data.init(),
-      history.init(),
-      readLater.init(),
-      favorites.init(),
-      domain.init(dataPath),
-      local.init(),
-      TranslationStore().init(),
+    // Named so a stalled store is identifiable: these run concurrently, so the
+    // one that never logs "done" is the blocker (D-14). Tracing is a no-op
+    // unless `--headless --trace` turned it on.
+    final futures = <(String, Future<void>)>[
+      ('data', data.init()),
+      ('history', history.init()),
+      ('readLater', readLater.init()),
+      ('favorites', favorites.init()),
+      ('domain', domain.init(dataPath)),
+      ('local', local.init()),
+      ('translationStore', TranslationStore().init()),
     ];
     // One store failing must not abort its siblings: an unguarded Future.wait
     // rejected on the first error and left every later store uninitialized —
     // the "init failed but the app carried on" startup chain.
     await Future.wait(
-      futures.map((future) async {
+      futures.map((entry) async {
+        headlessTrace('component ${entry.$1} ->');
         try {
-          await future;
+          await entry.$2;
+          headlessTrace('component ${entry.$1} done');
         } catch (e, s) {
+          headlessTrace('component ${entry.$1} failed: $e');
           Log.error("init", "$e\n$s");
         }
       }),

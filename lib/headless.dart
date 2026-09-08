@@ -7,6 +7,7 @@ import 'package:venera/foundation/log.dart';
 import 'package:venera/pages/comic_source_page.dart';
 import 'package:venera/init.dart';
 import 'package:venera/foundation/follow_updates.dart';
+import 'package:venera/foundation/headless_trace.dart';
 import 'package:venera/foundation/follow_update_scope.dart';
 import 'package:venera/foundation/app.dart';
 import 'package:venera/foundation/favorites.dart';
@@ -22,8 +23,16 @@ void cliPrint(Map<String, dynamic> data) {
   print('[CLI PRINT] ${jsonEncode(data)}');
 }
 
+/// Startup tracing for `--headless --trace` (see `foundation/headless_trace.dart`
+/// for why a file and not a log line).
+void _trace(String step) => headlessTrace(step);
+
 Future<void> runHeadlessMode(List<String> args) async {
+  headlessTraceEnabled = args.contains('--trace');
+  if (headlessTraceEnabled) headlessTraceStart('run ${DateTime.now()}');
+  _trace('ensureInitialized');
   WidgetsFlutterBinding.ensureInitialized();
+  _trace('binding ready');
   if (args.contains('--ignore-disheadless-log')) {
     Log.isMuted = true;
   }
@@ -38,13 +47,18 @@ Future<void> runHeadlessMode(List<String> args) async {
   }
 
   // Need to initialize the app for some features to work
+  _trace('init() ->');
   await init();
+  _trace('init() done');
   // The import path restores backups into LIVE stores (in-place, via the
   // SQLite backup API) instead of swapping files, so every store must be open
   // before a `webdav down` applies data — this also satisfies
   // coreDataStoresReady, which gates applying backups.
+  _trace('cookieJar ->');
   await SingleInstanceCookieJar.createInstance();
+  _trace('cookieJar done; initComponents ->');
   await App.initComponents();
+  _trace('initComponents done');
   // Headless never runs initDeferred(); complete the gate so DataSync's
   // download entry (which waits for deferred init before applying backups)
   // proceeds immediately instead of stalling on its 60s safety timeout.
