@@ -19,5 +19,5 @@ const firstChapter = 1;
 /// GitHub repository this build belongs to. Single edit point for a fork: the
 /// update check, the update package download, the changelog fetch, the
 /// repository link, and model release downloads all resolve through these.
-const kUpdateRepoOwner = 'Kyosee';
+const kUpdateRepoOwner = 'Animal2404';
 const kUpdateRepoName = 'VeneraX';
