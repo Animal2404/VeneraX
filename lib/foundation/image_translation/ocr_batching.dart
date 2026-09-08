@@ -420,6 +420,40 @@ BatchProfile cappedBy(BatchProfile profile, BatchProfile? ceiling) {
   );
 }
 
+/// The OOM shrink ladder as a control flow, shared by all three batch passes
+/// (det / rec / dec) so their semantics cannot drift — the very failure mode
+/// that produced D-5, where only rec carried the ladder.
+///
+/// [attempt] runs one whole pass at the given profile. **It must be safe to
+/// re-run from scratch**: the rec pass writes per original index and
+/// recognition is deterministic, the det pass dedups boxes by IoU, and the
+/// dec pass only appends to `results` as its final step. On an out-of-memory
+/// [profileAfterOom] decides whether a smaller profile exists; if so,
+/// [onShrink] records the retreat (the caller composes [next] into its
+/// sticky ceiling via [cappedBy] and names a pass-specific degraded event
+/// like `det1<-4` / `dec16<-32`) and the pass re-runs. Every other error —
+/// and OOM once recBatch has reached 1 — rethrows: an allocation failure is
+/// never swallowed, a page that genuinely cannot fit must still fail loudly.
+void runWithShrinkLadder({
+  required BatchProfile start,
+  required void Function(BatchProfile attempt) attempt,
+  required void Function(BatchProfile next, BatchProfile previous) onShrink,
+}) {
+  var current = start;
+  for (;;) {
+    try {
+      attempt(current);
+      return;
+    } on OrtFfiException catch (e) {
+      final next = profileAfterOom(current, e.kind);
+      if (next == null) rethrow;
+      final previous = current;
+      current = next;
+      onShrink(next, previous);
+    }
+  }
+}
+
 /// Engine routing group for a batch of clusters.
 class EngineGroup {
   const EngineGroup({

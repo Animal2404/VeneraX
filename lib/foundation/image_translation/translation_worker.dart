@@ -665,6 +665,16 @@ class _IsolateWorker {
 // ===========================================================================
 
 void _workerMain(SendPort mainPort) {
+  // Wire the dict/model class-count sink delivered with `ort_ffi.dart`
+  // (D-11 companion): `runArgmaxGrid` compares the output tensor's class
+  // axis (`shape.last`) against the active charset length on every run and
+  // routes the mismatch through this hook. The assignment belongs here —
+  // the worker isolate is where sessions live, and it is the only side
+  // allowed to pull `Log` (which drags `dart:ui` via `foundation/app.dart`)
+  // into `ort_ffi.dart`'s reach; that file must keep compiling under plain
+  // `dart run` for `tool/ort_ep_selfcheck.dart`. Unwired, the hook falls
+  // back to print() and never reaches the app log or the diagnostics page.
+  OrtFfiSession.classMismatchWarning = Log.warning;
   var port = ReceivePort();
   mainPort.send(port.sendPort);
   var state = _WorkerState();
@@ -788,17 +798,232 @@ class _ClusterWork {
 /// fold away and the normal path is byte-for-byte the behavior it always had.
 const bool ocrDebugForceOom = bool.fromEnvironment('OCR_DEBUG_FORCE_OOM');
 
+/// Session bookkeeping for [_WorkerState]: a cache of ONNX sessions keyed by
+/// **model path + the execution provider that session actually runs on**.
+///
+/// Extracted from the old inline `_session()` and made generic over the
+/// session type so its invariants are unit-testable — `OrtFfiSession.open`
+/// reaches for `onnxruntime.dll` and cannot be faked inside a test (see
+/// `test/ocr_worker_session_test.dart`).
+///
+/// The invariants, and why they are the correct semantics:
+///
+///  * **Exactly one live session per path.** This map is the only thing
+///    standing between a native `OrtSession` handle and being forgotten:
+///    [_WorkerState.release] is the sole production caller of
+///    `OrtFfiSession.close()`, so an entry that no lookup can reach again is
+///    not a cache hit waiting for reuse — it is VRAM pinned for the life of
+///    the isolate (the D-1 leak class), plus a `sessionCount` reporting more
+///    live sessions than the worker can still address. The old code produced
+///    exactly that state: once a model fell back to CPU while the
+///    worker-wide `_ep` still said `directml`, every later lookup of that
+///    path asked for `path@cpu`, missed, re-opened the model, and left the
+///    old `path@directml` handle stranded in the map — same model, two
+///    providers, double VRAM, inflated count. Every publish now goes through
+///    [_publish], which closes and removes any session of the same path on
+///    every *other* EP first. `OrtFfiSession.close()` is idempotent, so the
+///    eviction cannot double-free even if a stale Dart reference reaches it.
+///
+///  * **The key names the EP the session was opened on, not the EP the
+///    lookup guessed.** The old code computed the key once on entry from
+///    the (stale) `_ep` and then stored the successful session under it no
+///    matter which candidate actually won — so the first DirectML success
+///    inside a worker (entry `_ep == cpu`, the initial value) was filed
+///    under `path@cpu`, guaranteeing a pointless re-open on the next call.
+///    The entry lookup here uses [observedEp] (or `cpu` when pinned) only
+///    as a *prediction* for the cache fast path; storage always uses the
+///    winning candidate.
+///
+///  * **[observedEp] is an observation, not an instruction.** It records
+///    "the EP of the most recent **non-pinned** open success" — a sample of
+///    what the GPU is currently doing for this worker, consumed by
+///    `BatchProfile.forEp`, the perf log and `EpReport.active`. It never
+///    advances on a CPU-pinned (D-15) open, and no session ever *runs on*
+///    it — each session's real EP is whatever its key says.
+class EpSessionCache<S> {
+  EpSessionCache({
+    required this.open,
+    required this.release,
+    this.onOpened,
+  });
+
+  /// Creates a session for [path] on [ep]; throws an `OrtFfiException` when
+  /// the provider cannot host the model.
+  final S Function(String path, OrtEpKind ep, int intraOpThreads) open;
+
+  /// Called exactly once per session when it leaves the map — either
+  /// because the same path was superseded on another EP, or via [closeAll].
+  final void Function(S session) release;
+
+  /// Notified after a loop-success open, with the winning EP — used by the
+  /// worker to record input shapes for `EpReport`; keeping it a callback is
+  /// what lets the cache stay free of native types.
+  final void Function(S session, String path, OrtEpKind ep)? onOpened;
+
+  final _sessions = <String, S>{};
+
+  /// Attempt log (`ep:ok` / `ep:fail(kind):msg…`), surfaced through
+  /// `EpReport.attempts`.
+  final attempts = <String>[];
+
+  /// EP of the most recent **non-pinned** open success. See class comment.
+  OrtEpKind observedEp = OrtEpKind.cpu;
+
+  int _consecutiveFailures = 0;
+
+  int get sessionCount => _sessions.length;
+
+  Iterable<String> get keys => _sessions.keys;
+
+  static String keyFor(String path, OrtEpKind ep) => '$path@${ep.name}';
+
+  bool contains(String path, OrtEpKind ep) =>
+      _sessions.containsKey(keyFor(path, ep));
+
+  /// Open (or reuse) a session for [path], walking the provider fallback
+  /// ladder. [forceCpu] pins the model to the CPU EP (plan D-15): the order
+  /// collapses to `[cpu]`, the key says `cpu` explicitly, and [observedEp]
+  /// is deliberately left untouched.
+  S resolve(
+    String path, {
+    required EpPreference pref,
+    required OrtProbe probe,
+    required int intraOpThreads,
+    bool forceCpu = false,
+  }) {
+    final hit = _sessions[keyFor(path, forceCpu ? OrtEpKind.cpu : observedEp)];
+    if (hit != null) return hit;
+
+    final order = forceCpu ? const [OrtEpKind.cpu] : planEpOrder(pref, probe);
+
+    for (final candidate in order) {
+      try {
+        final session = open(path, candidate, intraOpThreads);
+        // A pinned model must not rewrite the worker-wide observation —
+        // that guard (kept from the D-15 fix) is what stops the CPU-only
+        // recognizers from dragging every later key/profile decision to
+        // CPU.
+        if (!forceCpu) observedEp = candidate;
+        attempts.add('${candidate.name}:ok');
+        _publish(path, candidate, session);
+        onOpened?.call(session, path, candidate);
+        return session;
+      } on OrtFfiException catch (e) {
+        final truncated =
+            e.message.length > 200 ? e.message.substring(0, 200) : e.message;
+        attempts.add('${candidate.name}:fail(${e.kind.name}):$truncated');
+        final decision = decideAfterFailure(
+          e,
+          alreadyTried: attempts.length,
+          consecutiveFailures: _consecutiveFailures,
+        );
+        switch (decision) {
+          case EpDecision.tryNextEp:
+          case EpDecision.shrinkAndRetry:
+            _consecutiveFailures++;
+            continue;
+          case EpDecision.goCpuPermanently:
+            observedEp = OrtEpKind.cpu;
+            _consecutiveFailures = 0;
+            final cpuSession = open(path, OrtEpKind.cpu, intraOpThreads);
+            _publish(path, OrtEpKind.cpu, cpuSession);
+            return cpuSession;
+        }
+      } catch (e) {
+        attempts.add('${candidate.name}:fail(other):$e');
+        continue;
+      }
+    }
+
+    observedEp = OrtEpKind.cpu;
+    final cpuSession = open(path, OrtEpKind.cpu, intraOpThreads);
+    _publish(path, OrtEpKind.cpu, cpuSession);
+    return cpuSession;
+  }
+
+  /// File [session] under its real EP and supersede every other session of
+  /// the same path (class comment, invariant 1). The keep-key is included
+  /// in the sweep: a re-open landing on the EP an older session already
+  /// holds must release that older handle too, never silently overwrite it.
+  void _publish(String path, OrtEpKind ep, S session) {
+    for (final other in OrtEpKind.values) {
+      final stale = _sessions.remove(keyFor(path, other));
+      if (stale != null && !identical(stale, session)) release(stale);
+    }
+    _sessions[keyFor(path, ep)] = session;
+  }
+
+  /// Release every session in the map and forget it (the worker's release /
+  /// reconfigure point). Attempts and [observedEp] survive — the old inline
+  /// `release()` kept them too, and the observation is about the provider,
+  /// not about any one session.
+  void closeAll() {
+    for (final session in _sessions.values) {
+      release(session);
+    }
+    _sessions.clear();
+  }
+}
+
+/// Pure half of the dict-vs-model class-count check on the batch path
+/// ([_WorkerState._charsetFor]).
+///
+/// Returns a one-line warning when [expectedClasses] (the opened session's
+/// real output class count, `shape.last`) disagrees with [charsetLength]
+/// (dict lines + 2, see [loadCharset]); `null` when they agree **or when
+/// [expectedClasses] is `null`** — a null means the probe could not read
+/// the model's output shape, in which case the check is explicitly skipped:
+/// a missing observation must never be counted as a mismatch.
+String? charsetClassMismatch({
+  required String lang,
+  required int charsetLength,
+  required int? expectedClasses,
+  String? dictPath,
+}) {
+  if (expectedClasses == null || expectedClasses == charsetLength) return null;
+  return 'Model output classes ($expectedClasses) does not match charset '
+      'length ($charsetLength) for $lang'
+      '${dictPath == null ? '' : ' (dict $dictPath)'}';
+}
+
 class _WorkerState {
-  final _sessions = <String, OrtFfiSession>{};
+  /// The one-live-session-per-path cache described by [EpSessionCache].
+  /// Named `_sessions` for continuity; `sessionCount`/`keys`/`attempts`
+  /// replace the direct map reads the old inline implementation had.
+  late final _sessions = EpSessionCache<OrtFfiSession>(
+    open: (path, ep, threads) =>
+        OrtFfiSession.open(path, ep: ep, intraOpThreads: threads),
+    release: (session) => session.close(),
+    onOpened: (session, path, ep) {
+      try {
+        final shapes = session.inputShapes();
+        if (shapes.isNotEmpty) {
+          _inputShapes[path] = shapes.values.first;
+        }
+      } catch (_) {}
+    },
+  );
   final _charsets = <String, List<String>>{};
+
+  /// Output class count (`shape.last`) probed once per rec model path from
+  /// the **already opened** session, cached because the probe costs an
+  /// inference. A `null` value is a cached *failure* — the probe threw or the
+  /// graph exposes no rank — and the dict/model class check is then
+  /// explicitly skipped for that path, never guessed. Cleared in [release]
+  /// together with the sessions it describes.
+  final _recClasses = <String, int?>{};
+
+  /// `lang@classes` pairs already warned about, so a genuine dict/model
+  /// mismatch logs once per worker instead of once per batch.
+  final _charsetMismatchNoted = <String>{};
   WordPieceVocab? _jaVocab;
   int _intraThreads = 2;
   EpPreference currentPref = EpPreference.auto;
 
-  OrtEpKind _ep = OrtEpKind.cpu;
+  /// The worker's EP observation — owned by [_sessions], read-only here.
+  OrtEpKind get _ep => _sessions.observedEp;
+
   OrtProbe? _probe;
-  int _consecutiveFailures = 0;
-  final _attempts = <String>[];
   final _inputShapes = <String, List<int>>{};
   final _arena = OrtTensorArena();
   final _hiddenArena = OrtTensorArena();
@@ -834,11 +1059,11 @@ class _WorkerState {
   EpReport get report => EpReport(
         active: _ep,
         runtimeVersion: OrtRuntime.runtimeVersion(),
-        attempts: List.unmodifiable(_attempts),
+        attempts: List.unmodifiable(_sessions.attempts),
         modelInputShapes: Map.unmodifiable(_inputShapes),
         batchCapable: _inputShapes.values.isNotEmpty &&
             _inputShapes.values.every((s) => s.isNotEmpty && s[0] <= 0),
-        sessionCount: _sessions.length,
+        sessionCount: _sessions.sessionCount,
         arenaCapacityBytes: _arena.capacityBytes,
         hiddenArenaCapacityBytes: _hiddenArena.capacityBytes,
         degradedTrail: List.unmodifiable(_degradedTrail),
@@ -866,90 +1091,31 @@ class _WorkerState {
     return _cpuOnlyRecDirs.any((dir) => norm.contains('/$dir/'));
   }
 
-  /// Opens (or reuses) a session for [path].
-  ///
-  /// [forceCpu] pins the model to the CPU EP. The cache key must then name
-  /// `cpu` explicitly: `_ep` is a worker-wide field that each successful open
-  /// rewrites, so a CPU-pinned session created while `_ep == directml` would be
-  /// stored under a key nobody looks up again — re-opening the same file on the
-  /// failing provider and leaving the good session stranded in the map.
+  /// Opens (or reuses) a session for [path]. All of the interesting policy —
+  /// the cache key, the provider ladder, the eviction of a superseded EP's
+  /// session for the same path — lives in [EpSessionCache.resolve], which is
+  /// generic over the session type so it can be unit-tested without the
+  /// native runtime. [forceCpu] pins the model to the CPU EP (plan D-15).
   OrtFfiSession _session(String path, {bool forceCpu = false}) {
-    final key =
-        '$path@${forceCpu ? OrtEpKind.cpu.name : _ep.name}';
-    final existing = _sessions[key];
-    if (existing != null) return existing;
-
-    final probe = _getProbe();
-    final order = forceCpu
-        ? const [OrtEpKind.cpu]
-        : planEpOrder(currentPref, probe);
-
-    for (final candidate in order) {
-      try {
-        final session = OrtFfiSession.open(
-          path,
-          ep: candidate,
-          intraOpThreads: _intraThreads,
-        );
-        // A CPU-pinned model must not rewrite the worker-wide provider: doing
-        // so would make every later key claim `cpu` and re-open unrelated
-        // models on the wrong EP.
-        if (!forceCpu) _ep = candidate;
-        _attempts.add('${candidate.name}:ok');
-        _sessions[key] = session;
-        try {
-          final shapes = session.inputShapes();
-          if (shapes.isNotEmpty) {
-            _inputShapes[path] = shapes.values.first;
-          }
-        } catch (_) {}
-        return session;
-      } on OrtFfiException catch (e) {
-        final truncated = e.message.length > 200 ? e.message.substring(0, 200) : e.message;
-        _attempts.add('${candidate.name}:fail(${e.kind.name}):$truncated');
-        final decision = decideAfterFailure(
-          e,
-          alreadyTried: _attempts.length,
-          consecutiveFailures: _consecutiveFailures,
-        );
-        switch (decision) {
-          case EpDecision.tryNextEp:
-          case EpDecision.shrinkAndRetry:
-            _consecutiveFailures++;
-            continue;
-          case EpDecision.goCpuPermanently:
-            _ep = OrtEpKind.cpu;
-            _consecutiveFailures = 0;
-            final cpuSession = OrtFfiSession.open(
-              path,
-              ep: OrtEpKind.cpu,
-              intraOpThreads: _intraThreads,
-            );
-            _sessions['$path@cpu'] = cpuSession;
-            return cpuSession;
-        }
-      } catch (e) {
-        _attempts.add('${candidate.name}:fail(other):$e');
-        continue;
-      }
-    }
-
-    _ep = OrtEpKind.cpu;
-    final cpuSession = OrtFfiSession.open(
+    return _sessions.resolve(
       path,
-      ep: OrtEpKind.cpu,
+      pref: currentPref,
+      probe: _getProbe(),
       intraOpThreads: _intraThreads,
+      forceCpu: forceCpu,
     );
-    _sessions['$path@cpu'] = cpuSession;
-    return cpuSession;
   }
 
   void release() {
-    for (var session in _sessions.values) {
-      session.close();
-    }
-    _sessions.clear();
+    // closeAll() is the single place that hands every session back to the
+    // native runtime (via OrtFfiSession.close(), idempotent).
+    _sessions.closeAll();
     _charsets.clear();
+    // The probed class counts belong to the sessions that just died: a
+    // settings switch may swap in a different model file under the same
+    // path, and a stale count would then either silence a real mismatch
+    // warning or manufacture a wrong one.
+    _recClasses.clear();
     _jaVocab = null;
     _arena.free();
     _hiddenArena.free();
@@ -1066,105 +1232,137 @@ class _WorkerState {
       }
 
       detTilesCount = allTiles.length;
-      final batches = planDetBatch(
-        tiles: [for (var t in allTiles) t.tile],
-        maxBatch: effectiveProfile.detBatch,
-        stride: 32,
-      );
-      detBatchesCount = batches.length;
+      final session = _session(req.paths.detector);
 
-      var session = _session(req.paths.detector);
-
-      for (var batch in batches) {
-        final n = batch.tiles.length;
-        final targetW = batch.w;
-        final targetH = batch.h;
-        final totalElements = n * 3 * targetH * targetW;
-        final offset = _arena.ensure(0, totalElements);
-        _arena.view.fillRange(offset, offset + totalElements, 0.0);
-
-        final tileInfo = <({int pageIndex, int realW, int realH, int origW, int origH, int top})>[];
-        const maxSide = 1280.0;
-        const mean = [0.485, 0.456, 0.406];
-        const std = [0.229, 0.224, 0.225];
-
-        for (var b = 0; b < n; b++) {
-          final t = batch.tiles[b];
-          final tileMeta = allTiles[t.tileIndex];
-          final img = pageImages[tileMeta.pageIndex]!;
-          final scale = math.min(1.0, maxSide / math.max(t.w, t.h));
-          int round32(double v) => math.max(32, (v / 32).round() * 32);
-          final inW = round32(t.w * scale);
-          final inH = round32(t.h * scale);
-          tileInfo.add((
-            pageIndex: tileMeta.pageIndex,
-            realW: inW,
-            realH: inH,
-            origW: t.w,
-            origH: t.h,
-            top: t.top,
-          ));
-
-          final tilePixels = Uint8List.sublistView(
-            img.pixels,
-            t.top * img.width * 4,
-            (t.top + t.h) * img.width * 4,
+      // OOM shrink ladder for the detection pass — see [runWithShrinkLadder]
+      // (plan D-5 / §6.2.3): an allocation failure re-plans the tile list at
+      // the halved profile and retries *in place*, instead of only learning
+      // the lesson when the next request is capped by `cappedBy`. The
+      // retreat is sticky through [_oomCeiling], and `noteDegraded` gets a
+      // `det`-prefixed event so the diagnostics trail names the pass that
+      // actually backed off. The stop rule is deliberately shared with rec
+      // ([profileAfterOom] keys the give-up rung on recBatch): once recBatch
+      // is 1 the page genuinely does not fit and the exception rethrows —
+      // never swallowed. Honest caveat: when the OOM hits at detBatch == 1
+      // the ladder has no per-tile occupancy knob left (tile side-lengths
+      // change detection results and are not part of the ladder), so those
+      // extra rungs only shrink the rec/dec footprint before rethrowing.
+      runWithShrinkLadder(
+        start: effectiveProfile,
+        attempt: (p) {
+          final batches = planDetBatch(
+            tiles: [for (var t in allTiles) t.tile],
+            maxBatch: p.detBatch,
+            stride: 32,
           );
-          final tileImg = RgbaImage(t.w, t.h, tilePixels);
-          final resized = _resizeRegion(tileImg, IntRect(0, 0, t.w, t.h), inW, inH);
+          // The stats describe the plan that actually completed; failed
+          // attempts are not counted twice (same rule as rec).
+          detBatchesCount = batches.length;
 
-          final plane = targetH * targetW;
-          final bOffset = offset + b * 3 * plane;
-          for (var y = 0; y < inH; y++) {
-            final rowIn = y * inW;
-            final rowOut = y * targetW;
-            for (var x = 0; x < inW; x++) {
-              final srcIdx = (rowIn + x) * 4;
-              final dstIdx = rowOut + x;
-              for (var c = 0; c < 3; c++) {
-                _arena.view[bOffset + c * plane + dstIdx] =
-                    (resized[srcIdx + c] / 255.0 - mean[c]) / std[c];
-              }
-            }
-          }
-        }
+          for (var batch in batches) {
+            final n = batch.tiles.length;
+            final targetW = batch.w;
+            final targetH = batch.h;
+            final totalElements = n * 3 * targetH * targetW;
+            final offset = _arena.ensure(0, totalElements);
+            _arena.view.fillRange(offset, offset + totalElements, 0.0);
 
-        session.runInPlace(
-          {
-            session.inputNames.first: OrtInput.nativeFloat32(
-              _arena.pointerAt(offset),
-              totalElements,
-              [n, 3, targetH, targetW],
-            ),
-          },
-          session.outputNames.first,
-          (probsPtr, shape, elementCount) {
-            final plane = targetH * targetW;
+            final tileInfo = <({int pageIndex, int realW, int realH, int origW, int origH, int top})>[];
+            const maxSide = 1280.0;
+            const mean = [0.485, 0.456, 0.406];
+            const std = [0.229, 0.224, 0.225];
+
             for (var b = 0; b < n; b++) {
-              final info = tileInfo[b];
-              final tileProbs = probsPtr + (b * plane);
-              final tileBoxes = _detPostprocessBatchSingle(
-                tileProbs,
-                w: targetW,
-                h: targetH,
-                realW: info.realW,
-                realH: info.realH,
-                tileWidth: info.origW,
-                tileHeight: info.origH,
+              final t = batch.tiles[b];
+              final tileMeta = allTiles[t.tileIndex];
+              final img = pageImages[tileMeta.pageIndex]!;
+              final scale = math.min(1.0, maxSide / math.max(t.w, t.h));
+              int round32(double v) => math.max(32, (v / 32).round() * 32);
+              final inW = round32(t.w * scale);
+              final inH = round32(t.h * scale);
+              tileInfo.add((
+                pageIndex: tileMeta.pageIndex,
+                realW: inW,
+                realH: inH,
+                origW: t.w,
+                origH: t.h,
+                top: t.top,
+              ));
+
+              final tilePixels = Uint8List.sublistView(
+                img.pixels,
+                t.top * img.width * 4,
+                (t.top + t.h) * img.width * 4,
               );
-              final boxesList = pageBoxes[info.pageIndex]!;
-              for (var box in tileBoxes) {
-                box.top += info.top;
-                box.bottom += info.top;
-                if (!boxesList.any((existing) => _iou(existing, box) > 0.5)) {
-                  boxesList.add(box);
+              final tileImg = RgbaImage(t.w, t.h, tilePixels);
+              final resized = _resizeRegion(tileImg, IntRect(0, 0, t.w, t.h), inW, inH);
+
+              final plane = targetH * targetW;
+              final bOffset = offset + b * 3 * plane;
+              for (var y = 0; y < inH; y++) {
+                final rowIn = y * inW;
+                final rowOut = y * targetW;
+                for (var x = 0; x < inW; x++) {
+                  final srcIdx = (rowIn + x) * 4;
+                  final dstIdx = rowOut + x;
+                  for (var c = 0; c < 3; c++) {
+                    _arena.view[bOffset + c * plane + dstIdx] =
+                        (resized[srcIdx + c] / 255.0 - mean[c]) / std[c];
+                  }
                 }
               }
             }
-            return null;
-          },
-        );
-      }
+
+            session.runInPlace(
+              {
+                session.inputNames.first: OrtInput.nativeFloat32(
+                  _arena.pointerAt(offset),
+                  totalElements,
+                  [n, 3, targetH, targetW],
+                ),
+              },
+              session.outputNames.first,
+              (probsPtr, shape, elementCount) {
+                final plane = targetH * targetW;
+                for (var b = 0; b < n; b++) {
+                  final info = tileInfo[b];
+                  final tileProbs = probsPtr + (b * plane);
+                  final tileBoxes = _detPostprocessBatchSingle(
+                    tileProbs,
+                    w: targetW,
+                    h: targetH,
+                    realW: info.realW,
+                    realH: info.realH,
+                    tileWidth: info.origW,
+                    tileHeight: info.origH,
+                  );
+                  final boxesList = pageBoxes[info.pageIndex]!;
+                  for (var box in tileBoxes) {
+                    box.top += info.top;
+                    box.bottom += info.top;
+                    if (!boxesList.any((existing) => _iou(existing, box) > 0.5)) {
+                      boxesList.add(box);
+                    }
+                  }
+                }
+                return null;
+              },
+            );
+          }
+        },
+        onShrink: (next, previous) {
+          _oomCeiling = cappedBy(next, _oomCeiling);
+          noteDegraded('det${next.detBatch}<-${previous.detBatch}');
+          Log.warning(
+            'OCR Perf',
+            'OOM: detBatch ${previous.detBatch}->${next.detBatch}',
+          );
+          // The retry replays the page's batches from the first one. Boxes
+          // merged before the throw are re-derived identically (detection is
+          // deterministic for a fixed tile plan) and dropped by the IoU>0.5
+          // dedup guard above, so a replay can never duplicate a box.
+        },
+      );
       detSw.stop();
     }
 
@@ -1388,7 +1586,7 @@ class _WorkerState {
         'dec={rows:$decRowsCount steps:$decStepsCount ms:${decSw.elapsedMilliseconds}} '
         'total_ms=${totalSw.elapsedMilliseconds} '
         'bytes_in_arena=${(totalArenaBytes / (1024 * 1024)).toStringAsFixed(1)}MB '
-        'sessions=${_sessions.length} '
+        'sessions=${_sessions.sessionCount} '
         'degraded=${_degradedTrail.isEmpty ? "none" : _degradedTrail.join(",")}';
 
     return (results, perfLog);
@@ -1524,32 +1722,42 @@ class _WorkerState {
     final modelPath = paths.recModels[lang];
     if (modelPath == null) return List.filled(lineItems.length, '');
     final session = _session(modelPath, forceCpu: _isCpuOnlyRec(modelPath));
+    final height = paths.recHeights[lang] ?? 48;
+    // Dead-validation fix: `_charsetFor` has always accepted an
+    // `expectedClasses`, but the batch path never passed one, so the
+    // dict-lines-vs-model-classes check silently never ran on the main
+    // path. The number comes from the session we just opened — probed once
+    // per model path via its real output shape (`shape.last`), see
+    // [_probeRecClasses].
+    final expectedClasses = _probeRecClasses(lang, modelPath, session, height);
     final List<String> charset;
     try {
-      charset = _charsetFor(lang, paths);
+      charset = _charsetFor(lang, paths, expectedClasses: expectedClasses);
     } on DictMismatchException catch (e) {
+      // Only a genuinely missing/unreadable dictionary still skips the lang:
+      // without a charset there is nothing to decode with. A mere class
+      // count mismatch now warns instead (see [_charsetFor]).
       Log.error('OCR Worker', 'Skipping batch for $lang due to dict mismatch: $e');
       return List.filled(lineItems.length, '');
     }
-    final height = paths.recHeights[lang] ?? 48;
 
     final results = List.filled(lineItems.length, '');
-    // OOM shrink ladder (plan D-5 / §6.2.3): when a run below reports an
-    // allocation failure, the whole plan is re-planned at the halved profile
-    // and retried; the retreat is sticky for this worker until [release]
-    // (the reconfigure point). Stop rules live in the pure [profileAfterOom]:
-    // non-OOM errors and recBatch==1 rethrow — the exception is never
-    // swallowed, a page that genuinely cannot fit must still fail loudly.
-    var runProfile = profile;
-    List<RecBatch> batches;
-    for (;;) {
-      batches = planRecBatch(
-        lines: [for (var item in lineItems) item.rect],
-        height: height,
-        widthBuckets: runProfile.widthBuckets,
-        maxBatch: runProfile.recBatch,
-      );
-      try {
+    // OOM shrink ladder (plan D-5 / §6.2.3) via the shared
+    // [runWithShrinkLadder]: when a run below reports an allocation failure,
+    // the whole plan is re-planned at the halved profile and retried; the
+    // retreat is sticky for this worker until [release] (the reconfigure
+    // point). Stop rules live in the pure [profileAfterOom]: non-OOM errors
+    // and recBatch==1 rethrow — the exception is never swallowed, a page
+    // that genuinely cannot fit must still fail loudly.
+    runWithShrinkLadder(
+      start: profile,
+      attempt: (p) {
+        final batches = planRecBatch(
+          lines: [for (var item in lineItems) item.rect],
+          height: height,
+          widthBuckets: p.widthBuckets,
+          maxBatch: p.recBatch,
+        );
         for (var batch in batches) {
           final n = batch.rows.length;
           final targetW = batch.maxWidth;
@@ -1622,20 +1830,19 @@ class _WorkerState {
         // Stats describe the plan that actually produced this page's texts;
         // failed attempts are deliberately not counted twice.
         onStats?.call(batches.length, lineItems.length);
-        break;
-      } on OrtFfiException catch (e) {
-        final next = profileAfterOom(runProfile, e.kind);
-        if (next == null) rethrow;
-        final prev = runProfile.recBatch;
-        runProfile = next;
+      },
+      onShrink: (next, previous) {
         _oomCeiling = cappedBy(next, _oomCeiling);
-        noteDegraded('rec${next.recBatch}<-$prev');
-        Log.warning('OCR Perf', 'OOM: recBatch $prev->${next.recBatch}');
+        noteDegraded('rec${next.recBatch}<-${previous.recBatch}');
+        Log.warning(
+          'OCR Perf',
+          'OOM: recBatch ${previous.recBatch}->${next.recBatch}',
+        );
         // Rows decoded before the throw are recomputed by the retry: results
         // are written per originalIndex and recognition is deterministic, so
         // re-running costs a little and corrupts nothing.
-      }
-    }
+      },
+    );
 
     return results;
   }
@@ -1658,100 +1865,223 @@ class _WorkerState {
     final decoder = _session(paths.jaDecoder!);
 
     final results = <String>[];
-    final effectiveBatch = profile.decBatch;
-
-    for (var i = 0; i < targets.length; i += effectiveBatch) {
-      final end = math.min(i + effectiveBatch, targets.length);
-      final chunkTargets = targets.sublist(i, end);
-      final B = chunkTargets.length;
-
-      final totalPixels = B * 3 * 224 * 224;
-      final off = _arena.ensure(0, totalPixels);
-      const plane = 224 * 224;
-      for (var b = 0; b < B; b++) {
-        final t = chunkTargets[b];
-        final resized = _resizeRegion(t.image, t.bounds, 224, 224);
-        final bOffset = off + b * 3 * plane;
-        for (var p = 0; p < plane; p++) {
-          final srcIdx = p * 4;
-          for (var c = 0; c < 3; c++) {
-            _arena.view[bOffset + c * plane + p] =
-                (resized[srcIdx + c] / 255.0 - 0.5) / 0.5;
+    // OOM shrink ladder for the manga-ocr (ja) pass — via the same shared
+    // [runWithShrinkLadder] that guards rec and det (plan D-5 / §6.2.3).
+    // Without it, an allocation failure inside the encoder run or any
+    // decoder step of [runArgmaxLastPosition] escaped the whole request, and
+    // the shrink only took effect on the *next* request via `cappedBy`. A
+    // chunk that dies on allocation is retried here and now at the halved
+    // profile, sticky through [_oomCeiling]; the trail event is
+    // `dec`-prefixed so diagnostics name the pass that actually retreated.
+    // The give-up rule is deliberately shared with rec: [profileAfterOom]
+    // stops at recBatch == 1 and the exception rethrows — never swallowed.
+    var runProfile = profile;
+    var cursor = 0;
+    while (cursor < targets.length) {
+      void runChunk(BatchProfile plan) {
+        final chunkSize = math.min(plan.decBatch, targets.length - cursor);
+        final chunkTargets = targets.sublist(cursor, cursor + chunkSize);
+        final B = chunkTargets.length;
+        final totalPixels = B * 3 * 224 * 224;
+        final off = _arena.ensure(0, totalPixels);
+        const plane = 224 * 224;
+        for (var b = 0; b < B; b++) {
+          final t = chunkTargets[b];
+          final resized = _resizeRegion(t.image, t.bounds, 224, 224);
+          final bOffset = off + b * 3 * plane;
+          for (var p = 0; p < plane; p++) {
+            final srcIdx = p * 4;
+            for (var c = 0; c < 3; c++) {
+              _arena.view[bOffset + c * plane + p] =
+                  (resized[srcIdx + c] / 255.0 - 0.5) / 0.5;
+            }
           }
         }
-      }
 
-      final (hiddenShape, hiddenCount) = encoder.runInto(
-        {
-          encoder.inputNames.first: OrtInput.nativeFloat32(
-            _arena.pointerAt(off),
-            totalPixels,
-            [B, 3, 224, 224],
-          ),
-        },
-        outputName: encoder.outputNames.first,
-        dst: _hiddenArena,
-        offset: 0,
-      );
-
-      final state = BatchDecodeState(
-        batch: B,
-        maxTokens: MangaOcrTokens.maxTokens,
-        startToken: MangaOcrTokens.start,
-        eosToken: MangaOcrTokens.eos,
-        padToken: MangaOcrTokens.pad,
-      );
-
-      decStopwatch?.start();
-      var stepsTaken = 0;
-      while (!state.allDone && state.currentStep < MangaOcrTokens.maxTokens) {
-        final L = state.currentStep;
-        final inputIds = state.flatPrefix(L);
-        final nextTokens = decoder.runArgmaxLastPosition(
+        final (hiddenShape, hiddenCount) = encoder.runInto(
           {
-            'input_ids': OrtInput.int64(inputIds, [B, L]),
-            'encoder_hidden_states': OrtInput.nativeFloat32(
-              _hiddenArena.pointerAt(0),
-              hiddenCount,
-              hiddenShape,
+            encoder.inputNames.first: OrtInput.nativeFloat32(
+              _arena.pointerAt(off),
+              totalPixels,
+              [B, 3, 224, 224],
             ),
           },
-          decoder.outputNames.first,
-          batch: B,
-          seqLen: L,
+          outputName: encoder.outputNames.first,
+          dst: _hiddenArena,
+          offset: 0,
         );
-        state.appendAll(nextTokens);
-        stepsTaken++;
-      }
-      decStopwatch?.stop();
-      onStepStats?.call(B, stepsTaken);
 
-      final chunkTexts = state.textOf((tokens) => _jaVocab!.decode(tokens));
-      results.addAll(chunkTexts);
+        final state = BatchDecodeState(
+          batch: B,
+          maxTokens: MangaOcrTokens.maxTokens,
+          startToken: MangaOcrTokens.start,
+          eosToken: MangaOcrTokens.eos,
+          padToken: MangaOcrTokens.pad,
+        );
+
+        decStopwatch?.start();
+        var stepsTaken = 0;
+        try {
+          while (!state.allDone &&
+              state.currentStep < MangaOcrTokens.maxTokens) {
+            final L = state.currentStep;
+            final inputIds = state.flatPrefix(L);
+            final nextTokens = decoder.runArgmaxLastPosition(
+              {
+                'input_ids': OrtInput.int64(inputIds, [B, L]),
+                'encoder_hidden_states': OrtInput.nativeFloat32(
+                  _hiddenArena.pointerAt(0),
+                  hiddenCount,
+                  hiddenShape,
+                ),
+              },
+              decoder.outputNames.first,
+              batch: B,
+              seqLen: L,
+            );
+            state.appendAll(nextTokens);
+            stepsTaken++;
+          }
+        } finally {
+          // A throw inside the step loop used to leave the stopwatch
+          // running across the retry; the timing then counted failed
+          // attempts as if they had decoded.
+          decStopwatch?.stop();
+        }
+        onStepStats?.call(B, stepsTaken);
+
+        final chunkTexts = state.textOf((tokens) => _jaVocab!.decode(tokens));
+        results.addAll(chunkTexts);
+        cursor += chunkSize;
+      }
+      runWithShrinkLadder(
+        start: runProfile,
+        attempt: runChunk,
+        onShrink: (next, previous) {
+          runProfile = next;
+          _oomCeiling = cappedBy(next, _oomCeiling);
+          noteDegraded('dec${next.decBatch}<-${previous.decBatch}');
+          Log.warning(
+            'OCR Perf',
+            'OOM: decBatch ${previous.decBatch}->${next.decBatch}',
+          );
+          // `results.addAll` is the last statement of a successful attempt,
+          // so a failed chunk appended nothing; the retry re-slices the same
+          // targets at the smaller chunk size. Decoding is deterministic per
+          // crop and `cursor` only advances on success, so a replay can
+          // never duplicate or drop a row.
+        },
+      );
     }
 
     return results;
   }
 
+  /// Loads (or reuses) the charset for [lang] and cross-checks it against
+  /// the opened model's real class count [expectedClasses].
+  ///
+  /// A mismatch is a **warning, not a failure**, by deliberate choice:
+  /// user directories contain dict/model pairs shipped before the pairing
+  /// was verifiable, and recognition itself degrades safely — the argmax
+  /// runs over the model's own class range and [ctcGreedyCollapse] drops
+  /// any index beyond the charset, so a wrong tail-class can at most lose
+  /// some glyphs, never crash. Turning this into a hard failure would make
+  /// every page of an old install untranslatable over what is, comparatively
+  /// speaking, a cosmetic decode defect. Only a missing/unreadable
+  /// dictionary (no charset at all) still throws — there the batch genuinely
+  /// cannot be decoded.
+  ///
+  /// When [expectedClasses] is null the probe found nothing and the check is
+  /// explicitly skipped ([charsetClassMismatch] returns null for that case);
+  /// a missing observation is never treated as a mismatch.
   List<String> _charsetFor(
     String lang,
     WorkerModelPaths paths, {
     int? expectedClasses,
   }) {
     var charset = _charsets[lang];
+    final dictPath = paths.recDicts[lang];
     if (charset == null) {
-      final dictPath = paths.recDicts[lang];
       if (dictPath == null) {
         throw DictMismatchException('No dictionary registered for $lang');
       }
-      charset = loadCharset(dictPath, expectedClasses: expectedClasses);
+      // loadCharset's expectedClasses parameter *throws*; we load unvalidated
+      // and apply the warn-only policy below so the two entry paths
+      // (fresh load vs cache hit) cannot disagree about severity.
+      charset = loadCharset(dictPath);
       _charsets[lang] = charset;
-    } else if (expectedClasses != null && charset.length != expectedClasses) {
-      throw DictMismatchException(
-        'Model output classes ($expectedClasses) does not match cached charset length (${charset.length}) for $lang',
-      );
+    }
+    final mismatch = charsetClassMismatch(
+      lang: lang,
+      charsetLength: charset.length,
+      expectedClasses: expectedClasses,
+      dictPath: dictPath,
+    );
+    if (mismatch != null) {
+      final noteKey = '$lang@$expectedClasses';
+      if (_charsetMismatchNoted.add(noteKey)) {
+        Log.warning('OCR Worker', '$mismatch — continuing, out-of-range '
+            'classes are dropped during CTC collapse');
+      }
     }
     return charset;
+  }
+
+  /// Cached per-model-path class count for [_charsetFor]; see [_recClasses].
+  int? _probeRecClasses(
+    String lang,
+    String modelPath,
+    OrtFfiSession session,
+    int height,
+  ) {
+    if (_recClasses.containsKey(modelPath)) return _recClasses[modelPath];
+    final classes = _probeOutputClasses(session, height);
+    _recClasses[modelPath] = classes;
+    if (classes == null) {
+      Log.info(
+        'OCR Worker',
+        'rec output-class probe failed for $lang ($modelPath); '
+        'dict/model class check skipped for this model',
+      );
+    }
+    return classes;
+  }
+
+  /// Reads the output class count of an open rec session by running one
+  /// minimal zero-filled crop (batch 1, smallest width bucket, the model's
+  /// own height) through [OrtFfiSession.runInPlace] and taking `shape.last`
+  /// from the real output tensor.
+  ///
+  /// Why a run instead of metadata: `ort_ffi.dart` exposes `inputShapes()`
+  /// only — the declared *output* shape would need a new binding there
+  /// (another agent owns that file), and the C-API output-type-info route
+  /// was already ruled out for this change. A single 1×3×48×160 forward is
+  /// milliseconds, happens once per model per worker lifetime, and reports
+  /// what the graph truly outputs — including after any EP-level rewrite.
+  ///
+  /// Any failure (a fixed-shape graph rejecting the probe, an OOM, a
+  /// nameless I/O) returns null: the probe must never break recognition,
+  /// which only ever *warns* downstream.
+  int? _probeOutputClasses(OrtFfiSession session, int height) {
+    try {
+      const probeWidth = 160; // the smallest rec bucket every profile ships
+      final total = 3 * height * probeWidth;
+      final offset = _arena.ensure(0, total);
+      _arena.view.fillRange(offset, offset + total, 0.0);
+      return session.runInPlace(
+        {
+          session.inputNames.first: OrtInput.nativeFloat32(
+            _arena.pointerAt(offset),
+            total,
+            [1, 3, height, probeWidth],
+          ),
+        },
+        session.outputNames.first,
+        (ptr, shape, elementCount) => shape.isEmpty ? null : shape.last,
+      );
+    } catch (_) {
+      return null;
+    }
   }
 }
 
