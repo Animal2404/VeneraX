@@ -441,6 +441,7 @@ abstract class LlmTranslator {
         headers: {
           'Content-Type': 'application/json',
           if (_apiKey.isNotEmpty) 'Authorization': 'Bearer $_apiKey',
+          'x-opencode-session': const Uuid().v4(),
         },
         validateStatus: (status) => status != null && status < 500,
       ),

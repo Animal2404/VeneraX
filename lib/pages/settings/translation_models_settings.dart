@@ -54,8 +54,18 @@ class _TranslationModelsPageState extends State<TranslationModelsPage> {
       widget.sourceLang ?? TranslationConfig.global.sourceLang,
     ).map((c) => c.id).toSet();
 
-    final hasGpuBackend = TranslationWorker.instance.lastReport?.active != null &&
-        TranslationWorker.instance.lastReport?.active != OrtEpKind.cpu;
+    final hasGpuBackend = (TranslationWorker.instance.lastReport?.active != null &&
+            TranslationWorker.instance.lastReport?.active != OrtEpKind.cpu) ||
+        (TranslationWorker.instance.lastReport == null &&
+            App.isDesktop &&
+            () {
+              try {
+                final probe = probeOrtRuntime();
+                return probe.hasDmlSymbol || probe.hasCudaSymbol;
+              } catch (_) {
+                return false;
+              }
+            }());
 
     final detComponents = TranslationModels.all
         .where((c) => c.kind == ModelKind.detector)
