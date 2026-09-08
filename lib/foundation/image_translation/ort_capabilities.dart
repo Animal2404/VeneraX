@@ -15,7 +15,6 @@ enum OrtEpKind {
 /// Settings choice for execution provider preference.
 enum EpPreference {
   auto,
-  cuda,
   directml,
   cpu,
 }
@@ -64,14 +63,6 @@ List<OrtEpKind> planEpOrder(EpPreference pref, OrtProbe probe) {
     case EpPreference.cpu:
       return const [OrtEpKind.cpu];
 
-    case EpPreference.cuda:
-      final order = <OrtEpKind>[OrtEpKind.cuda];
-      if (probe.hasDmlSymbol && probe.isWindows) {
-        order.add(OrtEpKind.directml);
-      }
-      order.add(OrtEpKind.cpu);
-      return order;
-
     case EpPreference.directml:
       if (probe.isWindows) {
         return const [OrtEpKind.directml, OrtEpKind.cpu];
@@ -82,10 +73,12 @@ List<OrtEpKind> planEpOrder(EpPreference pref, OrtProbe probe) {
       if (!probe.isWindows) {
         return const [OrtEpKind.cpu];
       }
+      // CUDA is deliberately absent from the auto order (decision R-2): the
+      // only entry point we can reach is the legacy
+      // OrtSessionOptionsAppendExecutionProvider_CUDA export, which modern GPU
+      // builds do not provide, and no gpu_mem_limit / arena strategy is set —
+      // so a real CUDA session would be both unreachable and unbounded.
       final order = <OrtEpKind>[];
-      if (probe.hasCudaSymbol) {
-        order.add(OrtEpKind.cuda);
-      }
       if (probe.hasDmlSymbol) {
         order.add(OrtEpKind.directml);
       }

@@ -258,6 +258,22 @@ abstract class LlmTranslator {
 
   static String get _model => (LlmProviderStore.active?.model ?? '').trim();
 
+  /// OpenCode's gateway requires `x-opencode-session` (decision R-1: keep it).
+  /// It is not part of the OpenAI-compatible surface, so it goes only to that
+  /// host — a custom header sent to every third-party endpoint risks a
+  /// strict-gateway rejection and lets unrelated providers key sessions off a
+  /// field they never documented.
+  static bool get isOpenCodeEndpoint {
+    final host = Uri.tryParse(_rawUrl)?.host.toLowerCase() ?? '';
+    return host.contains('opencode');
+  }
+
+  /// One id per process rather than one per request: the header names a
+  /// *session*, and a fresh UUID per batch made one chapter look like a dozen
+  /// unrelated sessions. If OpenCode ever turns out to require per-request ids,
+  /// revert this line only — keep the host scoping above.
+  static String? openCodeSession;
+
   /// Whether the active provider can translate right now. The keyless service
   /// needs nothing configured; an OpenAI-compatible one needs a URL and model.
   /// A key is optional on purpose: local gateways (ollama, lm-studio, one-api
@@ -441,7 +457,9 @@ abstract class LlmTranslator {
         headers: {
           'Content-Type': 'application/json',
           if (_apiKey.isNotEmpty) 'Authorization': 'Bearer $_apiKey',
-          'x-opencode-session': const Uuid().v4(),
+          if (isOpenCodeEndpoint)
+            'x-opencode-session':
+                openCodeSession ??= const Uuid().v4(),
         },
         validateStatus: (status) => status != null && status < 500,
       ),

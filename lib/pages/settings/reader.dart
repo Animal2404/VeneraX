@@ -1131,12 +1131,11 @@ class _ReaderSettingsState extends State<ReaderSettings> {
                 title: "Inference backend".tl,
                 settingKey: "imageTranslationExecutionProvider",
                 help:
-                    "Hardware acceleration backend used for OCR models. DirectML works with modern NVIDIA, AMD, and Intel GPUs on Windows."
+                    "Hardware acceleration backend used for OCR models. DirectML covers modern NVIDIA, AMD and Intel GPUs on Windows, including half-precision weights, so a separate CUDA build is not shipped."
                         .tl,
                 optionTranslation: {
                   "auto": "Automatic (Recommended)".tl,
                   "directml": "DirectML (GPU)".tl,
-                  "cuda": "CUDA (NVIDIA GPU)".tl,
                   "cpu": "CPU only".tl,
                 },
                 onChanged: () {

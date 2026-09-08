@@ -171,6 +171,7 @@ class Appdata with Init {
     "imageTranslationOcrRecBatch",
     "imageTranslationPagesPerOcrCall",
     "imageTranslationIdleEvictionSeconds",
+    "imageTranslationSelfHostedSource",
   ];
 
   @visibleForTesting
@@ -554,6 +555,9 @@ class Settings with ChangeNotifier {
     // 回顾文档写的是「10 秒自动驱逐」，代码一直是 90 秒 —— 做成设置项以便核对，
     // 而不是继续引用一个不存在的数字（施工图 D-1）。
     'imageTranslationIdleEvictionSeconds': 90,
+    // 本仓库是否真的发布了 models Release。默认关：该 tag 从未存在，
+    // 打开才把 {release} 放回下载链首位（施工图 D-10 / 裁决 R-3）。
+    'imageTranslationSelfHostedSource': false,
   };
 
   operator [](String key) {

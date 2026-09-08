@@ -13,7 +13,6 @@ void main() {
         isDesktop: false,
       );
       expect(planEpOrder(EpPreference.auto, probe), [OrtEpKind.cpu]);
-      expect(planEpOrder(EpPreference.cuda, probe), [OrtEpKind.cpu]);
       expect(planEpOrder(EpPreference.directml, probe), [OrtEpKind.cpu]);
     });
 
@@ -25,8 +24,11 @@ void main() {
         isWindows: true,
         isDesktop: true,
       );
+      // Decision R-2: CUDA is not offered even when the runtime exports it.
+      // DirectML already covers NVIDIA on Windows (including half-precision
+      // weights), while a CUDA path would need cuDNN distribution and a
+      // gpu_mem_limit we never set.
       expect(planEpOrder(EpPreference.auto, probeBoth), [
-        OrtEpKind.cuda,
         OrtEpKind.directml,
         OrtEpKind.cpu,
       ]);
@@ -66,11 +68,11 @@ void main() {
         OrtEpKind.directml,
         OrtEpKind.cpu,
       ]);
-      expect(planEpOrder(EpPreference.cuda, probe), [
-        OrtEpKind.cuda,
-        OrtEpKind.directml,
-        OrtEpKind.cpu,
-      ]);
+      expect(
+        planEpOrder(EpPreference.auto, probe).contains(OrtEpKind.cuda),
+        isFalse,
+        reason: 'CUDA must never be selected (decision R-2)',
+      );
     });
   });
 

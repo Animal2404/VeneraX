@@ -229,6 +229,10 @@ abstract class TranslationModels {
     tier: ModelTier.fast,
     kind: ModelKind.mangaEncoder,
     requiresGpuEp: true,
+    // Not published: the only source is {release}, which has no
+    // `models` tag behind it, and there is no checksum either. Registered but
+    // never produced (plan D-10 / decision R-3); re-enable through gate G5.
+    enabled: false,
     replaces: 'ocr_ja',
     displayNameKey: 'Japanese OCR (FP16 GPU)',
     files: [
@@ -313,6 +317,7 @@ abstract class TranslationModels {
     tier: ModelTier.fast,
     kind: ModelKind.rec,
     requiresGpuEp: true,
+    enabled: false, // unpublished {release}-only asset (D-10)
     replaces: 'ocr_zh',
     dictFrom: 'ocr_zh',
     displayNameKey: 'Chinese / Latin OCR (FP16 GPU)',
@@ -333,6 +338,7 @@ abstract class TranslationModels {
     tier: ModelTier.high,
     kind: ModelKind.rec,
     requiresGpuEp: true,
+    enabled: false, // unpublished {release}-only asset (D-10)
     replaces: 'ocr_zh_high',
     dictFrom: 'ocr_zh',
     displayNameKey: 'High-accuracy Chinese / Latin OCR (FP16 GPU)',
@@ -618,6 +624,15 @@ class TranslationModelStore with ChangeNotifier {
     return 'https://huggingface.co';
   }
 
+  /// Whether this fork publishes its own model Release (`models`).
+  ///
+  /// Off by default: the tag has never existed, so treating `{release}` as a
+  /// first-choice source only produced a 404 in front of every working mirror
+  /// (plan D-10 / decision R-3). Turn it on once `tool/model_export/publish.py`
+  /// has actually run and `ASSETS.md` records the published checksums.
+  static bool get selfHostedSourceEnabled =>
+      appdata.settings['imageTranslationSelfHostedSource'] == true;
+
   static String get releaseEndpoint =>
       'https://github.com/$kUpdateRepoOwner/$kUpdateRepoName/releases/download/models';
 
@@ -686,6 +701,13 @@ class TranslationModelStore with ChangeNotifier {
         Object? lastError;
         var ok = false;
         for (var rawUrl in file.urls) {
+          // `{release}` is this fork's own `models` Release, which may not
+          // exist. When the self-hosted source is off, the URL is dropped from
+          // the chain rather than tried first: all 20 assets list it first, so
+          // every download otherwise begins with a guaranteed 404 (plan D-10).
+          if (!selfHostedSourceEnabled && rawUrl.startsWith('{release}')) {
+            continue;
+          }
           final url = rawUrl
               .replaceFirst('{hf}', hfEndpoint)
               .replaceFirst('{release}', releaseEndpoint);

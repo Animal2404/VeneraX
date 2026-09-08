@@ -46,7 +46,6 @@ abstract final class TranslationPerformanceConfig {
   static EpPreference _epSetting() {
     return switch (appdata.settings['imageTranslationExecutionProvider']) {
       'directml' => EpPreference.directml,
-      'cuda' => EpPreference.cuda,
       'cpu' => EpPreference.cpu,
       _ => EpPreference.auto,
     };
