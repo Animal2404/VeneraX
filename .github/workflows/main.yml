@@ -84,8 +84,11 @@ jobs:
         run: rustup show
 
       # Step 2: Build the Flutter macOS app
+      # GIT_SHA is baked in so `--headless ocr-golden/--selfcheck` output can
+      # prove which commit produced the binary (plan V6-9); the measurement
+      # tool refuses a JSON whose "gitsha" is empty.
       - name: Build Flutter macOS App
-        run: flutter build macos --release
+        run: flutter build macos --release --dart-define=GIT_SHA=${{ github.sha }}
 
       # Step 3: Create the DMG file
       - name: Create DMG
@@ -122,7 +125,7 @@ jobs:
           architecture: x64
       - run: sudo xcode-select --switch /Applications/Xcode_16.4.app
       - run: flutter pub get
-      - run: flutter build ios --release --no-codesign
+      - run: flutter build ios --release --no-codesign --dart-define=GIT_SHA=${{ github.sha }}
       - run: |
           mkdir -p build/ios/iphoneos/Payload
           mv build/ios/iphoneos/Runner.app build/ios/iphoneos/Payload
@@ -194,7 +197,7 @@ jobs:
       - name: Check rust-toolchain.toml
         run: rustup show
       - run: flutter pub get
-      - run: flutter build apk --release
+      - run: flutter build apk --release --dart-define=GIT_SHA=${{ github.sha }}
       - name: Verify Android signature continuity
         if: github.event_name == 'push' && steps.detect.outputs.mode == 'release'
         env:
@@ -289,9 +292,46 @@ jobs:
       - name: build
         env:
           VENERA_ORT_EDITION: ${{ inputs.ort_edition || 'directml' }}
+          # Why the define is not on a `flutter build windows` line here: this
+          # file does not run that command. windows/build.py:11 calls
+          # `flutter build windows` with a fixed argument list, and the Flutter
+          # tool overwrites any DART_DEFINES environment value with its own
+          # (verified against flutter_tools build_info.dart / tool_backend.dart
+          # on 3.44.9), so an env-only injection cannot reach the compile.
+          # GIT_SHA is therefore exported *for* that script; the step after this
+          # one proves whether the artifact actually carries the sha.
+          GIT_SHA: ${{ github.sha }}
         run: |
           flutter pub get
           python windows/build.py
+      - name: Verify GIT_SHA attestation in the Windows artifact
+        # The measurement tool refuses a baseline JSON whose "gitsha" is empty
+        # (tool/ocr_run_stats.dart), so a Windows artifact that cannot name its
+        # commit is unusable for G1/G2/G3 — say it here instead of discovering
+        # it in doc/ocr-baseline.md later. Warning-only until windows/build.py
+        # forwards GIT_SHA: delete `continue-on-error` once it does and this
+        # becomes a hard gate.
+        continue-on-error: true
+        shell: pwsh
+        env:
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          $so = "build/windows/x64/runner/Release/data/app.so"
+          if (-not (Test-Path $so)) {
+            Write-Host "::warning::no $so found - cannot verify GIT_SHA attestation"
+            exit 0
+          }
+          # Dart string constants survive into the AOT snapshot verbatim (checked
+          # locally: "[CLI PRINT]" and "imageTranslationOcrRecBatch" are both
+          # findable in a release app.so), so a baked define value is detectable.
+          $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $so).Path)
+          $text = [System.Text.Encoding]::Latin1.GetString($bytes)
+          if ($text.Contains($env:GIT_SHA)) {
+            Write-Host "OK: GIT_SHA=$($env:GIT_SHA) is compiled into the Windows artifact."
+          } else {
+            Write-Host "::warning::Windows artifact carries no GIT_SHA - windows/build.py must forward it as --dart-define=GIT_SHA=$($env:GIT_SHA). Baseline JSON from this build reports gitsha='' and tool/ocr_run_stats.dart will refuse it."
+            exit 0
+          }
       - uses: actions/upload-artifact@v7
         with:
           name: windows_build
