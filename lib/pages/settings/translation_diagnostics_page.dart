@@ -60,6 +60,15 @@ class _TranslationDiagnosticsPageState
             title: Text("Inference diagnostics".tl),
             actions: [
               IconButton(
+                icon: const Icon(Icons.cleaning_services_outlined),
+                tooltip: "Release memory / VRAM".tl,
+                onPressed: () {
+                  TranslationWorker.instance.dispose();
+                  context.showMessage(message: "Memory and VRAM released".tl);
+                  setState(() {});
+                },
+              ),
+              IconButton(
                 icon: const Icon(Icons.copy),
                 tooltip: "Copy diagnostics".tl,
                 onPressed: () => _copyDiagnostics(context, report, perfLogs),

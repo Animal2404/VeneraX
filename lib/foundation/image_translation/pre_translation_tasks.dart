@@ -474,6 +474,8 @@ class PreTranslationTaskManager with ChangeNotifier {
     return false;
   }
 
+  bool get hasRunningTasks => currentTasks.any((t) => t.isRunning);
+
   void cancel(String id) {
     _canceledIds.add(id);
     var task = currentTasks.where((t) => t.id == id).firstOrNull;
@@ -485,6 +487,9 @@ class PreTranslationTaskManager with ChangeNotifier {
     _moveToHistory(task);
     if (!_runningIds.contains(id)) {
       _canceledIds.remove(id);
+    }
+    if (currentTasks.every((t) => !t.isRunning)) {
+      TranslationWorker.instance.dispose();
     }
     notifyListeners();
   }
@@ -523,6 +528,9 @@ class PreTranslationTaskManager with ChangeNotifier {
     task.status = PreTranslationTaskStatus.paused;
     _saveActive();
     notifyListeners();
+    if (currentTasks.every((t) => !t.isRunning)) {
+      TranslationWorker.instance.dispose();
+    }
   }
 
   /// Resumes a paused pre-translation job.
@@ -618,6 +626,7 @@ class PreTranslationTaskManager with ChangeNotifier {
         BackgroundKeepAlive.instance.remove(
           BackgroundKeepAlive.tagPreTranslate,
         );
+        TranslationWorker.instance.dispose();
       }
       onTaskFinished?.call(task);
       notifyListeners();
@@ -625,8 +634,11 @@ class PreTranslationTaskManager with ChangeNotifier {
   }
 
   /// Suspends the loop while [task] is paused, returning as soon as it resumes
-  /// or gets canceled. This keeps the running isolate alive without doing work.
+  /// or gets canceled. This frees GPU resources while paused.
   Future<void> _waitWhilePaused(PreTranslationTask task) async {
+    if (currentTasks.every((t) => !t.isRunning)) {
+      TranslationWorker.instance.dispose();
+    }
     while (task.status == PreTranslationTaskStatus.paused) {
       if (_canceledIds.contains(task.id)) return;
       // Poll every second. Resume() flips the status and the next iteration
