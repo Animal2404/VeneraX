@@ -458,6 +458,27 @@ class OrtFfiSession {
   final List<String> outputNames;
   final OrtEpKind ep;
 
+  /// Sink for the dict/model class-count check in [runArgmaxGrid] (D-11
+  /// companion). Production wiring assigns a function with the same
+  /// signature as `Log.warning` — that wiring lives in the worker bootstrap,
+  /// not here, because this file must keep compiling under plain `dart run`
+  /// (`tool/ort_ep_selfcheck.dart`): `package:venera/foundation/log.dart`
+  /// pulls in `dart:ui` through `foundation/app.dart`. While the sink is
+  /// unset, [warnClassMismatch] falls back to [print], which `flutter run`
+  /// forwards from worker isolates and `flutter test` captures.
+  static void Function(String title, String content)? classMismatchWarning;
+
+  /// Routes one dict/model class-count warning to the configured sink, or to
+  /// stdout when the app has not wired it yet. See [classMismatchWarning].
+  static void warnClassMismatch(String message) {
+    final sink = classMismatchWarning;
+    if (sink != null) {
+      sink('OCR Rec', message);
+    } else {
+      print('WARNING [OCR Rec] $message');
+    }
+  }
+
   static OrtFfiSession open(
     String modelPath, {
     required OrtEpKind ep,
@@ -708,7 +729,7 @@ class OrtFfiSession {
     return _execute(inputs, outputs, (values) {
       var result = <String, OrtOutput>{};
       for (var i = 0; i < outputs.length; i++) {
-        result[outputs[i]] = _readOutput(values[i]);
+        result[outputs[i]] = _readOutput(values[i], outputs[i]);
       }
       return result;
     });
@@ -722,6 +743,10 @@ class OrtFfiSession {
   ) {
     return _execute(inputs, [outputName], (values) {
       var value = values[0];
+      // D-11 gate: the callback below reinterprets the raw buffer as Float32,
+      // as do runArgmaxGrid / runArgmaxLastPosition / runInPlace — all of
+      // which delegate here. Refuse anything but fp32 before reading.
+      _requireFloat32Output(value, outputName);
       var (shape, elementCount) = _readShape(value);
       var dataOut = calloc<Pointer<Void>>();
       try {
@@ -788,6 +813,16 @@ class OrtFfiSession {
     return withNativeOutput(inputs, outputName, (ptr, shape, elementCount) {
       final actualSteps = shape.length >= 2 ? shape[1] : steps;
       final actualClasses = shape.last;
+      // The decoder collapses with charset[<index>], so a dict shorter or
+      // longer than the model's class axis corrupts text without any native
+      // error. [classes] exists exactly to catch that early. Decoding itself
+      // keeps using actualClasses (the tensor is the ground truth).
+      if (actualClasses != classes) {
+        OrtFfiSession.warnClassMismatch(
+          'runArgmaxGrid("$outputName"): model emits $actualClasses '
+          'classes but the active dict has $classes rows',
+        );
+      }
       final total = batch * actualSteps;
       final result = Int32List(total);
 
@@ -1011,6 +1046,63 @@ class OrtFfiSession {
     }
   }
 
+  /// Reads the real ONNX element type of a tensor OrtValue.
+  /// Returns an `ONNXTensorElementDataType` number (float32 == 1).
+  int _tensorElementType(Pointer<Void> value) {
+    var rt = _rt;
+    var infoOut = calloc<Pointer<Void>>();
+    Pointer<Void>? info;
+    try {
+      var getInfo = rt._api[OrtApiIdx.getTensorTypeAndShape]
+          .cast<
+            NativeFunction<
+              Pointer<Void> Function(Pointer<Void>, Pointer<Pointer<Void>>)
+            >
+          >()
+          .asFunction<
+            Pointer<Void> Function(Pointer<Void>, Pointer<Pointer<Void>>)
+          >();
+      rt._check(getInfo(value, infoOut));
+      info = infoOut.value;
+      // GetTensorElementType(OrtTensorTypeAndShapeInfo*, ONNXTensorElementDataType*)
+      // — a C enum, so 32-bit on every platform this binding targets.
+      var typeOut = calloc<Int32>();
+      try {
+        var getElementType = rt._api[OrtApiIdx.getTensorElementType]
+            .cast<
+              NativeFunction<Pointer<Void> Function(Pointer<Void>, Pointer<Int32>)>
+            >()
+            .asFunction<Pointer<Void> Function(Pointer<Void>, Pointer<Int32>)>();
+        rt._check(getElementType(info, typeOut));
+        return typeOut.value;
+      } finally {
+        calloc.free(typeOut);
+      }
+    } finally {
+      if (info != null) {
+        rt._releaser(OrtApiIdx.releaseTensorTypeAndShapeInfo)(info);
+      }
+      calloc.free(infoOut);
+    }
+  }
+
+  /// D-11: every output reader in this file reinterprets the OrtValue buffer
+  /// as float32. A model exported *without* `keep_io_types` (fp16 or int64
+  /// outputs) would then yield silently wrong numbers instead of failing, so
+  /// each read path must call this first. The message carries the numeric
+  /// ONNXTensorElementDataType, which is the whole diagnosis (e.g. 10 ==
+  /// float16, 7 == int64, 1 == float32). Returns the checked type.
+  int _requireFloat32Output(Pointer<Void> value, String name) {
+    final t = _tensorElementType(value);
+    if (t != OrtRuntime.typeFloat32) {
+      throw OrtFfiException(
+        'unexpected output dtype $t for $name',
+        OrtFfiErrorKind.invalidGraph,
+      );
+    }
+    return t;
+  }
+
   /// Reads a tensor's shape and total element count.
   (List<int>, int) _readShape(Pointer<Void> value) {
     var rt = _rt;
@@ -1075,8 +1167,10 @@ class OrtFfiSession {
     }
   }
 
-  OrtOutput _readOutput(Pointer<Void> value) {
+  OrtOutput _readOutput(Pointer<Void> value, String name) {
     var rt = _rt;
+    // D-11: assert the real element type before casting the buffer to Float.
+    final elementType = _requireFloat32Output(value, name);
     var (shape, elementCount) = _readShape(value);
     var dataOut = calloc<Pointer<Void>>();
     try {
@@ -1092,7 +1186,11 @@ class OrtFfiSession {
       rt._check(getData(value, dataOut));
       // Copy out: the OrtValue is released right after this call.
       var view = dataOut.value.cast<Float>().asTypedList(elementCount);
-      return OrtOutput(Float32List.fromList(view), shape);
+      return OrtOutput(
+        Float32List.fromList(view),
+        shape,
+        elementType: elementType,
+      );
     } finally {
       calloc.free(dataOut);
     }
