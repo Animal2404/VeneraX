@@ -1,9 +1,11 @@
 import 'dart:async';
+import 'dart:ffi';
 import 'dart:isolate';
 import 'dart:math' as math;
 
 import 'package:venera/foundation/app.dart';
 import 'package:venera/foundation/image_translation/hf_tokenizer.dart';
+import 'package:venera/foundation/image_translation/ocr_batching.dart';
 import 'package:venera/foundation/image_translation/ort_capabilities.dart';
 import 'package:venera/foundation/image_translation/ort_ffi.dart';
 import 'package:venera/foundation/image_translation/translation_types.dart';
@@ -448,6 +450,29 @@ void _workerMain(SendPort mainPort) {
   });
 }
 
+class _ClusterWork {
+  _ClusterWork({
+    required this.index,
+    required this.cluster,
+    required this.bounds,
+    required this.eraseBounds,
+    required this.eraseLines,
+    required this.colors,
+  });
+
+  final int index;
+  final List<IntRect> cluster;
+  final IntRect bounds;
+  final IntRect eraseBounds;
+  final List<IntRect> eraseLines;
+  final (int, int) colors;
+
+  String text = '';
+  String lang = '';
+  String engine = '';
+  bool isPlausible = false;
+}
+
 class _WorkerState {
   final _sessions = <String, OrtFfiSession>{};
   final _charsets = <String, List<String>>{};
@@ -460,6 +485,8 @@ class _WorkerState {
   int _consecutiveFailures = 0;
   final _attempts = <String>[];
   final _inputShapes = <String, List<int>>{};
+  final _arena = OrtTensorArena();
+  final _hiddenArena = OrtTensorArena();
 
   OrtProbe _getProbe() {
     return _probe ??= probeOrtRuntime();
@@ -544,7 +571,10 @@ class _WorkerState {
       session.close();
     }
     _sessions.clear();
+    _charsets.clear();
     _jaVocab = null;
+    _arena.free();
+    _hiddenArena.free();
   }
 
   // -------------------------------------------------------------------------
@@ -558,68 +588,240 @@ class _WorkerState {
       req.height,
       req.pixels.materialize().asUint8List(),
     );
-    var boxes = _detectBoxes(image, req.paths);
+
+    final baseProfile = BatchProfile.forEp(_ep, isDesktop: App.isDesktop);
+    final effectiveProfile = BatchProfile(
+      detBatch: req.detBatch > 0 ? req.detBatch : baseProfile.detBatch,
+      recBatch: req.recBatch > 0 ? req.recBatch : baseProfile.recBatch,
+      decBatch: req.recBatch > 0 ? req.recBatch : baseProfile.decBatch,
+      widthQuantum: baseProfile.widthQuantum,
+      widthBuckets: baseProfile.widthBuckets,
+    );
+
+    var boxes = _detectBoxes(image, req.paths, maxBatch: effectiveProfile.detBatch);
     if (boxes.isEmpty) return const [];
     var clusters = clusterOcrBoxes(boxes, image.width, image.height);
     clusters.sort((a, b) => _boundsOf(a).top.compareTo(_boundsOf(b).top));
-    const maxBlocks = 32;
-    if (clusters.length > maxBlocks) {
-      clusters = clusters.sublist(0, maxBlocks);
+    final pageCropLimit = (effectiveProfile.recBatch * 4).clamp(32, 128);
+    if (clusters.length > pageCropLimit) {
+      clusters = clusters.sublist(0, pageCropLimit);
     }
 
-    var blocks = <OcrBlock>[];
-    var pageHint = OcrPageEngineHint();
-    for (var cluster in clusters) {
-      var detectedBounds = _boundsOf(cluster);
-      var eraseBounds = detectedBounds.inflated(
+    if (effectiveProfile.recBatch == 1 && effectiveProfile.detBatch == 1) {
+      var blocks = <OcrBlock>[];
+      var pageHint = OcrPageEngineHint();
+      for (var cluster in clusters) {
+        var detectedBounds = _boundsOf(cluster);
+        var eraseBounds = detectedBounds.inflated(
+          2,
+          2,
+          image.width,
+          image.height,
+        );
+        var eraseLines = [
+          for (var line in cluster)
+            line.inflated(0, 0, image.width, image.height),
+        ];
+        var bounds = detectedBounds.inflated(4, 4, image.width, image.height);
+        if (bounds.width < 8 || bounds.height < 8) continue;
+        var colors = _sampleColors(image, bounds);
+        var recognized = _recognizeBlock(
+          image,
+          cluster,
+          bounds,
+          req,
+          preferredEngine: pageHint.preferredEngine,
+        );
+        var text = recognized.text.trim();
+        if (text.isEmpty) continue;
+        var lang = recognized.language;
+        if (req.sourceLang == 'auto') {
+          pageHint.observe(
+            text: text,
+            language: lang,
+            engine: recognized.engine,
+            isVertical: bounds.height > bounds.width * 1.3,
+          );
+        }
+        var lineHeight = _medianLineHeight(cluster);
+        blocks.add(
+          OcrBlock(
+            rect: bounds,
+            eraseRect: eraseBounds,
+            eraseRects: eraseLines,
+            text: text,
+            language: lang,
+            backgroundColor: colors.$1,
+            textColor: colors.$2,
+            lineHeight: lineHeight,
+          ),
+        );
+      }
+      return blocks;
+    }
+
+    final workItems = <_ClusterWork>[];
+    for (var i = 0; i < clusters.length; i++) {
+      final cluster = clusters[i];
+      final detectedBounds = _boundsOf(cluster);
+      final eraseBounds = detectedBounds.inflated(
         2,
         2,
         image.width,
         image.height,
       );
-      // DBNet already expands each component in post-processing. Keep the
-      // individual line boxes tight; the inpainter adds its own tiny glyph
-      // guard and must not reach into artwork between lines.
-      var eraseLines = [
+      final eraseLines = [
         for (var line in cluster)
           line.inflated(0, 0, image.width, image.height),
       ];
-      var bounds = detectedBounds.inflated(4, 4, image.width, image.height);
+      final bounds = detectedBounds.inflated(4, 4, image.width, image.height);
       if (bounds.width < 8 || bounds.height < 8) continue;
-      var colors = _sampleColors(image, bounds);
-      var recognized = _recognizeBlock(
-        image,
-        cluster,
-        bounds,
-        req,
-        preferredEngine: pageHint.preferredEngine,
+      final colors = _sampleColors(image, bounds);
+      workItems.add(
+        _ClusterWork(
+          index: i,
+          cluster: cluster,
+          bounds: bounds,
+          eraseBounds: eraseBounds,
+          eraseLines: eraseLines,
+          colors: colors,
+        ),
       );
-      var text = recognized.text;
-      var lang = recognized.language;
-      text = text.trim();
-      if (text.isEmpty) continue;
+    }
+
+    if (workItems.isEmpty) return const [];
+
+    final hasJa = req.paths.jaEncoder != null;
+    final recLangs = req.paths.recModels.keys.toList();
+
+    void executeEngineBatch(
+      List<_ClusterWork> targets,
+      String engine,
+      WorkerModelPaths paths,
+      BatchProfile profile,
+    ) {
+      if (targets.isEmpty) return;
+      if (engine == 'ja') {
+        final bounds = [for (var t in targets) t.bounds];
+        final texts = _mangaOcrBatch(image, bounds, paths, profile: profile);
+        for (var i = 0; i < targets.length; i++) {
+          final t = targets[i];
+          final raw = texts[i].trim();
+          if (_isPlausible(raw)) {
+            t.text = raw;
+            t.lang = _detectLanguage(raw, 'ja');
+            t.engine = 'ja';
+            t.isPlausible = true;
+          }
+        }
+      } else {
+        if (!paths.recModels.containsKey(engine)) return;
+        final lineClusterIdx = <int>[];
+        final allLines = <IntRect>[];
+        for (var i = 0; i < targets.length; i++) {
+          final t = targets[i];
+          final sortedLines = [
+            for (var l in t.cluster)
+              l.inflated(2, 2, image.width, image.height),
+          ]..sort((a, b) => a.top.compareTo(b.top));
+          final validLines = sortedLines.where((r) => r.width >= 8 && r.height >= 8).toList();
+          for (var l in validLines) {
+            lineClusterIdx.add(i);
+            allLines.add(l);
+          }
+        }
+
+        if (allLines.isEmpty) return;
+
+        final lineTexts = _recognizeLinesBatch(
+          image,
+          allLines,
+          engine,
+          paths,
+          profile: profile,
+        );
+
+        final clusterParts = List.generate(targets.length, (_) => <String>[]);
+        for (var l = 0; l < allLines.length; l++) {
+          final txt = lineTexts[l].trim();
+          if (txt.isNotEmpty) {
+            clusterParts[lineClusterIdx[l]].add(txt);
+          }
+        }
+
+        for (var i = 0; i < targets.length; i++) {
+          final t = targets[i];
+          final raw = clusterParts[i].join(' ').trim();
+          if (_isPlausible(raw)) {
+            t.text = raw;
+            t.lang = _detectLanguage(raw, engine);
+            t.engine = engine;
+            t.isPlausible = true;
+          }
+        }
+      }
+    }
+
+    // Pass A: Group by preferred engine
+    final engineGroups = planEngineGroups(
+      bounds: [for (var c in workItems) c.bounds],
+      hasJa: hasJa,
+      recLangs: recLangs,
+      sourceLang: req.sourceLang,
+    );
+
+    for (var group in engineGroups) {
+      final targets = [for (var idx in group.clusterIndices) workItems[idx]];
+      executeEngineBatch(targets, group.engine, req.paths, effectiveProfile);
+    }
+
+    // Pass B: For un-plausible items in auto mode, try fallback engine
+    if (req.sourceLang == 'auto') {
+      final passBJa = <_ClusterWork>[];
+      final passBRec = <_ClusterWork>[];
+      final defaultRec = recLangs.isNotEmpty ? recLangs.first : 'zh';
+
+      for (var item in workItems) {
+        if (!item.isPlausible) {
+          if (item.engine == 'ja') {
+            passBRec.add(item);
+          } else if (hasJa) {
+            passBJa.add(item);
+          }
+        }
+      }
+
+      if (passBJa.isNotEmpty) {
+        executeEngineBatch(passBJa, 'ja', req.paths, effectiveProfile);
+      }
+      if (passBRec.isNotEmpty) {
+        executeEngineBatch(passBRec, defaultRec, req.paths, effectiveProfile);
+      }
+    }
+
+    final blocks = <OcrBlock>[];
+    var pageHint = OcrPageEngineHint();
+    for (var item in workItems) {
+      final text = item.text.trim();
+      if (text.isEmpty || !item.isPlausible) continue;
       if (req.sourceLang == 'auto') {
         pageHint.observe(
           text: text,
-          language: lang,
-          engine: recognized.engine,
-          isVertical: bounds.height > bounds.width * 1.3,
+          language: item.lang,
+          engine: item.engine,
+          isVertical: item.bounds.height > item.bounds.width * 1.3,
         );
       }
-      // Median line height across the cluster's line boxes ≈ the original
-      // glyph height, so the renderer can size the translation to match the
-      // source text instead of stretching it to fill the (often much taller)
-      // detected block box — a short line in a tall box otherwise ballooned.
-      var lineHeight = _medianLineHeight(cluster);
+      final lineHeight = _medianLineHeight(item.cluster);
       blocks.add(
         OcrBlock(
-          rect: bounds,
-          eraseRect: eraseBounds,
-          eraseRects: eraseLines,
+          rect: item.bounds,
+          eraseRect: item.eraseBounds,
+          eraseRects: item.eraseLines,
           text: text,
-          language: lang,
-          backgroundColor: colors.$1,
-          textColor: colors.$2,
+          language: item.lang,
+          backgroundColor: item.colors.$1,
+          textColor: item.colors.$2,
           lineHeight: lineHeight,
         ),
       );
@@ -718,53 +920,363 @@ class _WorkerState {
 
   // ----- detection -----
 
-  List<IntRect> _detectBoxes(RgbaImage image, WorkerModelPaths paths) {
+  List<IntRect> _detectBoxes(
+    RgbaImage image,
+    WorkerModelPaths paths, {
+    int maxBatch = 1,
+  }) {
     var session = _session(paths.detector);
     var boxes = <IntRect>[];
     const tileHeight = 1280;
     const tileOverlap = 128;
+
+    final tiles = <DetTile>[];
     var top = 0;
+    var tileIdx = 0;
     while (top < image.height) {
       var bottom = math.min(image.height, top + tileHeight);
-      var tile = RgbaImage(
-        image.width,
-        bottom - top,
-        Uint8List.sublistView(
-          image.pixels,
-          top * image.width * 4,
-          bottom * image.width * 4,
+      tiles.add(
+        DetTile(
+          tileIndex: tileIdx++,
+          w: image.width,
+          h: bottom - top,
+          top: top,
         ),
       );
-      var input = _detPreprocess(tile);
-      var output = session
-          .run({
-            session.inputNames.first: OrtInput.float32(input.tensor, [
-              1,
-              3,
-              input.height,
-              input.width,
-            ]),
-          })
-          .values
-          .first;
-      var tileBoxes = _detPostprocess(
-        output.data,
-        input.width,
-        input.height,
-        tile.width,
-        tile.height,
-      );
-      for (var box in tileBoxes) {
-        box.top += top;
-        box.bottom += top;
-        if (!boxes.any((b) => _iou(b, box) > 0.5)) {
-          boxes.add(box);
-        }
-      }
       if (bottom >= image.height) break;
       top = bottom - tileOverlap;
     }
+
+    final batches = planDetBatch(tiles: tiles, maxBatch: maxBatch, stride: 32);
+    for (var batch in batches) {
+      final n = batch.tiles.length;
+      final targetW = batch.w;
+      final targetH = batch.h;
+      final totalElements = n * 3 * targetH * targetW;
+      final offset = _arena.ensure(0, totalElements);
+      _arena.view.fillRange(offset, offset + totalElements, 0.0);
+
+      final tileInfo = <({int realW, int realH, int origW, int origH, int top})>[];
+      const maxSide = 1280.0;
+      const mean = [0.485, 0.456, 0.406];
+      const std = [0.229, 0.224, 0.225];
+
+      for (var b = 0; b < n; b++) {
+        final t = batch.tiles[b];
+        final scale = math.min(1.0, maxSide / math.max(t.w, t.h));
+        int round32(double v) => math.max(32, (v / 32).round() * 32);
+        final inW = round32(t.w * scale);
+        final inH = round32(t.h * scale);
+        tileInfo.add((realW: inW, realH: inH, origW: t.w, origH: t.h, top: t.top));
+
+        final tilePixels = Uint8List.sublistView(
+          image.pixels,
+          t.top * image.width * 4,
+          (t.top + t.h) * image.width * 4,
+        );
+        final tileImg = RgbaImage(t.w, t.h, tilePixels);
+        final resized = _resizeRegion(tileImg, IntRect(0, 0, t.w, t.h), inW, inH);
+
+        final plane = targetH * targetW;
+        final bOffset = offset + b * 3 * plane;
+        for (var y = 0; y < inH; y++) {
+          final rowIn = y * inW;
+          final rowOut = y * targetW;
+          for (var x = 0; x < inW; x++) {
+            final srcIdx = (rowIn + x) * 4;
+            final dstIdx = rowOut + x;
+            for (var c = 0; c < 3; c++) {
+              _arena.view[bOffset + c * plane + dstIdx] =
+                  (resized[srcIdx + c] / 255.0 - mean[c]) / std[c];
+            }
+          }
+        }
+      }
+
+      session.runInPlace(
+        {
+          session.inputNames.first: OrtInput.nativeFloat32(
+            _arena.pointerAt(offset),
+            totalElements,
+            [n, 3, targetH, targetW],
+          ),
+        },
+        session.outputNames.first,
+        (probsPtr, shape, elementCount) {
+          final plane = targetH * targetW;
+          for (var b = 0; b < n; b++) {
+            final info = tileInfo[b];
+            final tileProbs = probsPtr + (b * plane);
+            final tileBoxes = _detPostprocessBatchSingle(
+              tileProbs,
+              w: targetW,
+              h: targetH,
+              realW: info.realW,
+              realH: info.realH,
+              tileWidth: info.origW,
+              tileHeight: info.origH,
+            );
+            for (var box in tileBoxes) {
+              box.top += info.top;
+              box.bottom += info.top;
+              if (!boxes.any((existing) => _iou(existing, box) > 0.5)) {
+                boxes.add(box);
+              }
+            }
+          }
+          return null;
+        },
+      );
+    }
     return boxes;
+  }
+
+  List<IntRect> _detPostprocessBatchSingle(
+    Pointer<Float> probs, {
+    required int w,
+    required int h,
+    required int realW,
+    required int realH,
+    required int tileWidth,
+    required int tileHeight,
+  }) {
+    const binaryThreshold = 0.3;
+    const scoreThreshold = 0.5;
+    const unclipRatio = 1.8;
+    var labels = Int32List(w * h);
+    var boxes = <IntRect>[];
+    var stack = <int>[];
+    var nextLabel = 0;
+
+    for (var start = 0; start < w * h; start++) {
+      if (labels[start] != 0 || probs[start] < binaryThreshold) {
+        continue;
+      }
+      nextLabel++;
+      var minX = w, minY = h, maxX = 0, maxY = 0;
+      var count = 0;
+      var scoreSum = 0.0;
+      stack.add(start);
+      labels[start] = nextLabel;
+      while (stack.isNotEmpty) {
+        var index = stack.removeLast();
+        var x = index % w;
+        var y = index ~/ w;
+        count++;
+        scoreSum += probs[index];
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+        for (var d = 0; d < 4; d++) {
+          var nx = x + const [1, -1, 0, 0][d];
+          var ny = y + const [0, 0, 1, -1][d];
+          if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+          var ni = ny * w + nx;
+          if (labels[ni] == 0 && probs[ni] >= binaryThreshold) {
+            labels[ni] = nextLabel;
+            stack.add(ni);
+          }
+        }
+      }
+
+      var centerX = (minX + maxX) / 2.0;
+      var centerY = (minY + maxY) / 2.0;
+      if (centerX >= realW || centerY >= realH) {
+        continue;
+      }
+
+      if (count < 12 || scoreSum / count < scoreThreshold) {
+        continue;
+      }
+      var boxW = maxX - minX + 1;
+      var boxH = maxY - minY + 1;
+      if (boxW < 3 || boxH < 3) continue;
+      var offset = boxW * boxH * unclipRatio / (2 * (boxW + boxH));
+      var scaleX = tileWidth / realW;
+      var scaleY = tileHeight / realH;
+      boxes.add(
+        IntRect(
+          ((minX - offset) * scaleX).round(),
+          ((minY - offset) * scaleY).round(),
+          ((maxX + 1 + offset) * scaleX).round(),
+          ((minY - offset) * scaleY).round() +
+              ((boxH + 2 * offset) * scaleY).round(),
+        ),
+      );
+    }
+    return boxes;
+  }
+
+  List<String> _recognizeLinesBatch(
+    RgbaImage image,
+    List<IntRect> lines,
+    String lang,
+    WorkerModelPaths paths, {
+    required BatchProfile profile,
+  }) {
+    if (lines.isEmpty) return const [];
+    final modelPath = paths.recModels[lang];
+    if (modelPath == null) return List.filled(lines.length, '');
+    final session = _session(modelPath);
+    final charset = _charsetFor(lang, paths);
+    final height = paths.recHeights[lang] ?? 48;
+
+    final results = List.filled(lines.length, '');
+    final batches = planRecBatch(
+      lines: lines,
+      height: height,
+      widthBuckets: profile.widthBuckets,
+      maxBatch: profile.recBatch,
+    );
+
+    for (var batch in batches) {
+      final n = batch.rows.length;
+      final targetW = batch.maxWidth;
+      final targetH = batch.height;
+      final totalElements = n * 3 * targetH * targetW;
+      final offset = _arena.ensure(0, totalElements);
+      _arena.view.fillRange(offset, offset + totalElements, 0.0);
+
+      final plane = targetH * targetW;
+      for (var b = 0; b < n; b++) {
+        final row = batch.rows[b];
+        final resized = _resizeRegion(image, row.rect, row.width, targetH);
+        final bOffset = offset + b * 3 * plane;
+        for (var y = 0; y < targetH; y++) {
+          final rowIn = y * row.width;
+          final rowOut = y * targetW;
+          for (var x = 0; x < row.width; x++) {
+            final srcIdx = (rowIn + x) * 4;
+            final dstIdx = rowOut + x;
+            for (var c = 0; c < 3; c++) {
+              _arena.view[bOffset + c * plane + dstIdx] =
+                  (resized[srcIdx + c] / 255.0 - 0.5) / 0.5;
+            }
+          }
+        }
+      }
+
+      final argmax = session.runArgmaxGrid(
+        {
+          session.inputNames.first: OrtInput.nativeFloat32(
+            _arena.pointerAt(offset),
+            totalElements,
+            [n, 3, targetH, targetW],
+          ),
+        },
+        session.outputNames.first,
+        batch: n,
+        steps: targetW ~/ 8,
+        classes: charset.length,
+      );
+
+      final steps = argmax.length ~/ n;
+      final decodedTexts = ctcGreedyCollapse(
+        argmax: argmax,
+        batch: n,
+        steps: steps,
+        charset: charset,
+      );
+
+      for (var b = 0; b < n; b++) {
+        final origIdx = batch.rows[b].originalIndex;
+        results[origIdx] = decodedTexts[b];
+      }
+    }
+
+    return results;
+  }
+
+  List<String> _mangaOcrBatch(
+    RgbaImage image,
+    List<IntRect> bounds,
+    WorkerModelPaths paths, {
+    required BatchProfile profile,
+  }) {
+    if (bounds.isEmpty) return const [];
+    if (paths.jaEncoder == null || paths.jaDecoder == null || paths.jaVocab == null) {
+      return List.filled(bounds.length, '');
+    }
+    _jaVocab ??= WordPieceVocab.fromFileSync(paths.jaVocab!);
+    final encoder = _session(paths.jaEncoder!);
+    final decoder = _session(paths.jaDecoder!);
+
+    final results = <String>[];
+    final effectiveBatch = profile.decBatch;
+
+    for (var i = 0; i < bounds.length; i += effectiveBatch) {
+      final end = math.min(i + effectiveBatch, bounds.length);
+      final chunkBounds = bounds.sublist(i, end);
+      final B = chunkBounds.length;
+
+      final totalPixels = B * 3 * 224 * 224;
+      final off = _arena.ensure(0, totalPixels);
+      const plane = 224 * 224;
+      for (var b = 0; b < B; b++) {
+        final resized = _resizeRegion(image, chunkBounds[b], 224, 224);
+        final bOffset = off + b * 3 * plane;
+        for (var p = 0; p < plane; p++) {
+          final srcIdx = p * 4;
+          for (var c = 0; c < 3; c++) {
+            _arena.view[bOffset + c * plane + p] =
+                (resized[srcIdx + c] / 255.0 - 0.5) / 0.5;
+          }
+        }
+      }
+
+      final (hiddenShape, hiddenCount) = encoder.runInto(
+        {
+          encoder.inputNames.first: OrtInput.nativeFloat32(
+            _arena.pointerAt(off),
+            totalPixels,
+            [B, 3, 224, 224],
+          ),
+        },
+        outputName: encoder.outputNames.first,
+        dst: _hiddenArena,
+        offset: 0,
+      );
+
+      final state = BatchDecodeState(
+        batch: B,
+        maxTokens: MangaOcrTokens.maxTokens,
+        startToken: MangaOcrTokens.start,
+        eosToken: MangaOcrTokens.eos,
+        padToken: MangaOcrTokens.pad,
+      );
+
+      while (!state.allDone && state.currentStep < MangaOcrTokens.maxTokens) {
+        final L = state.currentStep;
+        final inputIds = state.flatPrefix(L);
+        final nextTokens = decoder.runArgmaxLastPosition(
+          {
+            'input_ids': OrtInput.int64(inputIds, [B, L]),
+            'encoder_hidden_states': OrtInput.nativeFloat32(
+              _hiddenArena.pointerAt(0),
+              hiddenCount,
+              hiddenShape,
+            ),
+          },
+          decoder.outputNames.first,
+          batch: B,
+          seqLen: L,
+        );
+        state.appendAll(nextTokens);
+      }
+
+      final chunkTexts = state.textOf((tokens) => _jaVocab!.decode(tokens));
+      results.addAll(chunkTexts);
+    }
+
+    return results;
+  }
+
+  List<String> _charsetFor(String lang, WorkerModelPaths paths) {
+    return _charsets.putIfAbsent(lang, () {
+      var dict = File(paths.recDicts[lang]!).readAsLinesSync();
+      return ['', ...dict.map((line) => line.isEmpty ? ' ' : line), ' '];
+    });
   }
 
   // ----- Japanese OCR (manga-ocr) -----
@@ -903,13 +1415,6 @@ class _WorkerState {
 // Pure image math (worker side)
 // ===========================================================================
 
-class _DetInput {
-  _DetInput(this.tensor, this.width, this.height);
-
-  final Float32List tensor;
-  final int width;
-  final int height;
-}
 
 Uint8List _resizeRegion(RgbaImage src, IntRect region, int outW, int outH) {
   var out = Uint8List(outW * outH * 4);
@@ -942,101 +1447,6 @@ Uint8List _resizeRegion(RgbaImage src, IntRect region, int outW, int outH) {
     }
   }
   return out;
-}
-
-/// PP-OCR DBNet preprocessing: long side <= 1280 (small/stylized lettering
-/// survives better than at the stock 960), multiple of 32, ImageNet
-/// normalization.
-_DetInput _detPreprocess(RgbaImage tile) {
-  const maxSide = 1280.0;
-  var scale = math.min(1.0, maxSide / math.max(tile.width, tile.height));
-  int round32(double v) => math.max(32, (v / 32).round() * 32);
-  var inW = round32(tile.width * scale);
-  var inH = round32(tile.height * scale);
-  var resized = _resizeRegion(
-    tile,
-    IntRect(0, 0, tile.width, tile.height),
-    inW,
-    inH,
-  );
-  const mean = [0.485, 0.456, 0.406];
-  const std = [0.229, 0.224, 0.225];
-  var tensor = Float32List(3 * inH * inW);
-  var plane = inH * inW;
-  for (var i = 0; i < plane; i++) {
-    for (var c = 0; c < 3; c++) {
-      tensor[c * plane + i] = (resized[i * 4 + c] / 255.0 - mean[c]) / std[c];
-    }
-  }
-  return _DetInput(tensor, inW, inH);
-}
-
-/// DBNet postprocessing: binarize, connected components, filter, dilate.
-List<IntRect> _detPostprocess(
-  Float32List probs,
-  int w,
-  int h,
-  int tileWidth,
-  int tileHeight,
-) {
-  const binaryThreshold = 0.3;
-  const scoreThreshold = 0.5;
-  const unclipRatio = 1.8;
-  var labels = Int32List(w * h);
-  var boxes = <IntRect>[];
-  var stack = <int>[];
-  var nextLabel = 0;
-  for (var start = 0; start < w * h; start++) {
-    if (labels[start] != 0 || probs[start] < binaryThreshold) {
-      continue;
-    }
-    nextLabel++;
-    var minX = w, minY = h, maxX = 0, maxY = 0;
-    var count = 0;
-    var scoreSum = 0.0;
-    stack.add(start);
-    labels[start] = nextLabel;
-    while (stack.isNotEmpty) {
-      var index = stack.removeLast();
-      var x = index % w;
-      var y = index ~/ w;
-      count++;
-      scoreSum += probs[index];
-      if (x < minX) minX = x;
-      if (x > maxX) maxX = x;
-      if (y < minY) minY = y;
-      if (y > maxY) maxY = y;
-      for (var d = 0; d < 4; d++) {
-        var nx = x + const [1, -1, 0, 0][d];
-        var ny = y + const [0, 0, 1, -1][d];
-        if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
-        var ni = ny * w + nx;
-        if (labels[ni] == 0 && probs[ni] >= binaryThreshold) {
-          labels[ni] = nextLabel;
-          stack.add(ni);
-        }
-      }
-    }
-    if (count < 12 || scoreSum / count < scoreThreshold) {
-      continue;
-    }
-    var boxW = maxX - minX + 1;
-    var boxH = maxY - minY + 1;
-    if (boxW < 3 || boxH < 3) continue;
-    var offset = boxW * boxH * unclipRatio / (2 * (boxW + boxH));
-    var scaleX = tileWidth / w;
-    var scaleY = tileHeight / h;
-    boxes.add(
-      IntRect(
-        ((minX - offset) * scaleX).round(),
-        ((minY - offset) * scaleY).round(),
-        ((maxX + 1 + offset) * scaleX).round(),
-        ((minY - offset) * scaleY).round() +
-            ((boxH + 2 * offset) * scaleY).round(),
-      ),
-    );
-  }
-  return boxes;
 }
 
 /// Groups detector line boxes into OCR blocks without joining incompatible

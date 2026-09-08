@@ -4,7 +4,6 @@ library;
 
 import 'dart:io';
 
-import 'package:venera/foundation/app.dart';
 import 'ort_ffi.dart';
 
 enum OrtEpKind {
@@ -45,7 +44,7 @@ OrtProbe probeOrtRuntime() {
     hasCudaSymbol: rt.hasExport('OrtSessionOptionsAppendExecutionProvider_CUDA'),
     hasDmlSymbol: rt.hasExport('OrtSessionOptionsAppendExecutionProvider_DML'),
     isWindows: Platform.isWindows,
-    isDesktop: App.isDesktop,
+    isDesktop: Platform.isWindows || Platform.isLinux || Platform.isMacOS,
   );
 }
 

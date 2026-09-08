@@ -290,12 +290,79 @@ class OrtRuntime {
   }
 }
 
+/// Native memory arena for zero-copy tensor inputs and outputs.
+class OrtTensorArena {
+  OrtTensorArena({this.maxBytes = 256 * 1024 * 1024});
+
+  final int maxBytes;
+  Pointer<Float> _ptr = nullptr;
+  int _capacityElements = 0;
+  Float32List? _cachedView;
+
+  int get capacityElements => _capacityElements;
+  Pointer<Float> get basePtr => _ptr;
+
+  Float32List get view {
+    if (_ptr == nullptr || _cachedView == null) {
+      ensure(0, 1024);
+    }
+    return _cachedView!;
+  }
+
+  Pointer<Float> pointerAt(int offset) {
+    if (offset < 0 || offset > _capacityElements) {
+      throw RangeError.range(offset, 0, _capacityElements);
+    }
+    return _ptr + offset;
+  }
+
+  /// Ensures capacity for at least [offset + count] float elements.
+  /// Returns [offset].
+  int ensure(int offset, int count) {
+    final required = offset + count;
+    if (required * sizeOf<Float>() > maxBytes) {
+      throw OrtFfiException(
+        'Arena allocation request ${required * 4} bytes exceeds maxBytes limit $maxBytes',
+        OrtFfiErrorKind.outOfMemory,
+      );
+    }
+    if (required > _capacityElements) {
+      var newCap = _capacityElements == 0 ? 65536 : _capacityElements * 2;
+      while (newCap < required) {
+        newCap *= 2;
+      }
+      final newPtr = calloc<Float>(newCap);
+      if (_ptr != nullptr) {
+        if (offset > 0) {
+          newPtr.asTypedList(newCap).setRange(0, offset, _cachedView!);
+        }
+        calloc.free(_ptr);
+      }
+      _ptr = newPtr;
+      _capacityElements = newCap;
+      _cachedView = _ptr.asTypedList(_capacityElements);
+    }
+    return offset;
+  }
+
+  void free() {
+    if (_ptr != nullptr) {
+      calloc.free(_ptr);
+      _ptr = nullptr;
+      _capacityElements = 0;
+      _cachedView = null;
+    }
+  }
+}
+
 /// Description of an input tensor (Float32, Native Float32, Int64, or Float16).
 sealed class OrtInput {
   const OrtInput();
 
   factory OrtInput.float32(Float32List data, List<int> shape) = _OrtInputF32Dart;
   factory OrtInput.nativeFloat32(Pointer<Float> ptr, int elementCount, List<int> shape) = _OrtInputF32Native;
+  factory OrtInput.fromArena(OrtTensorArena arena, int offset, int elementCount, List<int> shape) =>
+      OrtInput.nativeFloat32(arena.pointerAt(offset), elementCount, shape);
   factory OrtInput.int64(Int64List data, List<int> shape) = _OrtInputI64Dart;
   factory OrtInput.float16(Uint16List halfs, List<int> shape) = _OrtInputF16Dart;
 
@@ -677,6 +744,69 @@ class OrtFfiSession {
   int runArgmaxLastRow(Map<String, OrtInput> inputs, String outputName) {
     return runArgmaxLastPosition(inputs, outputName, batch: 1, seqLen: 1)[0];
   }
+
+  /// Runs the session and computes argmax across the classes dimension for each step and batch item.
+  /// [outputName] tensor shape is [B, T, C].
+  Int32List runArgmaxGrid(
+    Map<String, OrtInput> inputs,
+    String outputName, {
+    required int batch,
+    required int steps,
+    required int classes,
+  }) {
+    return withNativeOutput(inputs, outputName, (ptr, shape, elementCount) {
+      final actualSteps = shape.length >= 2 ? shape[1] : steps;
+      final actualClasses = shape.last;
+      final total = batch * actualSteps;
+      final result = Int32List(total);
+
+      for (var b = 0; b < batch; b++) {
+        final bOffset = b * actualSteps * actualClasses;
+        final resOffset = b * actualSteps;
+        for (var t = 0; t < actualSteps; t++) {
+          final row = ptr + (bOffset + t * actualClasses);
+          var best = 0;
+          var bestScore = row[0];
+          for (var c = 1; c < actualClasses; c++) {
+            final score = row[c];
+            if (score > bestScore) {
+              bestScore = score;
+              best = c;
+            }
+          }
+          result[resOffset + t] = best;
+        }
+      }
+      return result;
+    });
+  }
+
+  /// Runs the session and writes output tensor data directly into [dst] arena at [offset].
+  (List<int>, int) runInto(
+    Map<String, OrtInput> inputs, {
+    required String outputName,
+    required OrtTensorArena dst,
+    required int offset,
+  }) {
+    return withNativeOutput(inputs, outputName, (ptr, shape, elementCount) {
+      dst.ensure(offset, elementCount);
+      final dstPtr = dst.pointerAt(offset);
+      dstPtr.asTypedList(elementCount).setRange(
+            0,
+            elementCount,
+            ptr.asTypedList(elementCount),
+          );
+      return (shape, elementCount);
+    });
+  }
+
+  /// In-place execution callback view.
+  R runInPlace<R>(
+    Map<String, OrtInput> inputs,
+    String outputName,
+    R Function(Pointer<Float> ptr, List<int> shape, int elementCount) action,
+  ) =>
+      withNativeOutput(inputs, outputName, action);
 
   T _execute<T>(
     Map<String, OrtInput> inputs,
