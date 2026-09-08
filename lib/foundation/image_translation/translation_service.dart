@@ -608,6 +608,12 @@ class ImageTranslationService with ChangeNotifier {
           regionsOf[i] = stored;
           continue;
         }
+        var cachedOcr = TranslationStore().getOcr(p.cacheKey);
+        if (cachedOcr != null) {
+          pendingOcr[i] = cachedOcr;
+          freshOcr[i] = true;
+          continue;
+        }
         ocrNeededIndices.add(i);
       } catch (e, s) {
         Log.warning('Image Translation', 'Batch OCR failed: $e\n$s');
@@ -742,9 +748,11 @@ class ImageTranslationService with ChangeNotifier {
           onStage?.call(TranslationStage.rendering, completedPages());
           if (freshOcr[i]) {
             TranslationStore().put(p.cacheKey, regions, chapter: chapter);
+            TranslationStore().deleteOcr(p.cacheKey);
           }
           if (regions.isEmpty) {
             _noContent.add(p.cacheKey);
+            TranslationStore().deleteOcr(p.cacheKey);
             success[i] = true; // no translatable text still counts as handled
             return;
           }
@@ -899,6 +907,11 @@ class ImageTranslationService with ChangeNotifier {
     }
     return _comicLangs!;
   }
+
+  PageTranslationPipeline get pipeline => _pipeline ??= PageTranslationPipeline();
+
+  String effectiveSourceFor(String comicKey, TranslationConfig config) =>
+      _effectiveSourceFor(comicKey, config);
 
   String _effectiveSourceFor(String comicKey, TranslationConfig config) {
     if (config.sourceLang != 'auto') {

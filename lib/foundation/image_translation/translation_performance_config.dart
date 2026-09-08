@@ -102,7 +102,7 @@ abstract final class TranslationPerformanceConfig {
       llmConcurrency: _intSetting(
         'imageTranslationLlmConcurrency',
         2,
-      ).clamp(1, isDesktop ? 4 : 3),
+      ).clamp(1, isDesktop ? 8 : 3),
       ep: _epSetting(),
       detBatch: _intSetting('imageTranslationOcrDetBatch', 1).clamp(1, 16),
       recBatch: _intSetting('imageTranslationOcrRecBatch', 1).clamp(1, isDesktop ? 32 : 4),

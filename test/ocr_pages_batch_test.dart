@@ -42,6 +42,45 @@ void main() {
       expect(withReady.hasError, isFalse);
       expect(withReady.isEmpty, isFalse);
     });
+
+    test('JSON serialization round-trips accurately', () {
+      final original = PageOcr(
+        [
+          TranslatedRegion(
+            rect: IntRect(0, 0, 10, 10),
+            eraseRect: IntRect(0, 0, 10, 10),
+            eraseRects: const [],
+            text: '你好',
+            backgroundColor: 0,
+            textColor: 0,
+            lineHeight: 12,
+          ),
+        ],
+        [
+          OcrBlock(
+            rect: IntRect(5, 5, 20, 25),
+            eraseRect: IntRect(5, 5, 20, 25),
+            eraseRects: const [],
+            text: 'テスト',
+            language: 'ja',
+            backgroundColor: 0xFFFFFFFF,
+            textColor: 0,
+            lineHeight: 14,
+          ),
+        ],
+        {'ja': 5, 'zh': 1},
+      );
+
+      final json = original.toJson();
+      final restored = PageOcr.fromJson(json);
+
+      expect(restored.ready.length, 1);
+      expect(restored.ready.first.text, '你好');
+      expect(restored.pending.length, 1);
+      expect(restored.pending.first.text, 'テスト');
+      expect(restored.pending.first.language, 'ja');
+      expect(restored.languageVotes, {'ja': 5, 'zh': 1});
+    });
   });
 
   group('OcrPageResult', () {

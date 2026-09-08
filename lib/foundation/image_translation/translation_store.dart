@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:sqlite3/common.dart';
 import 'package:venera/foundation/app.dart';
+import 'package:venera/foundation/image_translation/translation_pipeline.dart';
 import 'package:venera/foundation/image_translation/translation_types.dart';
 import 'package:venera/foundation/log.dart';
 import 'package:venera/foundation/source_platform.dart';
@@ -111,6 +112,7 @@ class TranslationStore with ChangeNotifier {
     _db = DatabaseGateway.instance.openManaged(_dbPath);
     _db.execute(_createTableSql);
     _db.execute(_createIndexTableSql);
+    _db.execute(_createOcrTableSql);
     _migrateSchema();
     migrateLegacyKeys(_db);
     _backfillChapterIndex();
@@ -212,6 +214,14 @@ class TranslationStore with ChangeNotifier {
         chapter_title text not null default '',
         page_count int not null default 0,
         updated_at int not null default 0
+      );
+    """;
+
+  static const String _createOcrTableSql = """
+      create table if not exists translated_ocr_page (
+        cache_key text primary key,
+        ocr_data text not null,
+        time int not null
       );
     """;
 
@@ -375,6 +385,76 @@ class TranslationStore with ChangeNotifier {
       );
       _notifyChanged();
     }
+  }
+
+  static const _insertReplaceOcrSql = """
+    insert or replace into translated_ocr_page (cache_key, ocr_data, time)
+    values (?, ?, ?);
+  """;
+
+  /// Stores the intermediate [ocr] result of a page before LLM translation.
+  void putOcr(String cacheKey, PageOcr ocr) {
+    if (!isInitialized) return;
+    var timestamp = DateTime.now().millisecondsSinceEpoch;
+    _db.execute(_insertReplaceOcrSql, [
+      cacheKey,
+      jsonEncode(ocr.toJson()),
+      timestamp,
+    ]);
+  }
+
+  /// The cached [PageOcr] for a page, or null when never OCR'd or evicted.
+  PageOcr? getOcr(String cacheKey) {
+    if (!isInitialized) return null;
+    try {
+      var rows = _db.select(
+        "select ocr_data from translated_ocr_page where cache_key = ?;",
+        [cacheKey],
+      );
+      if (rows.isEmpty) return null;
+      var data = jsonDecode(rows.first["ocr_data"] as String);
+      if (data is! Map<String, dynamic>) {
+        data = Map<String, dynamic>.from(data as Map);
+      }
+      return PageOcr.fromJson(data);
+    } catch (e, s) {
+      Log.error("TranslationStore", "getOcr failed: $e", s);
+      return null;
+    }
+  }
+
+  /// Whether intermediate OCR results already exist for [cacheKey].
+  bool hasOcr(String cacheKey) {
+    if (!isInitialized) return false;
+    try {
+      var rows = _db.select(
+        "select 1 from translated_ocr_page where cache_key = ? limit 1;",
+        [cacheKey],
+      );
+      return rows.isNotEmpty;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Deletes the intermediate OCR cache for one page.
+  void deleteOcr(String cacheKey) {
+    if (!isInitialized) return;
+    _db.execute(
+      "delete from translated_ocr_page where cache_key = ?;",
+      [cacheKey],
+    );
+  }
+
+  /// Deletes all intermediate OCR results under [scopePrefix].
+  int deleteOcrByPrefix(String scopePrefix) {
+    if (!isInitialized) return 0;
+    var escaped = _escapeLike(scopePrefix);
+    _db.execute(
+      "delete from translated_ocr_page where cache_key like ? escape '\\';",
+      ['$escaped%'],
+    );
+    return _db.select("select changes();").first[0] as int;
   }
 
   int recordExistingChapter(TranslationChapterIdentity chapter) {
@@ -661,6 +741,7 @@ class TranslationStore with ChangeNotifier {
   /// re-translate or "clear" drops both levels in lockstep. Returns rows removed.
   int deleteByPrefix(String scopePrefix) {
     if (!isInitialized) return 0;
+    deleteOcrByPrefix(scopePrefix);
     // Escape LIKE wildcards in the prefix so a '%' or '_' inside a key can't
     // widen the match; '\' is the explicit escape char below.
     var escaped = _escapeLike(scopePrefix);
@@ -681,6 +762,7 @@ class TranslationStore with ChangeNotifier {
   /// Wipes every stored translation across all comics.
   int clearAll() {
     if (!isInitialized) return 0;
+    _db.execute("delete from translated_ocr_page;");
     _db.execute("delete from translated_page;");
     var removed = _db.select("select changes();").first[0] as int;
     _db.execute("delete from translated_chapter_index;");

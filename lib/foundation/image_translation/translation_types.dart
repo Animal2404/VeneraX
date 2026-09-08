@@ -74,6 +74,73 @@ class OcrBlock {
   /// size to this so a small original caption stays small instead of growing to
   /// fill the whole detected box. 0 means unknown (fall back to box-based fit).
   final int lineHeight;
+
+  Map<String, dynamic> toJson() => {
+    'l': rect.left,
+    't': rect.top,
+    'r': rect.right,
+    'b': rect.bottom,
+    'text': text,
+    'lang': language,
+    'bg': backgroundColor,
+    'fg': textColor,
+    if (!_sameRect(eraseRect, rect)) ...{
+      'el': eraseRect.left,
+      'et': eraseRect.top,
+      'er': eraseRect.right,
+      'eb': eraseRect.bottom,
+    },
+    if (!_sameEraseRects(eraseRects, eraseRect))
+      'es': [
+        for (var r in eraseRects) [r.left, r.top, r.right, r.bottom],
+      ],
+    if (lineHeight > 0) 'lh': lineHeight,
+  };
+
+  factory OcrBlock.fromJson(Map<String, dynamic> json) {
+    var rect = IntRect(json['l'], json['t'], json['r'], json['b']);
+    var eraseRect = json['el'] == null
+        ? rect
+        : IntRect(json['el'], json['et'], json['er'], json['eb']);
+    var storedEraseRects = json['es'];
+    var eraseRects = <IntRect>[];
+    if (storedEraseRects is List) {
+      for (var stored in storedEraseRects) {
+        if (stored is List &&
+            stored.length == 4 &&
+            stored.every((value) => value is num)) {
+          var candidate = IntRect(
+            (stored[0] as num).toInt(),
+            (stored[1] as num).toInt(),
+            (stored[2] as num).toInt(),
+            (stored[3] as num).toInt(),
+          );
+          if (candidate.width > 0 && candidate.height > 0) {
+            eraseRects.add(candidate);
+          }
+        }
+      }
+    }
+    return OcrBlock(
+      rect: rect,
+      eraseRect: eraseRect,
+      eraseRects: eraseRects.isEmpty ? null : eraseRects,
+      text: json['text'] ?? '',
+      language: json['lang'] ?? '',
+      backgroundColor: json['bg'] ?? 0,
+      textColor: json['fg'] ?? 0,
+      lineHeight: json['lh'] ?? 0,
+    );
+  }
+
+  static bool _sameRect(IntRect a, IntRect b) =>
+      a.left == b.left &&
+      a.top == b.top &&
+      a.right == b.right &&
+      a.bottom == b.bottom;
+
+  static bool _sameEraseRects(List<IntRect> rects, IntRect eraseRect) =>
+      rects.length == 1 && _sameRect(rects.single, eraseRect);
 }
 
 /// A translated text block ready for rendering.

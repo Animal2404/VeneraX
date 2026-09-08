@@ -224,11 +224,11 @@ abstract class LlmTranslator {
   /// share this gate — neither path can overrun the endpoint on its own. The
   /// effective limit is min(user setting, AIMD estimate); AIMD backs off on a
   /// 429/503 and recovers on success.
-  static final _aimd = AimdController(min: 1, max: 4);
+  static final _aimd = AimdController(min: 1, max: 8);
   static final _gate = ConcurrencyGate((bucket) {
     var userMax = TranslationPerformanceConfig.effective.llmConcurrency.clamp(
       1,
-      4,
+      8,
     );
     return math.min(userMax, _aimd.limitFor(bucket));
   });
@@ -653,15 +653,26 @@ abstract class LlmTranslator {
         objEnd > objStart &&
         (arrStart == -1 || objStart < arrStart)) {
       try {
-        return jsonDecode(content.substring(objStart, objEnd + 1));
+        return _parseJsonLenient(content.substring(objStart, objEnd + 1));
       } catch (_) {
         // fall through to array
       }
     }
     if (arrStart != -1 && arrEnd > arrStart) {
-      return jsonDecode(content.substring(arrStart, arrEnd + 1));
+      return _parseJsonLenient(content.substring(arrStart, arrEnd + 1));
     }
     throw Exception('LLM response has no JSON payload');
+  }
+
+  static dynamic _parseJsonLenient(String text) {
+    try {
+      return jsonDecode(text);
+    } catch (_) {
+      // LLMs frequently output trailing commas, e.g. `[{"id": 1, "text": "foo"},]`
+      // Strip trailing commas before ] or } as a lenient fallback.
+      var sanitized = text.replaceAll(RegExp(r',\s*([\]}])'), r'$1');
+      return jsonDecode(sanitized);
+    }
   }
 
   static String _briefBody(Object? body) {

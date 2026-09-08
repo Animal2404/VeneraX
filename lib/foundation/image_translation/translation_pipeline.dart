@@ -48,6 +48,24 @@ class PageOcr {
   bool get hasError => error != null;
 
   bool get isEmpty => ready.isEmpty && pending.isEmpty;
+
+  Map<String, dynamic> toJson() => {
+    'ready': [for (var r in ready) r.toJson()],
+    'pending': [for (var p in pending) p.toJson()],
+    'votes': languageVotes,
+    if (error != null) 'error': error,
+  };
+
+  factory PageOcr.fromJson(Map<String, dynamic> json) => PageOcr(
+    (json['ready'] as List? ?? [])
+        .map((e) => TranslatedRegion.fromJson(Map<String, dynamic>.from(e)))
+        .toList(),
+    (json['pending'] as List? ?? [])
+        .map((e) => OcrBlock.fromJson(Map<String, dynamic>.from(e)))
+        .toList(),
+    Map<String, int>.from(json['votes'] as Map? ?? {}),
+    error: json['error'] as String?,
+  );
 }
 
 /// Per-page translation orchestrator. Runs on the main isolate but does no

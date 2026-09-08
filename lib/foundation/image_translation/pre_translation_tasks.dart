@@ -15,6 +15,7 @@ import 'package:venera/foundation/image_translation/translation_config.dart';
 import 'package:venera/foundation/image_translation/translation_models.dart';
 import 'package:venera/foundation/image_translation/translation_performance_config.dart';
 import 'package:venera/foundation/image_translation/translation_service.dart';
+import 'package:venera/foundation/image_translation/translation_store.dart';
 import 'package:venera/foundation/image_translation/translation_types.dart';
 import 'package:venera/foundation/image_translation/translation_worker.dart';
 import 'package:venera/foundation/local.dart';
@@ -684,19 +685,24 @@ class PreTranslationTaskManager with ChangeNotifier {
     }
     if (ranges.isEmpty) return;
 
-    // Overlap groups so a group's image fetch + OCR can proceed while a prior
-    // group waits on the LLM. Groups may finish out of order, but their counts
-    // are applied via the committer in strict group order, preserving the
-    // resume invariant that done+failed is always a contiguous prefix. The
-    // committer starts at group 0 = the first range processed here (counts for
-    // pages before startIndex are already in chapter.done/failed).
+    // Stage 1: Full-Speed GPU OCR Sweep across the entire chapter.
+    // Pre-run OCR on all remaining un-rendered pages across the chapter.
+    // This allows the GPU to run at maximum throughput without waiting on LLM I/O,
+    // stores intermediate OCR results in TranslationStore, and then disposes the
+    // TranslationWorker to immediately release all GPU VRAM before translation starts.
+    await _runChapterOcrPass(task, chapter, pageKeys, startIndex);
+    if (_canceledIds.contains(task.id) || chapter.canceled) return;
+
+    // Overlap groups so a group's translation request can proceed concurrently.
+    // Since Stage 1 completed OCR and freed the GPU, Stage 2 (LLM translation + rendering)
+    // runs with ep: OrtEpKind.cpu, allowing full network concurrency without GPU VRAM risk.
     var committer = OrderedGroupCommitter(0);
     var overlap = pipelineConcurrencyFor(
       TranslationPerformanceConfig.effective,
       isMobile: App.isMobile,
       sourceLang: task.config.sourceLang,
       hasJapaneseModel: TranslationModels.workerPaths().jaEncoder != null,
-      ep: TranslationWorker.instance.lastReport?.active ?? OrtEpKind.cpu,
+      ep: OrtEpKind.cpu,
     );
     var next = 0;
     // Self-removing set: each launched future removes itself on completion, so
@@ -769,6 +775,118 @@ class PreTranslationTaskManager with ChangeNotifier {
     await Future.wait(active);
   }
 
+  /// Stage 1: Continuous GPU OCR pass across all remaining pages in [chapter].
+  ///
+  /// Extracts text and bubble bounding boxes at maximum GPU batching speed
+  /// without waiting for remote LLM responses. Results are saved directly into
+  /// [TranslationStore.putOcr]. Once all pages are OCR'd, [TranslationWorker]
+  /// is disposed to completely free GPU VRAM before translation begins.
+  Future<void> _runChapterOcrPass(
+    PreTranslationTask task,
+    PreTranslationChapter chapter,
+    List<String> pageKeys,
+    int startIndex,
+  ) async {
+    final service = ImageTranslationService.instance;
+    final store = TranslationStore();
+    final perf = TranslationPerformanceConfig.effective;
+    final sourceLang = service.effectiveSourceFor(task.comicKey, task.config);
+
+    // 1. Identify which page indices still need OCR
+    final ocrNeeded = <int>[];
+    for (var i = startIndex; i < pageKeys.length; i++) {
+      if (_canceledIds.contains(task.id) || chapter.canceled) return;
+      final imageKey = pageKeys[i];
+      final cacheKey = ImageTranslationService.cacheKeyFor(
+        imageKey,
+        task.sourceKey,
+        task.cid,
+        chapter.eid,
+      );
+      if (await service.hasRenderedPage(cacheKey, task.config.mode)) {
+        continue;
+      }
+      if (store.get(cacheKey) != null) {
+        continue;
+      }
+      if (store.hasOcr(cacheKey)) {
+        continue;
+      }
+      ocrNeeded.add(i);
+    }
+
+    if (ocrNeeded.isEmpty) {
+      return;
+    }
+
+    // 2. Report OCR sweep activity in UI
+    final activity = _activities[task.id];
+    final ocrSlot = PreTranslationGroupActivity(
+      index: -1,
+      pageCount: ocrNeeded.length,
+    )..stage = TranslationStage.recognizing;
+    activity?.groups[-1] = ocrSlot;
+    _notifyActivity();
+
+    try {
+      final chunkSize = math.max<int>(1, perf.pagesPerOcrCall);
+      final pipeline = service.pipeline;
+
+      for (var i = 0; i < ocrNeeded.length; i += chunkSize) {
+        if (_canceledIds.contains(task.id) || chapter.canceled) return;
+        await _waitWhilePaused(task);
+        if (_canceledIds.contains(task.id) || chapter.canceled) return;
+
+        final chunkIndices = ocrNeeded.sublist(
+          i,
+          math.min<int>(i + chunkSize, ocrNeeded.length),
+        );
+
+        final chunkData = <({int index, String cacheKey, Uint8List bytes})>[];
+        for (final idx in chunkIndices) {
+          final imageKey = pageKeys[idx];
+          final cacheKey = ImageTranslationService.cacheKeyFor(
+            imageKey,
+            task.sourceKey,
+            task.cid,
+            chapter.eid,
+          );
+          try {
+            final bytes = await _fetchPageBytes(task, chapter.eid, imageKey);
+            chunkData.add((index: idx, cacheKey: cacheKey, bytes: bytes));
+          } catch (e, s) {
+            Log.warning('Pre-translation', 'Fetch failed in OCR sweep: $e\n$s');
+          }
+        }
+
+        if (chunkData.isNotEmpty) {
+          try {
+            final results = await pipeline.ocrPages(
+              chunkData.map((e) => e.bytes).toList(),
+              sourceLang: sourceLang,
+              targetLang: task.config.targetLang,
+            );
+            for (var c = 0; c < chunkData.length; c++) {
+              if (c < results.length && !results[c].hasError) {
+                store.putOcr(chunkData[c].cacheKey, results[c]);
+              }
+            }
+          } catch (e, s) {
+            Log.warning('Pre-translation', 'GPU OCR sweep chunk failed: $e\n$s');
+          }
+        }
+
+        ocrSlot.completedPages = (i + chunkIndices.length) * 0.55;
+        _notifyActivity();
+      }
+    } finally {
+      activity?.groups.remove(-1);
+      _notifyActivity();
+      // Dispose worker to completely free GPU VRAM immediately!
+      TranslationWorker.instance.dispose();
+    }
+  }
+
   /// Applies one finished group's counts, keeping the display channel in step.
   ///
   /// The group leaves [activity]'s in-flight map and its pages become buffered
@@ -818,7 +936,7 @@ class PreTranslationTaskManager with ChangeNotifier {
         (sourceLang == 'ja' || (sourceLang == 'auto' && hasJapaneseModel))) {
       return 1;
     }
-    final base = performance.llmConcurrency.clamp(1, 4);
+    final base = performance.llmConcurrency.clamp(1, 8);
     if (ep != OrtEpKind.cpu) {
       // GPU is serialized; overlap > 2 just causes more pages to hold decoded
       // RGBA buffers and queue for VRAM, raising VRAM pressure and OOM risk.
