@@ -77,17 +77,28 @@ class PageTranslationPipeline {
 
   /// OCR + translation. Returns render-ready regions; an empty list means
   /// the page has no text worth translating.
+  ///
+  /// [existingOcr] (null by default, so every existing caller keeps running
+  /// the full OCR) lets a caller hand in a page already recognized by
+  /// [ocrPage]/[ocrPages] — e.g. one restored from the durable OCR
+  /// intermediate cache (plan D-8) — and skip the GPU stage entirely, paying
+  /// only for the translation request. An [existingOcr] that records an
+  /// error counts as absent: a half-failed recognition is re-run, never
+  /// rendered.
   Future<PageAnalysis> analyzePage(
     Uint8List imageBytes, {
     required String sourceLang,
     required String targetLang,
     Map<String, String> glossary = const {},
+    PageOcr? existingOcr,
   }) async {
-    var ocr = await ocrPage(
-      imageBytes,
-      sourceLang: sourceLang,
-      targetLang: targetLang,
-    );
+    var ocr = (existingOcr != null && !existingOcr.hasError)
+        ? existingOcr
+        : await ocrPage(
+            imageBytes,
+            sourceLang: sourceLang,
+            targetLang: targetLang,
+          );
     if (ocr.pending.isEmpty) {
       return PageAnalysis(ocr.ready, ocr.languageVotes, const {});
     }

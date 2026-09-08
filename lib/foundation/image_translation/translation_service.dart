@@ -502,6 +502,34 @@ class ImageTranslationService with ChangeNotifier {
     return true;
   }
 
+  /// The shared OCR-intermediate cache read. Both consumer paths — the
+  /// reader's [_translateToCache] and the batch [translatePageGroup] — go
+  /// through here so the fingerprint they query with is always the one
+  /// produced by [ocrFingerprintFor], exactly as the pre-translation sweep
+  /// (`_runChapterOcrPass`) writes it. Readers computing the key
+  /// "individually" is the drift plan §5.3 warns about (D-8).
+  ///
+  /// A miss — no row, a row under another fingerprint, a row that records an
+  /// error, or a failed read — returns `fromCache: false` and null, and the
+  /// caller runs OCR. Matching is never relaxed to force a hit: a fingerprint
+  /// mismatch means the row was produced by different model inputs and must
+  /// be re-recognised (D-2, red line R2-adjacent — [ocrFingerprintFor]'s
+  /// semantics are not negotiable here).
+  ({PageOcr? ocr, bool fromCache}) _ocrFromCache(
+    String cacheKey,
+    String fingerprint,
+  ) {
+    try {
+      var ocr = TranslationStore().getOcr(cacheKey, fingerprint: fingerprint);
+      if (ocr != null && !ocr.hasError) {
+        return (ocr: ocr, fromCache: true);
+      }
+    } catch (e, s) {
+      Log.warning('Image Translation', 'OCR cache read failed: $e\n$s');
+    }
+    return (ocr: null, fromCache: false);
+  }
+
   /// The shared translation core used by both the awaitable [translateOne]
   /// (pre-translation manager) and the queued [_process] (reader). It performs
   /// the cache probe, OCR/translation analysis (with the text-level cache),
@@ -526,16 +554,41 @@ class ImageTranslationService with ChangeNotifier {
     // another device via WebDAV) skips OCR and the paid LLM request entirely.
     var regions = TranslationStore().get(cacheKey);
     if (regions == null) {
+      var effectiveSourceLang = _effectiveSourceFor(comicKey, config);
+      // D-8: the reader shares the OCR intermediate with the pre-translation
+      // sweep. A chapter whose sweep was cancelled or failed part-way used to
+      // burn the GPU again here for pages already recognized; now the stored
+      // PageOcr is handed to [analyzePage] and only the LLM is paid. The
+      // fingerprint is computed the same way both writers compute it — from
+      // the *resolved* source language, the value `effectiveSourceFor`
+      // returns (never the raw `auto` of an unlocked comic's config), so the
+      // reader queries exactly the key the sweep wrote (plan §5.3).
+      var cached = _ocrFromCache(
+        cacheKey,
+        ocrFingerprintFor(effectiveSourceLang),
+      );
+      // Observability (plan V8-6): `ocr=cache` without a following
+      // `det={…}` worker line is the evidence the page was not re-recognized.
+      Log.info(
+        'Image Translation',
+        'Page analysis ocr=${cached.fromCache ? 'cache' : 'run'} '
+        'lang=$effectiveSourceLang $cacheKey',
+      );
       var analysis = await pipeline.analyzePage(
         imageBytes,
-        sourceLang: _effectiveSourceFor(comicKey, config),
+        sourceLang: effectiveSourceLang,
         targetLang: config.targetLang,
         glossary: _glossaryFor(comicKey),
+        existingOcr: cached.ocr,
       );
       _updateLanguageLock(comicKey, analysis.languageVotes, config);
       _mergeGlossary(comicKey, analysis.newGlossary);
       regions = analysis.regions;
       TranslationStore().put(cacheKey, regions, chapter: chapter);
+      // The durable text now exists (even if empty), so the OCR intermediate
+      // is spent — drop it, matching translatePageGroup's stage-3 lifecycle,
+      // including a stale-fingerprint row this page had to re-recognize past.
+      TranslationStore().deleteOcr(cacheKey);
     }
     if (shouldCancel?.call() ?? false) {
       throw const PipelineCanceled();
@@ -625,6 +678,7 @@ class ImageTranslationService with ChangeNotifier {
     // reader of the OCR cache must agree on the same value (plan §5.3).
     final ocrFp = ocrFingerprintFor(sourceLang);
     var ocrNeededIndices = <int>[];
+    var reusedOcr = 0;
     for (var i = 0; i < pages.length; i++) {
       if (shouldCancel?.call() ?? false) throw const PipelineCanceled();
       var p = pages[i];
@@ -641,13 +695,11 @@ class ImageTranslationService with ChangeNotifier {
           regionsOf[i] = stored;
           continue;
         }
-        var cachedOcr = TranslationStore().getOcr(
-          p.cacheKey,
-          fingerprint: ocrFp,
-        );
-        if (cachedOcr != null) {
-          pendingOcr[i] = cachedOcr;
+        var cached = _ocrFromCache(p.cacheKey, ocrFp);
+        if (cached.ocr != null) {
+          pendingOcr[i] = cached.ocr;
           freshOcr[i] = true;
+          reusedOcr++;
           continue;
         }
         ocrNeededIndices.add(i);
@@ -655,6 +707,16 @@ class ImageTranslationService with ChangeNotifier {
         Log.warning('Image Translation', 'Batch OCR failed: $e\n$s');
         settled[i] = true; // failed; success[i] stays false
       }
+    }
+    if (reusedOcr > 0 || ocrNeededIndices.isNotEmpty) {
+      // The same ocr=cache / ocr=run field as the reader path, aggregated
+      // per group so batch logs stay quiet (plan V8-6).
+      Log.info(
+        'Image Translation',
+        'Group OCR resolve: ocr=cache x$reusedOcr '
+        'ocr=run x${ocrNeededIndices.length} '
+        '(fingerprint ${ocrFp.substring(0, 8)})',
+      );
     }
 
     if (ocrNeededIndices.isNotEmpty) {
@@ -945,6 +1007,13 @@ class ImageTranslationService with ChangeNotifier {
   }
 
   PageTranslationPipeline get pipeline => _pipeline ??= PageTranslationPipeline();
+
+  /// Test seam: replace the pipeline used by [_translateToCache] and
+  /// [translatePageGroup] with a stub whose OCR/render are fake, so the
+  /// cache-reuse decisions can be pinned without models, fonts or an LLM
+  /// endpoint. Passing null restores lazy construction.
+  @visibleForTesting
+  void usePipelineForTest(PageTranslationPipeline? value) => _pipeline = value;
 
   String effectiveSourceFor(String comicKey, TranslationConfig config) =>
       _effectiveSourceFor(comicKey, config);
