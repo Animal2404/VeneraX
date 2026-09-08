@@ -6,22 +6,23 @@ import 'package:flutter/foundation.dart';
 import 'package:venera/foundation/app.dart';
 import 'package:venera/foundation/appdata.dart';
 import 'package:venera/foundation/consts.dart';
+import 'package:venera/foundation/image_translation/local_model_import.dart';
 import 'package:venera/foundation/image_translation/ort_capabilities.dart';
 import 'package:venera/foundation/image_translation/translation_worker.dart';
 import 'package:venera/foundation/log.dart';
 import 'package:venera/network/app_dio_io.dart';
 import 'package:venera/utils/io.dart';
 
+// Re-exported so the model-management settings page (a `part` of
+// settings_page.dart, which therefore cannot add its own imports without a
+// cross-agent edit) reaches the import API through this library only.
+export 'local_model_import.dart' show ImportVerdict, validateComponent;
+
 /// A single downloadable file of a model component. [urls] is a fallback
 /// chain: mirrors are tried in order, so a blocked host does not make the
 /// component impossible to install.
 class ModelFile {
-  const ModelFile(
-    this.name,
-    this.urls, {
-    this.sha256BytesHint,
-    this.expectedSha256,
-  });
+  const ModelFile(this.name, this.urls, {this.expectedSha256});
 
   /// File name inside the component directory.
   final String name;
@@ -31,12 +32,25 @@ class ModelFile {
   /// `{release}` is replaced with the GitHub Releases download URL for models.
   final List<String> urls;
 
-  /// Optional expected file size hint in bytes.
-  final int? sha256BytesHint;
-
   /// Optional expected SHA-256 checksum (hex string, case-insensitive).
   final String? expectedSha256;
 }
+
+/// Verification state of a component's local files (plan §7.2.1, name
+/// frozen by appendix F — other phases and the settings UI compile against
+/// these exact identifiers).
+///
+/// * [absent]   — at least one required file is missing or 0 bytes.
+/// * [present]  — files exist, are non-empty and passed the cheap, FFI-free
+///   structure gate of `local_model_import.dart`, but nothing stronger has
+///   ever been checked (no checksum comparison, no session probe).
+/// * [verified] — [absent]/[present] plus a full [validateComponent] pass,
+///   which includes checksum matches against [ModelFile.expectedSha256].
+/// * [invalid]  — validation (on sight or on demand) found a defect with a
+///   human-readable [TranslationModels.validationDetail]; the component is
+///   excluded from `isInstalled` / `workerPaths()` so a broken file can
+///   never blow up in the middle of inference (V10-4).
+enum ModelState { absent, present, verified, invalid }
 
 /// Accuracy / performance tier for models.
 enum ModelTier {
@@ -98,21 +112,23 @@ class ModelComponent {
   String get directory =>
       FilePath.join(App.dataPath, 'translation_models', id);
 
+  /// Whether [name] is one of this component's own files (a `dictFrom`
+  /// dictionary does not count — it belongs to the owner).
+  bool ownsFileNamed(String name) => files.any((f) => f.name == name);
+
   bool get isInstalled {
+    // Plan §7.2.1 / V10-4: usability is state-gated, not "exists && > 0
+    // bytes". `stateOf` runs the cheap synchronous structure check the
+    // first time a file set is seen (and again whenever size/mtime
+    // changed), so files dropped in from a network drive are judged before
+    // they can reach an inference crash; `invalid` is excluded outright.
+    // The 12 published upstream fp32 assets ride the "checksum matched"
+    // (verified) branch or pass the structure gate as `present`; neither
+    // route requires a session, and neither can regress a good install —
+    // pinned by test/local_model_import_test.dart.
     if (!enabled) return false;
-    for (var file in files) {
-      var f = File(FilePath.join(directory, file.name));
-      if (!f.existsSync() || f.lengthSync() == 0) {
-        return false;
-      }
-    }
-    if (dictFrom != null) {
-      var dictComp = TranslationModels.find(dictFrom!);
-      if (dictComp == null || !dictComp.isInstalled) {
-        return false;
-      }
-    }
-    return true;
+    final s = TranslationModels.stateOf(this);
+    return s == ModelState.present || s == ModelState.verified;
   }
 
   String filePath(String name) {
@@ -431,6 +447,125 @@ abstract class TranslationModels {
     return null;
   }
 
+  // ------------------------------------------------------------------------
+  // Validation ledger (plan §7.2.1 / §7.2.2, decision R-3)
+  //
+  // Component id -> last verdict, stamped with the fingerprint (size +
+  // mtime, shared dictionary included) of the files it was computed for.
+  // A fingerprint miss means "the user replaced something": the verdict is
+  // recomputed by the FFI-free structure gate in local_model_import.dart
+  // (red line R3: it never opens an ORT session, so it is safe on this
+  // isolate). validateComponent() upgrades or downgrades entries after a
+  // full pass (checksums, optional session probe).
+  // ------------------------------------------------------------------------
+
+  static final _verdicts = <String, _ModelVerdict>{};
+
+  /// Current verification state of [c]'s local files. See [ModelState].
+  static ModelState stateOf(ModelComponent c) {
+    if (!c.enabled) return ModelState.absent;
+    for (final f in c.files) {
+      final file = File(c.filePath(f.name));
+      if (!file.existsSync() || file.lengthSync() == 0) {
+        if (_verdicts.remove(c.id) != null) invalidateReadyCache();
+        return ModelState.absent;
+      }
+    }
+    if (c.dictFrom != null) {
+      final owner = find(c.dictFrom!);
+      if (owner == null) return ModelState.invalid;
+      final os = stateOf(owner);
+      if (os == ModelState.absent || os == ModelState.invalid) {
+        // A component whose shared dictionary is gone/broken is not usable
+        // either, regardless of what its own files look like.
+        if (_verdicts.remove(c.id) != null) invalidateReadyCache();
+        return os;
+      }
+    }
+    final fp = _componentFingerprint(c);
+    final v = _verdicts[c.id];
+    if (v != null && v.fingerprint == fp) return v.state;
+    final check = checkComponentStructure(c);
+    final problem = check.problem;
+    if (problem != null) {
+      Log.warning('Translation Models', '${c.id}: ${check.problem}');
+      _verdicts[c.id] = _ModelVerdict(
+        ModelState.invalid,
+        detail: problem,
+        fingerprint: fp,
+      );
+      invalidateReadyCache();
+      return ModelState.invalid;
+    }
+    _verdicts[c.id] = _ModelVerdict(ModelState.present, fingerprint: fp);
+    // A fresh gate result (files replaced since last check): the memoised
+    // readiness must not outlive it.
+    invalidateReadyCache();
+    return ModelState.present;
+  }
+
+  /// Records a verdict from the validators (`validateComponent`, the
+  /// download path). The fingerprint is taken now, so any later change to
+  /// the files demotes the component back to "re-check me".
+  static void recordVerdict(
+    ModelComponent c,
+    ModelState state, {
+    String? detail,
+  }) {
+    _verdicts[c.id] = _ModelVerdict(
+      state,
+      detail: detail,
+      fingerprint: _componentFingerprint(c),
+    );
+    invalidateReadyCache();
+  }
+
+  /// Human-readable reason behind an [ModelState.invalid] verdict, for the
+  /// settings page inline status (plan §7.2.3: "Toast + 行内状态").
+  static String? validationDetail(ModelComponent c) => _verdicts[c.id]?.detail;
+
+  /// Forgets the verdict of [c] (files deleted etc.); it will be recomputed
+  /// on the next [stateOf] call.
+  static void forgetVerdictsFor(ModelComponent c) {
+    _verdicts.remove(c.id);
+    invalidateReadyCache();
+  }
+
+  @visibleForTesting
+  static void clearVerdictsForTest() {
+    _verdicts.clear();
+    invalidateReadyCache();
+  }
+
+  static String _componentFingerprint(ModelComponent c) {
+    final sb = StringBuffer();
+    for (final f in c.files) {
+      sb.write('|${_fileFingerprint(c.filePath(f.name))}');
+    }
+    if (c.dictFrom != null) {
+      final owner = find(c.dictFrom!);
+      // A shared dictionary is part of "this component's inputs" as far as
+      // the C == N + 2 gate goes: replacing it must re-validate the model.
+      if (owner != null) {
+        sb.write('|dict:${_fileFingerprint(owner.filePath('dict.txt'))}');
+      }
+    }
+    return sb.toString();
+  }
+
+  static String _fileFingerprint(String path) {
+    try {
+      final s = File(path).statSync();
+      if (s.type == FileSystemEntityType.notFound) return 'missing';
+      // FileStat exposes `modified` as a DateTime (there is no
+      // modifiedMicrosecondsSinceEpoch); sync path on purpose — this runs
+      // from isInstalled, which callers use from build() too.
+      return '${s.size}@${s.modified.millisecondsSinceEpoch}';
+    } catch (_) {
+      return 'unknown';
+    }
+  }
+
   /// Current model tier configured in app settings.
   static ModelTier get currentModelTier =>
       appdata.settings['imageTranslationModelQuality'] == 'high'
@@ -603,6 +738,17 @@ class ModelDownloadState {
   String? error;
 }
 
+/// One entry of the validation ledger: a [ModelState] stamped with the
+/// fingerprint (size + mtime of every file that feeds the checks, shared
+/// dictionary included) it was computed for.
+class _ModelVerdict {
+  const _ModelVerdict(this.state, {this.detail, required this.fingerprint});
+
+  final ModelState state;
+  final String? detail;
+  final String fingerprint;
+}
+
 /// Downloads and manages local translation model files.
 class TranslationModelStore with ChangeNotifier {
   TranslationModelStore._();
@@ -766,6 +912,18 @@ class TranslationModelStore with ChangeNotifier {
         finishedBytes += target.lengthSync();
       }
       state.progress = 1;
+      // §7.3: downloaded files run the same import validation as manually
+      // dropped ones. Per-file checksums were already enforced on the
+      // `.part` file above, so what happens here is the structure / dict
+      // cross-check plus the verdict record the gate reads.
+      final verdict = await validateComponent(component);
+      if (!verdict.ok) {
+        state.error = verdict.reason;
+        Log.error(
+          'Translation Models',
+          'Post-download validation failed for ${component.id}: ${verdict.reason}',
+        );
+      }
     } catch (e) {
       if (!cancelToken.isCancelled) {
         state.error = e.toString();
@@ -791,6 +949,7 @@ class TranslationModelStore with ChangeNotifier {
       await dir.deleteIgnoreError(recursive: true);
     }
     _states.remove(component.id);
+    TranslationModels.forgetVerdictsFor(component);
     TranslationModels.invalidateReadyCache();
     notifyListeners();
   }

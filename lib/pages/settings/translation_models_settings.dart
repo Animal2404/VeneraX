@@ -15,6 +15,9 @@ class TranslationModelsPage extends StatefulWidget {
 }
 
 class _TranslationModelsPageState extends State<TranslationModelsPage> {
+  /// Ids of components whose "Validate files" run is still in flight.
+  final _validating = <String>{};
+
   @override
   void initState() {
     TranslationModelStore.instance.addListener(_update);
@@ -108,6 +111,18 @@ class _TranslationModelsPageState extends State<TranslationModelsPage> {
               'https://hf-mirror.com': "hf-mirror.com",
             },
           ).toSliver(),
+          // Plan §7.2.3 (3) / R-3: `{release}` is this fork's own `models`
+          // Release, which only exists once publish.py actually ran. Default
+          // off (the key's default is registered in appdata.dart; this page
+          // only reads/writes it) — with it off, {release} URLs are dropped
+          // from the chain instead of burning a 404 in front of every
+          // working mirror.
+          _SwitchSetting(
+            title: "Self-hosted model source".tl,
+            settingKey: "imageTranslationSelfHostedSource",
+            subtitle:
+                "Only enable this after the repository has actually published a 'models' release containing the model files.".tl,
+          ).toSliver(),
           ListTile(
             title: Text("Storage used by models".tl),
             subtitle: Text(
@@ -155,11 +170,61 @@ class _TranslationModelsPageState extends State<TranslationModelsPage> {
     var state = store.stateOf(component);
     var installed = component.isInstalled;
     final isGpuBlocked = component.requiresGpuEp && !hasGpuBackend;
+    // stateOf runs the FFI-free structure gate on first sight, so a broken
+    // drop-in is flagged here without any inference having touched it.
+    final modelState = component.enabled
+        ? TranslationModels.stateOf(component)
+        : ModelState.absent;
+
+    // §7.2.3: the two local-import actions live on every *enabled* row,
+    // installed or not — the typical flow is "open folder, drop files,
+    // validate" precisely while the component is still missing.
+    // Android has no filesystem semantics for these paths: no folder button.
+    final actions = <Widget>[
+      if (component.enabled && !App.isAndroid)
+        IconButton(
+          icon: const Icon(Icons.folder_open),
+          tooltip: "Open model folder".tl,
+          onPressed: () => _openModelFolder(component),
+        ),
+      if (component.enabled)
+        IconButton(
+          icon: _validating.contains(component.id)
+              ? SizedBox(
+                  width: 18,
+                  height: 18,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2.2,
+                    color: context.colorScheme.primary,
+                  ),
+                )
+              : Icon(
+                  switch (modelState) {
+                    ModelState.verified => Icons.fact_check_outlined,
+                    ModelState.invalid => Icons.error_outline,
+                    _ => Icons.rule_folder_outlined,
+                  },
+                  color: switch (modelState) {
+                    ModelState.invalid => context.colorScheme.error,
+                    ModelState.verified => context.colorScheme.primary,
+                    _ => context.colorScheme.outline,
+                  },
+                ),
+          tooltip: "Validate files".tl,
+          onPressed: _validating.contains(component.id)
+              ? null
+              : () => _validateComponentFiles(component),
+        ),
+    ];
 
     Widget trailing;
     if (!component.enabled) {
+      // R-3 / §7.2.1: assets that are registered but never published say so
+      // and offer nothing to click; reserved placeholders keep "Coming soon".
       trailing = Text(
-        "Coming soon".tl,
+        component.files.isEmpty
+            ? "Coming soon".tl
+            : "Unpublished · not available".tl,
         style: TextStyle(color: context.colorScheme.outline),
       );
     } else if (state.downloading) {
@@ -186,6 +251,7 @@ class _TranslationModelsPageState extends State<TranslationModelsPage> {
       trailing = Row(
         mainAxisSize: MainAxisSize.min,
         children: [
+          ...actions,
           Icon(Icons.check_circle, color: context.colorScheme.primary),
           IconButton(
             icon: const Icon(Icons.delete_outline),
@@ -204,19 +270,31 @@ class _TranslationModelsPageState extends State<TranslationModelsPage> {
         ],
       );
     } else if (isGpuBlocked) {
-      trailing = Button.outlined(
-        color: context.colorScheme.outline.withValues(alpha: 0.4),
-        onPressed: () {},
-        child: Text(
-          "Download".tl,
-          style: TextStyle(color: context.colorScheme.outline),
-        ),
-      ).fixHeight(32);
+      trailing = Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          ...actions,
+          Button.outlined(
+            color: context.colorScheme.outline.withValues(alpha: 0.4),
+            onPressed: () {},
+            child: Text(
+              "Download".tl,
+              style: TextStyle(color: context.colorScheme.outline),
+            ),
+          ).fixHeight(32),
+        ],
+      );
     } else {
-      trailing = Button.filled(
-        onPressed: () => store.download(component),
-        child: Text("Download".tl),
-      ).fixHeight(32);
+      trailing = Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          ...actions,
+          Button.filled(
+            onPressed: () => store.download(component),
+            child: Text("Download".tl),
+          ).fixHeight(32),
+        ],
+      );
     }
 
     String subtitle = _formatSize(component.approxSizeBytes);
@@ -229,6 +307,19 @@ class _TranslationModelsPageState extends State<TranslationModelsPage> {
     }
     if (requiredIds.contains(component.id) && !installed && component.enabled) {
       subtitle += " · ${"Required by current settings".tl}";
+    }
+    if (component.enabled) {
+      // §7.2.3 "行内状态": the validation verdict, in words.
+      switch (modelState) {
+        case ModelState.invalid:
+          subtitle += '\n${"Invalid".tl}: ${TranslationModels.validationDetail(component) ?? ""}';
+        case ModelState.verified:
+          subtitle += ' · ${"Validated".tl}';
+        case ModelState.present:
+          subtitle += ' · ${"Files present, not validated yet".tl}';
+        case ModelState.absent:
+          break;
+      }
     }
     if (state.error != null) {
       subtitle += "\n${"Download failed".tl}: ${state.error}";
@@ -247,8 +338,89 @@ class _TranslationModelsPageState extends State<TranslationModelsPage> {
             ? null
             : TextStyle(color: context.colorScheme.outline),
       ),
-      isThreeLine: state.error != null,
+      isThreeLine:
+          state.error != null ||
+          (component.enabled && modelState == ModelState.invalid),
       trailing: trailing,
     );
+  }
+
+  /// §7.2.3 ladder for "Open model folder".
+  ///
+  /// ① `lib/utils/io.dart` carries no open-folder helper at all ([自验],
+  ///   checked at the time of writing: only `DirectoryPicker`, `Share` and
+  ///   path/file utilities) — nothing to reuse, so the ladder starts at ②.
+  /// ② url_launcher (`Uri.directory(path)` as a file: URL; the dependency
+  ///   was already in pubspec.yaml, no new dependency added).
+  /// ③ `Process.run`: `explorer` / `open` / `xdg-open` (+ common Linux
+  ///   file managers), mirroring what `openComicFolder` does on this repo.
+  /// ④ total failure: copy the full path to the clipboard and show it.
+  Future<void> _openModelFolder(ModelComponent component) async {
+    final dir = Directory(component.directory);
+    try {
+      // The directory is what the user is supposed to drop files into;
+      // creating it on first use beats opening a path that does not exist.
+      dir.createSync(recursive: true);
+    } catch (_) {}
+    final path = dir.path;
+    try {
+      if (await launchUrlString(Uri.directory(path).toString())) return;
+    } catch (_) {}
+    if (await _openFolderProcess(path)) return;
+    try {
+      await Clipboard.setData(ClipboardData(text: path));
+    } catch (_) {}
+    if (mounted) {
+      context.showMessage(
+        message:
+            '${"Could not open the folder; the path has been copied to the clipboard".tl}\n$path',
+      );
+    }
+  }
+
+  /// ③ of [_openModelFolder]: per-platform spawn. `Process.run` only throws
+  /// when the binary cannot start; a non-zero exit from explorer/open is
+  /// still "the folder was shown", so it is not treated as failure.
+  Future<bool> _openFolderProcess(String path) async {
+    try {
+      if (App.isWindows) {
+        await Process.run('explorer', [path]);
+        return true;
+      }
+      if (App.isMacOS) {
+        await Process.run('open', [path]);
+        return true;
+      }
+      if (App.isLinux) {
+        for (var opener in const ['xdg-open', 'nautilus', 'dolphin', 'thunar']) {
+          try {
+            await Process.run(opener, [path]);
+            return true;
+          } catch (_) {
+            // that opener is not installed; try the next candidate
+          }
+        }
+      }
+    } catch (_) {}
+    return false;
+  }
+
+  /// §7.2.2: explicit "校验已放入的文件" action — full validateComponent pass
+  /// (checksums included: this is a deliberate user click, the hashing cost
+  /// is expected), result as Toast + the inline row state.
+  Future<void> _validateComponentFiles(ModelComponent component) async {
+    setState(() => _validating.add(component.id));
+    final verdict = await validateComponent(component, checkHashes: true);
+    if (!mounted) return;
+    setState(() => _validating.remove(component.id));
+    final name = _componentName(component);
+    if (verdict.ok) {
+      final extra = verdict.warnings.isEmpty ? '' : '\n${verdict.warnings.first}';
+      context.showMessage(message: '${"Validation passed".tl}: $name$extra');
+    } else {
+      context.showMessage(
+        message: '${"Validation failed".tl}: $name\n${verdict.reason}',
+      );
+    }
   }
 }
