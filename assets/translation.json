@@ -1436,7 +1436,13 @@
     "Suggested for this machine: @tier — detection batch @det, recognition batch @rec, @pages pages per recognition call.": "本机建议：@tier —— 检测批 @det，识别批 @rec，每次识别调用处理 @pages 页。",
     "Suggested for this machine: @tier — @vram MB of graphics memory, detection batch @det, recognition batch @rec, @pages pages per recognition call.": "本机建议：@tier —— 显存 @vram MB，检测批 @det，识别批 @rec，每次识别调用处理 @pages 页。",
     "Erased text could not be rebuilt on @n area(s) — the original is kept there": "有 @n 处原文未能重建，已保留原始文字",
-    "Models are still in memory after cancelling this task": "取消本任务后模型仍驻留显存"
+    "Models are still in memory after cancelling this task": "取消本任务后模型仍驻留显存",
+    "@rate pages/min": "@rate 页/分钟",
+    "@ms ms/page": "平均每页 @ms 毫秒",
+    "Elapsed @elapsed": "用时 @elapsed",
+    "Progress refresh interval": "进度刷新间隔",
+    "How often the pre-translation progress card re-reads its per-phase rates. Lower refreshes faster but rebuilds the task list more often; higher is cheaper and slightly staler.": "预翻译进度卡片重新读取各阶段速率的频率。调低刷新更快，但任务列表重建更频繁；调高更省，数字略滞后。",
+    "@seconds s": "@seconds 秒"
   },
   "zh_TW": {
     "Reading Statistics": "閱讀統計",
@@ -2875,6 +2881,12 @@
     "Suggested for this machine: @tier — detection batch @det, recognition batch @rec, @pages pages per recognition call.": "本機建議：@tier —— 偵測批 @det，識別批 @rec，每次識別呼叫處理 @pages 頁。",
     "Suggested for this machine: @tier — @vram MB of graphics memory, detection batch @det, recognition batch @rec, @pages pages per recognition call.": "本機建議：@tier —— 記憶體 @vram MB，偵測批 @det，識別批 @rec，每次識別呼叫處理 @pages 頁。",
     "Erased text could not be rebuilt on @n area(s) — the original is kept there": "有 @n 處原文未能重建，已保留原始文字",
-    "Models are still in memory after cancelling this task": "取消本任務後模型仍駐留顯存"
+    "Models are still in memory after cancelling this task": "取消本任務後模型仍駐留顯存",
+    "@rate pages/min": "@rate 頁/分鐘",
+    "@ms ms/page": "平均每頁 @ms 毫秒",
+    "Elapsed @elapsed": "用時 @elapsed",
+    "Progress refresh interval": "進度刷新間隔",
+    "How often the pre-translation progress card re-reads its per-phase rates. Lower refreshes faster but rebuilds the task list more often; higher is cheaper and slightly staler.": "預翻譯進度卡片重新讀取各階段速率的頻率。調低刷新更快，但工作列表重建更頻繁；調高更省，數字略滯後。",
+    "@seconds s": "@seconds 秒"
   }
 }

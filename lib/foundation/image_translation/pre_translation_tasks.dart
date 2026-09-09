@@ -107,6 +107,7 @@ class PreTranslationTask {
     this.cover = '',
     this.status = PreTranslationTaskStatus.running,
     this.finishedAt,
+    this.finalSummary,
   });
 
   final String id;
@@ -119,6 +120,16 @@ class PreTranslationTask {
   final DateTime createdAt;
   PreTranslationTaskStatus status;
   DateTime? finishedAt;
+
+  /// The card's last live view, frozen at the moment the job ended (natural
+  /// finish, failure or cancel). Rates, per-phase page counts and the engine
+  /// row used to live only in [PreTranslationActivity] and the worker fold,
+  /// both of which are gone once the loop exits — so a finished card showed
+  /// none of them. This is plain JSON inside the task object itself: it rides
+  /// the existing history persistence (appdata implicit data), **not** a new
+  /// database table. Null for jobs recorded before this existed, which the
+  /// card renders from committed counters with `—` rates (never fake zeros).
+  PreTranslationTaskSummary? finalSummary;
 
   String get comicKey => '$cid@$sourceKey';
 
@@ -167,6 +178,7 @@ class PreTranslationTask {
     'createdAt': createdAt.toIso8601String(),
     'finishedAt': finishedAt?.toIso8601String(),
     'status': status.name,
+    'finalSummary': finalSummary?.toJson(),
     'chapters': chapters.map((c) => c.toJson()).toList(),
   };
 
@@ -184,6 +196,11 @@ class PreTranslationTask {
         (e) => e.name == json['status'],
         orElse: () => PreTranslationTaskStatus.completed,
       ),
+      finalSummary: json['finalSummary'] is Map
+          ? PreTranslationTaskSummary.fromJson(
+              Map<String, dynamic>.from(json['finalSummary'] as Map),
+            )
+          : null,
       chapters: (json['chapters'] as List? ?? [])
           .whereType<Map>()
           .map(
@@ -219,6 +236,27 @@ class PreTranslationGroupActivity {
   /// is not phase-weighted (8 recognized pages read as 8, not as 8×0.55), and
   /// like [completedPages] it never feeds the resume cursor.
   int? recognizedPages;
+
+  /// Moves [stage] forward and reports whether this change is the moment the
+  /// group *crossed from before-rendering into rendering*.
+  ///
+  /// That crossing is exactly when the group's translation response landed —
+  /// [ImageTranslationService.translatePageGroup] only enters its render loop
+  /// after the batch call returned (a failed batch also reports back and
+  /// settles, which is why the failure path counts too, matching
+  /// [PreTranslationActivity.translatedThrough]'s "the request came back"
+  /// semantics). The check fires true once per group: every later
+  /// `rendering` report sees a previous stage that is already ≥ rendering.
+  /// This is how the translation stream gets sampled without adding a second
+  /// instrumentation path to the service (the service's own GroupPerf log
+  /// stays the log it is; the crossing is already visible here).
+  bool noteStage(TranslationStage stage) {
+    var crossed =
+        this.stage.index < TranslationStage.rendering.index &&
+        stage.index >= TranslationStage.rendering.index;
+    this.stage = stage;
+    return crossed;
+  }
 }
 
 /// What a running job is doing right now, beyond its committed counters.
@@ -376,14 +414,19 @@ class PreTranslationActivity {
   // ---------------------------------------------------------------------
   // Throughput (display only, window-based).
   //
-  // Two separate streams because they measure different things and the
-  // phases alternate: recognition pages/min during a sweep, end-to-end
-  // committed pages/min during stage 2. Sharing one window would print a
-  // "translation throughput" computed from OCR chunks — the exact class of
-  // wrong-but-plausible number this card is here to remove.
+  // Three separate streams, one per pipeline phase, because the phases
+  // alternate and sharing one number printed a "translation throughput"
+  // computed from OCR chunks — the exact class of wrong-but-plausible
+  // figure this card exists to remove. Recognition is fed by the sweep
+  // (stage 1), translation by each group's translating→rendering crossing
+  // (the moment its LLM answer landed), rendering by group commits (a
+  // committed page is a drawn page). All three are the same
+  // [_ThroughputTracker] mechanism; what differs is only which producer
+  // calls `add`.
   // ---------------------------------------------------------------------
 
   final _sweepRate = _ThroughputTracker();
+  final _translateRate = _ThroughputTracker();
   final _pipelineRate = _ThroughputTracker();
 
   /// Rolling pages/min of the recognition sweep, or null when it has not run
@@ -394,13 +437,26 @@ class PreTranslationActivity {
   /// quiet instead of quoting the last known rate forever.
   DateTime? get lastOcrSampleAt => _sweepRate.lastSampleAt;
 
+  /// Rolling pages/min of answered translation requests (groups crossing
+  /// into rendering). Null until two crossings span a few seconds. The fold
+  /// additionally hides it while a sweep owns the card (stage-2 crossings
+  /// cannot happen mid-sweep anyway — chapters run strictly in sequence).
+  double? get translatePagesPerMinute => _translateRate.pagesPerMinute;
+
   /// Rolling pages/min of committed (fully translated + rendered) pages.
+  /// This is the *rendering* stream's rate: the commit is exactly when a
+  /// group's pages are drawn, cached and counted.
   double? get pagesPerMinute => _pipelineRate.pagesPerMinute;
 
   /// Called by the sweep once per OCR chunk (and per fetch failure). Cheap:
   /// one append plus an occasional window trim, on the producer side, so the
   /// UI's build path only reads a pre-computed double.
   void recordOcrPages(int pages, {DateTime? at}) => _sweepRate.add(pages, at: at);
+
+  /// Called once per group at its translating→rendering crossing, with the
+  /// page count the service was handed. Producer-side, like the others.
+  void recordTranslatedPages(int pages, {DateTime? at}) =>
+      _translateRate.add(pages, at: at);
 
   /// Called once per *committed* group — deliberately coarse: this number
   /// means "pages fully done", and crediting in-flight fractions would just
@@ -496,6 +552,7 @@ class PreTranslationProgress {
     required this.focusTranslating,
     required this.focusRendering,
     required this.recognitionRatePerMinute,
+    required this.translationRatePerMinute,
     required this.commitRatePerMinute,
     required this.batch,
     required this.msPerPage,
@@ -570,6 +627,7 @@ class PreTranslationProgress {
         !sweepActive && stage == TranslationStage.rendering;
 
     var recRate = activity?.sweepPagesPerMinute;
+    var translateRate = activity?.translatePagesPerMinute;
     var commitRate = activity?.pagesPerMinute;
     Duration? eta;
     if (activity != null && task.isRunning) {
@@ -607,13 +665,29 @@ class PreTranslationProgress {
       focusRecognizing: focusRecognizing,
       focusTranslating: focusTranslating,
       focusRendering: focusRendering,
+      // Each phase line gets *its own* stream's number; the three are never
+      // interchangeable. While the sweep owns the card a stage-2 crossing
+      // cannot be happening, and once it stopped, a stale recognition figure
+      // would quote the wrong stream — so each rate is nulled outside its
+      // phase, and the card prints `—`, never a borrowed number.
       recognitionRatePerMinute: sweepActive ? recRate : null,
+      translationRatePerMinute: sweepActive ? null : translateRate,
       commitRatePerMinute: commitRate,
       batch: freshBatch,
       msPerPage: freshBatch != null && freshBatch.pages > 0
           ? freshBatch.totalMs / freshBatch.pages
           : null,
-      elapsed: task.isRunning ? at.difference(task.createdAt) : null,
+      // Wall clock the card shows next to the ETA. For a finished job this
+      // is the *total* run time (createdAt→finishedAt, both persisted), so
+      // the history card can answer "how long did that take" without any
+      // summary; for a paused job (activity alive, not running) it keeps
+      // ticking to "now". null only when nothing can be said (no finish and
+      // no live activity) — printed as `—`.
+      elapsed: task.finishedAt != null
+          ? task.finishedAt!.difference(task.createdAt)
+          : (task.isRunning || activity != null)
+          ? at.difference(task.createdAt)
+          : null,
       eta: eta,
       epName: workerReport?.active.name ?? batchPerf?.epName,
       sessions: workerReport?.sessionCount ?? batchPerf?.sessionCount,
@@ -655,8 +729,14 @@ class PreTranslationProgress {
   /// translating job would read as the wrong stream's speed.
   final double? recognitionRatePerMinute;
 
-  /// Pages/min of fully settled (committed) pages; null until at least two
-  /// commits span a few seconds.
+  /// Pages/min of answered translation requests (the translating→rendering
+  /// crossings in the last window). Null before enough crossings and while a
+  /// sweep owns the card.
+  final double? translationRatePerMinute;
+
+  /// Pages/min of fully settled (committed = drawn + cached) pages — the
+  /// *rendering* line's rate; null until at least two commits span a few
+  /// seconds.
   final double? commitRatePerMinute;
 
   /// The freshest OCR batch's structured stats, or null when there is no
@@ -681,6 +761,195 @@ class PreTranslationProgress {
   final int? sessions;
   final double? arenaMb;
   final String? degradedLabel;
+}
+
+/// What a finished job's card still shows, frozen by [_run]'s finally out of
+/// the last [PreTranslationProgress] fold, before the live activity and the
+/// worker's fresh-batch window go away.
+///
+/// Everything here is a plain nullable scalar and rides
+/// [PreTranslationTask.toJson] — appdata implicit data, **not** a new
+/// database table. Absence of data stays absence: each null prints `—` on
+/// the card; nothing here may be back-filled with a 0 that would read as a
+/// measurement (the project's standing rule).
+class PreTranslationTaskSummary {
+  const PreTranslationTaskSummary({
+    this.recognized,
+    this.translated,
+    this.rendered,
+    this.recognitionRatePerMinute,
+    this.translationRatePerMinute,
+    this.renderRatePerMinute,
+    this.msPerPage,
+    this.epName,
+    this.sessions,
+    this.arenaMb,
+    this.degradedLabel,
+  });
+
+  /// Freezes one live fold. Only the fields the live fold derives from the
+  /// dying activity / worker window are kept; counts, elapsed and ETA are
+  /// recomputed from the (persisted) task itself at display time, so they
+  /// cannot go stale here.
+  ///
+  /// The rate parameters are taken **ungated** from [activity] when given:
+  /// the live fold hides each phase's rate outside its own phase (a stale
+  /// recognition figure beside a translating job quotes the wrong stream),
+  /// but that guard is a *live-display* rule — the final view is a museum
+  /// plaque, and its phase rows are labelled by phase, not "current speed".
+  /// So the summary keeps the last measured figure of all three streams
+  /// even when the card ended mid-another-phase (e.g. cancelled during a
+  /// sweep: the chapter-before's translation rate is still real data).
+  factory PreTranslationTaskSummary.capture(
+    PreTranslationProgress p, {
+    PreTranslationActivity? activity,
+  }) => PreTranslationTaskSummary(
+    recognized: p.recognized,
+    translated: p.translated,
+    rendered: p.rendered,
+    recognitionRatePerMinute:
+        activity?.sweepPagesPerMinute ?? p.recognitionRatePerMinute,
+    translationRatePerMinute:
+        activity?.translatePagesPerMinute ?? p.translationRatePerMinute,
+    renderRatePerMinute: p.commitRatePerMinute,
+    msPerPage: p.msPerPage,
+    epName: p.epName,
+    sessions: p.sessions,
+    arenaMb: p.arenaMb,
+    degradedLabel: p.degradedLabel,
+  );
+
+  /// Final per-phase page counts. The last fold could include in-flight
+  /// credit the commits never reached (a cancel mid-sweep really did
+  /// recognise those pages and stored their OCR rows), so these are shown in
+  /// preference to the committed counters when present.
+  final int? recognized;
+  final int? translated;
+  final int? rendered;
+
+  /// The three phase rates as of the last fold; null when that stream never
+  /// produced a measurable window (the card prints `—`).
+  final double? recognitionRatePerMinute;
+  final double? translationRatePerMinute;
+  final double? renderRatePerMinute;
+
+  /// Recognition ms/page from the freshest OCR batch at capture time.
+  final double? msPerPage;
+
+  /// Engine row as last observed (the worker may have torn down since; this
+  /// is what the card showed *while* it ran, kept honest by being marked
+  /// final).
+  final String? epName;
+  final int? sessions;
+  final double? arenaMb;
+  final String? degradedLabel;
+
+  /// Rebuilds the card's fold for a finished job. The card formats this
+  /// exactly like the live fold — same fields, same `—` rules — so the
+  /// display code has one path, not two.
+  PreTranslationProgress toProgress(PreTranslationTask task) {
+    // Committed counters are the persisted truth for processed/total; the
+    // captured phase counts (when present) may exceed them with legitimate
+    // end-of-run in-flight credit.
+    var processed = task.done + task.failed;
+    return PreTranslationProgress(
+      running: false,
+      processed: processed,
+      total: task.total,
+      recognized: recognized ?? processed,
+      translated: translated ?? processed,
+      rendered: rendered ?? processed,
+      sweepActive: false,
+      focusRecognizing: false,
+      focusTranslating: false,
+      focusRendering: false,
+      recognitionRatePerMinute: recognitionRatePerMinute,
+      translationRatePerMinute: translationRatePerMinute,
+      commitRatePerMinute: renderRatePerMinute,
+      // The worker's last batch belongs to whoever used the pool *last*, not
+      // necessarily to this finished job — deliberately not quoted here.
+      batch: null,
+      msPerPage: msPerPage,
+      elapsed: task.finishedAt?.difference(task.createdAt),
+      eta: null,
+      epName: epName,
+      sessions: sessions,
+      arenaMb: arenaMb,
+      degradedLabel: degradedLabel,
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+    'recognized': recognized,
+    'translated': translated,
+    'rendered': rendered,
+    'recognitionRatePerMinute': recognitionRatePerMinute,
+    'translationRatePerMinute': translationRatePerMinute,
+    'renderRatePerMinute': renderRatePerMinute,
+    'msPerPage': msPerPage,
+    'epName': epName,
+    'sessions': sessions,
+    'arenaMb': arenaMb,
+    'degradedLabel': degradedLabel,
+  }..removeWhere((_, v) => v == null);
+
+  factory PreTranslationTaskSummary.fromJson(Map<String, dynamic> json) {
+    return PreTranslationTaskSummary(
+      recognized: (json['recognized'] as num?)?.toInt(),
+      translated: (json['translated'] as num?)?.toInt(),
+      rendered: (json['rendered'] as num?)?.toInt(),
+      recognitionRatePerMinute: (json['recognitionRatePerMinute'] as num?)
+          ?.toDouble(),
+      translationRatePerMinute: (json['translationRatePerMinute'] as num?)
+          ?.toDouble(),
+      renderRatePerMinute: (json['renderRatePerMinute'] as num?)?.toDouble(),
+      msPerPage: (json['msPerPage'] as num?)?.toDouble(),
+      epName: json['epName']?.toString(),
+      sessions: (json['sessions'] as num?)?.toInt(),
+      arenaMb: (json['arenaMb'] as num?)?.toDouble(),
+      degradedLabel: json['degradedLabel']?.toString(),
+    );
+  }
+}
+
+/// The user-tunable refresh cadence of the pre-translation progress card.
+///
+/// Stored in [appdata]'s implicit data — the same per-device channel the
+/// pre-translation task records themselves persist through — because the
+/// typed `Settings` defaults table lives in appdata.dart (frozen scope for
+/// this feature) and this is a display preference, not a pipeline input. It
+/// is deliberately **not** part of the performance-preset value table: like
+/// "Pipeline mode", changing it must not flip the user's preset to custom.
+class PreTranslationRefresh {
+  /// Key inside appdata.implicitData.
+  static const settingKey = 'imageTranslationProgressRefreshMs';
+
+  /// What the card defaults to: half the old hard-coded rebuild floor was
+  /// 500 ms twice a second; one second is the middle of the honest range
+  /// (the rates are 120-second window figures anyway).
+  static const defaultMs = 1000;
+
+  /// 0.5–5 s. The floor is the previous hard-coded coalescing window: below
+  /// it the task-list rebuild cost rises per perceived tick with nothing new
+  /// to show (the sweep itself only reports per chunk, typically ≥ 1 s).
+  static const minMs = 500;
+  static const maxMs = 5000;
+
+  /// Pure, testable normalisation: anything unreadable or out of range
+  /// falls back to the default; in-range values clamp, never silently 0.
+  static int normalizeMs(Object? raw) {
+    if (raw is! num) return defaultMs;
+    var v = raw.round();
+    if (v < minMs || v > maxMs) return defaultMs;
+    return v;
+  }
+
+  /// Current interval, already normalised. A plain in-memory map read — no
+  /// IO, safe to call from build paths and from every activity event.
+  static int intervalMs(Object? stored) => normalizeMs(stored);
+
+  static Duration intervalFrom(Object? stored) =>
+      Duration(milliseconds: intervalMs(stored));
 }
 
 /// Manages background pre-translation jobs. Mirrors the structure of the
@@ -708,15 +977,36 @@ class PreTranslationTaskManager with ChangeNotifier {
   DateTime _lastActivityNotify = DateTime.fromMillisecondsSinceEpoch(0);
 
   /// Stage changes and sweep samples land per page across up to four
-  /// concurrent groups, and each one would rebuild the whole task list.
-  /// Coalesce to ≤2 rebuilds/second: the card's job is to prove the job is
-  /// alive and roughly how fast it is, and a 500 ms floor on those numbers
-  /// costs nothing a human can perceive, while per-page setState storms do
-  /// (the list rebuild is the expensive half, not the data read). The
-  /// trailing timer makes sure the final change is not swallowed.
+  /// concurrent groups, and each one would rebuild the whole task list, so
+  /// they are coalesced to at most one notify per refresh window.
+  ///
+  /// That window is the user-tunable card refresh interval
+  /// ([PreTranslationRefresh], default 1 s, floor 0.5 s = the previous
+  /// hard-coded 500 ms): one knob controls both "how fresh the card looks"
+  /// and "how often the list rebuilds", instead of the old two-constant
+  /// dance where a configurable tick could only ever land on top of the
+  /// fixed 500 ms floor and fight it. The trade-off, deliberately:
+  ///  * the expensive half of a notify is the list rebuild, not the data
+  ///    fold (PreTranslationProgress reads pre-computed numbers), so a
+  ///    smaller window costs frame work only — but on a long task list that
+  ///    work is every window, forever while a job runs; 0.5 s therefore
+  ///    stays the floor, and the 1 s default halves the notify load the old
+  ///    500 ms coalescing produced;
+  ///  * nothing is lost by waiting: every figure on the card is either a
+  ///    120-second window rate or a committed counter, none of which change
+  ///    meaningfully inside one interval;
+  ///  * the trailing timer still guarantees the *final* change is not
+  ///    swallowed — the last notify of a burst fires one window after the
+  ///    first, so a coalesced burst always lands.
+  ///
+  /// The interval is read as a plain in-memory map lookup (no IO) per
+  /// event, so a settings change takes effect on the next event without
+  /// any wiring.
   void _notifyActivity() {
     var now = DateTime.now();
-    const window = Duration(milliseconds: 500);
+    var window = PreTranslationRefresh.intervalFrom(
+      appdata.implicitData[PreTranslationRefresh.settingKey],
+    );
     if (now.difference(_lastActivityNotify) >= window) {
       _lastActivityNotify = now;
       _activityNotifyTimer?.cancel();
@@ -1056,8 +1346,28 @@ class PreTranslationTaskManager with ChangeNotifier {
       _ocrLeases.remove(task.id)?.release();
       // The coalescing timer is shared by every running job, so it is not this
       // job's to cancel; the notifyListeners below already flushes this one.
+      //
+      // Freeze the card's last live view *before* the activity dies: per-phase
+      // rates, in-flight-credited phase counts and the engine row only exist
+      // in the fold of (activity + worker window), and that fold goes stale
+      // the moment the pool is released below. Plain JSON on the task object;
+      // no new storage. (A job that never got an activity — started, died in
+      // `_resolvePageKeys` — still gets a counts-only summary, which is what
+      // the committed data can honestly say.)
+      task.finalSummary = PreTranslationTaskSummary.capture(
+        PreTranslationProgress.of(task, activity: _activities[task.id]),
+        activity: _activities[task.id],
+      );
       _activities.remove(task.id);
+      // cancel() already moved the task to history and saved it *before* this
+      // summary existed; saving the history again covers that path (a no-op
+      // extra write once per job end). For jobs that finish on their own,
+      // _moveToHistory performs the save with the summary in place.
+      final alreadyMoved = !currentTasks.contains(task);
       _moveToHistory(task);
+      if (alreadyMoved) {
+        _saveHistory();
+      }
       if (currentTasks.every((t) => !t.isRunning)) {
         BackgroundKeepAlive.instance.remove(
           BackgroundKeepAlive.tagPreTranslate,
@@ -1728,9 +2038,14 @@ class PreTranslationTaskManager with ChangeNotifier {
         ),
         shouldCancel: () => _canceledIds.contains(task.id),
         onStage: (stage, completed) {
-          activity.stage = stage;
+          // Same translation-stream sampling as the forward pass: the group
+          // crossing into rendering is its answer coming back.
+          var crossed = activity.noteStage(stage);
           // The service scores only the pages it was handed, on the same scale.
           activity.completedPages = settledBeforeBatch + completed;
+          if (crossed && pending.isNotEmpty) {
+            _activities[task.id]?.recordTranslatedPages(pending.length);
+          }
           _notifyActivity();
         },
       );
@@ -1846,10 +2161,18 @@ class PreTranslationTaskManager with ChangeNotifier {
           ),
           shouldCancel: () => _canceledIds.contains(task.id),
           onStage: (stage, completed) {
-            activity.stage = stage;
+            // The translating→rendering crossing is the moment this group's
+            // batch response landed (see PreTranslationGroupActivity
+            // .noteStage): credit the translation stream with exactly the
+            // pages the service was handed, once per group. Same all-or-
+            // nothing-per-request semantics as translatedThrough's count.
+            var crossed = activity.noteStage(stage);
             // The service scores only the pages it was handed, on the same
             // page-unit scale, so the two halves simply add up.
             activity.completedPages = preSettled + completed;
+            if (crossed && pending.isNotEmpty) {
+              _activities[task.id]?.recordTranslatedPages(pending.length);
+            }
             _notifyActivity();
           },
         );

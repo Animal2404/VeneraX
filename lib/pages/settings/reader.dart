@@ -1108,7 +1108,15 @@ class _ReaderSettingsState extends State<ReaderSettings> {
               Builder(
                 builder: (context) {
                   var report = TranslationWorker.instance.lastReport;
-                  var advice = TranslationPerformanceConfig.adviseForDevice(
+                  // One device class for the whole row: `advise` answers for
+                  // App.isDesktop, and `isActionable` and the apply path have to
+                  // be judged against that same class. Reading the ambient
+                  // platform a second time would compare the advice's desktop
+                  // table against a phone's and offer a change that is no
+                  // change.
+                  var isDesktop = App.isDesktop;
+                  var advice = TranslationPerformanceConfig.advise(
+                    isDesktop: isDesktop,
                     ep: report?.active,
                     batchCapable: report?.batchCapable ?? false,
                   );
@@ -1215,6 +1223,75 @@ class _ReaderSettingsState extends State<ReaderSettings> {
                 setState(() {});
                 widget.onChanged?.call(
                   TranslationPerformanceConfig.pipelineModeSettingKey,
+                );
+              },
+            ),
+            // Refresh cadence of the pre-translation progress card. This is
+            // a display-only knob, deliberately stored in appdata's implicit
+            // data (the per-device channel the pre-translation task records
+            // themselves persist through) rather than the typed Settings
+            // defaults table. Like "Pipeline mode" above, it is NOT part of
+            // the performance-preset value table, so changing it must not
+            // flip the user's preset to custom — hence no
+            // _markTranslationCustom here.
+            //
+            // The interval doubles as the coalescing window of
+            // PreTranslationTaskManager._notifyActivity: one knob controls
+            // both "how fresh the card looks" and "how often the task list
+            // rebuilds", so no second timer can fight the 500 ms trailing
+            // merge (the trade-off — rebuild cost per tick vs perceived
+            // liveness — is written out at that method). 0.5 s floor = the
+            // old hard-coded window; default 1 s halves its notify load.
+            // The Slider value/trailing text are pure in-memory map reads —
+            // no parsing, no IO, in this build path.
+            Builder(
+              builder: (context) {
+                // One in-memory map read per build, shared by the slider
+                // position and the trailing label: display always speaks
+                // the stored value, so the two can never disagree. Pure
+                // map lookup + clamp — no parsing, no IO, in build.
+                final refreshMs = PreTranslationRefresh.intervalMs(
+                  appdata.implicitData[PreTranslationRefresh.settingKey],
+                );
+                final refreshSeconds = (refreshMs / 1000.0).toStringAsFixed(1);
+                return ListTile(
+                  leading: const Icon(Icons.speed),
+                  title: Text("Progress refresh interval".tl),
+                  subtitle: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        "How often the pre-translation progress card re-reads its per-phase rates. Lower refreshes faster but rebuilds the task list more often; higher is cheaper and slightly staler."
+                            .tl,
+                        style: ts.s12,
+                      ),
+                      Slider(
+                        min: 0.5,
+                        max: 5.0,
+                        divisions: 9,
+                        value: refreshMs / 1000.0,
+                        label: "@seconds s".tlParams({
+                          'seconds': refreshSeconds,
+                        }),
+                        onChanged: (v) {
+                          // Snap to the 0.5 s grid before storing (the same
+                          // defence _SliderSetting takes against slider float
+                          // drift); the stored value is integer milliseconds.
+                          final steps = ((v - 0.5) / 0.5).round();
+                          final seconds = (0.5 + steps * 0.5).clamp(0.5, 5.0);
+                          appdata
+                              .implicitData[PreTranslationRefresh.settingKey] =
+                              (seconds * 1000).round();
+                          appdata.writeImplicitData();
+                          setState(() {});
+                        },
+                      ),
+                    ],
+                  ),
+                  trailing: Text(
+                    "@seconds s".tlParams({'seconds': refreshSeconds}),
+                    style: ts.s12,
+                  ),
                 );
               },
             ),
