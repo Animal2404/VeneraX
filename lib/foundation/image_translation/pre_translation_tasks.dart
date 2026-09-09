@@ -594,6 +594,13 @@ class _ThroughputTracker {
       stablePagesPerMinute: stable,
       measuredPagesPerMinute: measured,
       msPerPage: _msPerPage,
+      // Wall-clock seconds per page at the rate printed beside it — the exact
+      // reciprocal, so the two figures can never contradict each other. Null
+      // while the shown rate is the measured warm-up one: there the reciprocal
+      // *is* [msPerPage], and printing one number twice under two names is
+      // noise, not evidence.
+      throughputSecondsPerPage:
+          stable != null && stable > 0 ? 60000 / stable : null,
       // The count has to back the number it is printed next to: a wall-clock
       // window is made of every sample in it, a measured warm-up rate only of
       // the samples that carried a duration. Claiming "3 samples" behind a
@@ -712,6 +719,7 @@ class PhaseRates {
     required this.stablePagesPerMinute,
     required this.measuredPagesPerMinute,
     required this.msPerPage,
+    required this.throughputSecondsPerPage,
     required this.samples,
   });
 
@@ -721,6 +729,7 @@ class PhaseRates {
     stablePagesPerMinute: null,
     measuredPagesPerMinute: null,
     msPerPage: null,
+    throughputSecondsPerPage: null,
     samples: 0,
   );
 
@@ -728,9 +737,27 @@ class PhaseRates {
   final double? stablePagesPerMinute;
   final double? measuredPagesPerMinute;
 
-  /// Mean milliseconds one page of this phase cost, over the measured samples
-  /// in the window. Null when no sample in the window carried a duration.
+  /// Mean milliseconds this phase's own measured work spent per page — the
+  /// **service time of one group / batch / request**, not the job's pace.
+  ///
+  /// Translation and rendering report Σ workMs over Σ pages of the groups in
+  /// the window ([GroupPerf.llmMs]/[GroupPerf.llmPages] and
+  /// [GroupPerf.renderMs]/[GroupPerf.renderPages]); recognition reports the
+  /// engine's own batch time per page. With N groups in flight at once those
+  /// durations overlap, so this figure is ≈ N × the per-page wall clock — the
+  /// real-device card showed `16.8 页/分钟` (= 3.57 s/page) next to
+  /// `平均每页 15727 毫秒` on a four-group run, two numbers that read as a
+  /// contradiction because one of them was labelled "average per page".
+  /// It stays exactly this measurement (the tests pin it); the card now prints
+  /// it under a name that says what it measures, beside the throughput figure
+  /// below. Null when no sample in the window carried a duration.
   final double? msPerPage;
+
+  /// Wall-clock seconds per page at the *shown* rate — the reciprocal of
+  /// [pagesPerMinute], pre-computed so the row's two per-page figures are
+  /// consistent by construction rather than by coincidence. Null when the
+  /// shown rate is the measured warm-up one (see [_ThroughputTracker.view]).
+  final double? throughputSecondsPerPage;
 
   /// Samples in the window — the confidence figure shown beside the rate.
   final int samples;
@@ -776,6 +803,9 @@ class PreTranslationProgress {
     required this.recognitionSamples,
     required this.translationSamples,
     required this.commitSamples,
+    required this.recognitionSecondsPerPage,
+    required this.translationSecondsPerPage,
+    required this.commitSecondsPerPage,
     required this.translationMsPerPage,
     required this.renderMsPerPage,
     required this.batch,
@@ -907,11 +937,16 @@ class PreTranslationProgress {
       // is shown, and shown *as* a first sample).
       recognitionRatePerMinute: sweepActive ? rec.pagesPerMinute : null,
       recognitionSamples: sweepActive ? rec.sampleCount : null,
+      recognitionSecondsPerPage:
+          sweepActive ? rec.throughputSecondsPerPage : null,
       translationRatePerMinute: sweepActive ? null : trans.pagesPerMinute,
       translationSamples: sweepActive ? null : trans.sampleCount,
+      translationSecondsPerPage:
+          sweepActive ? null : trans.throughputSecondsPerPage,
       translationMsPerPage: sweepActive ? null : trans.msPerPage,
       commitRatePerMinute: commit.pagesPerMinute,
       commitSamples: commit.sampleCount,
+      commitSecondsPerPage: commit.throughputSecondsPerPage,
       renderMsPerPage: render.msPerPage,
       batch: freshBatch,
       // Recognition's ms/page stays the worker's own per-page measurement
@@ -995,6 +1030,16 @@ class PreTranslationProgress {
   final int? translationSamples;
   final int? commitSamples;
 
+  /// Wall-clock seconds per page at the rate shown on the same row — the
+  /// reciprocal of the row's `…RatePerMinute`, pre-computed in
+  /// [PhaseRates.throughputSecondsPerPage] so the card never divides while
+  /// building. Null while that row's rate is a measured warm-up figure (the
+  /// reciprocal would just repeat the row's service-time number) or when the
+  /// row has no rate at all.
+  final double? recognitionSecondsPerPage;
+  final double? translationSecondsPerPage;
+  final double? commitSecondsPerPage;
+
   /// Mean milliseconds this phase's measured work spent per page it carried,
   /// for the two stage-2 rows (plan 12-B). Translation comes from the shared
   /// request's own wall time ([GroupPerf.llmMs] over [GroupPerf.llmPages]);
@@ -1002,6 +1047,11 @@ class PreTranslationProgress {
   /// [GroupPerf.renderPages]). Both are structured values the service reported
   /// at its timing sites — nothing here is read back out of a log line, which
   /// is the coupling Phase 2's detMs accident ruled out. Null prints `—`.
+  ///
+  /// This is **service time inside one group/request**, not the job's pace:
+  /// concurrent groups overlap, so it is ≈ concurrency × the per-page wall
+  /// clock. The card labels it accordingly and prints the throughput figure
+  /// beside it, so the pair can no longer read as a contradiction.
   final double? translationMsPerPage;
   final double? renderMsPerPage;
 
@@ -1049,6 +1099,9 @@ class PreTranslationTaskSummary {
     this.recognitionSamples,
     this.translationSamples,
     this.renderSamples,
+    this.recognitionSecondsPerPage,
+    this.translationSecondsPerPage,
+    this.commitSecondsPerPage,
     this.translationMsPerPage,
     this.renderMsPerPage,
     this.msPerPage,
@@ -1095,6 +1148,14 @@ class PreTranslationTaskSummary {
       recognitionSamples: rec?.sampleCount ?? p.recognitionSamples,
       translationSamples: trans?.sampleCount ?? p.translationSamples,
       renderSamples: commit?.sampleCount ?? p.commitSamples,
+      // The throughput figure rides with the rate it is the reciprocal of, and
+      // is already null when that rate was a measured warm-up one.
+      recognitionSecondsPerPage:
+          rec?.throughputSecondsPerPage ?? p.recognitionSecondsPerPage,
+      translationSecondsPerPage:
+          trans?.throughputSecondsPerPage ?? p.translationSecondsPerPage,
+      commitSecondsPerPage:
+          commit?.throughputSecondsPerPage ?? p.commitSecondsPerPage,
       translationMsPerPage: trans?.msPerPage ?? p.translationMsPerPage,
       renderMsPerPage:
           activity?.renderWorkRates.msPerPage ?? p.renderMsPerPage,
@@ -1126,6 +1187,13 @@ class PreTranslationTaskSummary {
   final int? recognitionSamples;
   final int? translationSamples;
   final int? renderSamples;
+
+  /// Wall-clock seconds per page at each frozen rate, kept so a finished card
+  /// prints the same consistent pair the live card printed (throughput beside
+  /// service time) instead of dropping one half of it.
+  final double? recognitionSecondsPerPage;
+  final double? translationSecondsPerPage;
+  final double? commitSecondsPerPage;
 
   /// Per-phase `ms/页` of the two stage-2 phases, from the service's structured
   /// [GroupPerf] (plan 12-B) — the last measured values the live card printed.
@@ -1168,6 +1236,9 @@ class PreTranslationTaskSummary {
       recognitionSamples: recognitionSamples,
       translationSamples: translationSamples,
       commitSamples: renderSamples,
+      recognitionSecondsPerPage: recognitionSecondsPerPage,
+      translationSecondsPerPage: translationSecondsPerPage,
+      commitSecondsPerPage: commitSecondsPerPage,
       translationMsPerPage: translationMsPerPage,
       renderMsPerPage: renderMsPerPage,
       // The worker's last batch belongs to whoever used the pool *last*, not
@@ -1193,6 +1264,9 @@ class PreTranslationTaskSummary {
     'recognitionSamples': recognitionSamples,
     'translationSamples': translationSamples,
     'renderSamples': renderSamples,
+    'recognitionSecondsPerPage': recognitionSecondsPerPage,
+    'translationSecondsPerPage': translationSecondsPerPage,
+    'commitSecondsPerPage': commitSecondsPerPage,
     'translationMsPerPage': translationMsPerPage,
     'renderMsPerPage': renderMsPerPage,
     'msPerPage': msPerPage,
@@ -1215,6 +1289,12 @@ class PreTranslationTaskSummary {
       recognitionSamples: (json['recognitionSamples'] as num?)?.toInt(),
       translationSamples: (json['translationSamples'] as num?)?.toInt(),
       renderSamples: (json['renderSamples'] as num?)?.toInt(),
+      recognitionSecondsPerPage:
+          (json['recognitionSecondsPerPage'] as num?)?.toDouble(),
+      translationSecondsPerPage:
+          (json['translationSecondsPerPage'] as num?)?.toDouble(),
+      commitSecondsPerPage:
+          (json['commitSecondsPerPage'] as num?)?.toDouble(),
       translationMsPerPage: (json['translationMsPerPage'] as num?)?.toDouble(),
       renderMsPerPage: (json['renderMsPerPage'] as num?)?.toDouble(),
       msPerPage: (json['msPerPage'] as num?)?.toDouble(),

@@ -776,10 +776,23 @@ class _TasksPageState extends State<TasksPage>
   /// recognition, the service's structured GroupPerf value object for the two
   /// stage-2 phases).
   ///
+  /// The row's two per-page figures are labelled by the quantity they measure,
+  /// so they can no longer read as a contradiction:
+  ///
+  ///  * `@s s/page throughput` is the row's wall-clock pace — the reciprocal of
+  ///    the pages/min printed beside it, pre-computed in the data layer, so the
+  ///    pair is consistent by construction;
+  ///  * `@ms ms/page in group` is that phase's **service time per page**: the
+  ///    mean time one group / OCR batch / request spent on a page it carried.
+  ///    Concurrent groups overlap, so it is ≈ concurrency × the wall-clock page
+  ///    time. A four-group run really did show `16.8 页/分钟` (= 3.6 s/page)
+  ///    next to `平均每页 15727 毫秒`, and both numbers were right about
+  ///    different things — only the label was wrong.
+  ///
   /// Nothing here parses, reads a clock or computes: every value is pre-derived
-  /// in [PreTranslationProgress], and an unmeasured one prints `—` — a 0 would
-  /// claim the phase is doing nothing, which was never measured (project rule:
-  /// unreadable is N/A, never a fake 0).
+  /// in [PreTranslationProgress] (including the throughput reciprocal), and an
+  /// unmeasured one prints `—` — a 0 would claim the phase is doing nothing,
+  /// which was never measured (project rule: unreadable is N/A, never a fake 0).
   Widget _phaseLine({
     required String labelKey,
     required int done,
@@ -788,6 +801,7 @@ class _TasksPageState extends State<TasksPage>
     required double? ratePagesPerMinute,
     int? samples,
     double? msPerPage,
+    double? secondsPerPage,
   }) {
     final style = active
         ? ts.s14.copyWith(
@@ -808,8 +822,12 @@ class _TasksPageState extends State<TasksPage>
         "@rate pages/min".tlParams({
           'rate': ratePagesPerMinute.toStringAsFixed(1),
         }),
+      if (secondsPerPage != null && secondsPerPage > 0)
+        "@s s/page throughput".tlParams({
+          's': formatSecondsPerPage(secondsPerPage),
+        }),
       if (msPerPage != null && msPerPage > 0)
-        "@ms ms/page".tlParams({'ms': msPerPage.round().toString()}),
+        "@ms ms/page in group".tlParams({'ms': msPerPage.round().toString()}),
     ];
     return Row(
       children: [
@@ -975,6 +993,7 @@ class _TasksPageState extends State<TasksPage>
                   active: progressView.focusRecognizing,
                   ratePagesPerMinute: progressView.recognitionRatePerMinute,
                   samples: progressView.recognitionSamples,
+                  secondsPerPage: progressView.recognitionSecondsPerPage,
                   // Recognition is the one phase the worker measures per page.
                   msPerPage: progressView.msPerPage,
                 ),
@@ -986,8 +1005,10 @@ class _TasksPageState extends State<TasksPage>
                   active: progressView.focusTranslating,
                   ratePagesPerMinute: progressView.translationRatePerMinute,
                   samples: progressView.translationSamples,
+                  secondsPerPage: progressView.translationSecondsPerPage,
                   // From the shared request's own measured wall time, reported
-                  // as a structured GroupPerf by the service (plan 12-B).
+                  // as a structured GroupPerf by the service (plan 12-B) — the
+                  // service time inside one request, not the job's pace.
                   msPerPage: progressView.translationMsPerPage,
                 ),
                 const SizedBox(height: 2),
@@ -998,6 +1019,7 @@ class _TasksPageState extends State<TasksPage>
                   active: progressView.focusRendering,
                   ratePagesPerMinute: progressView.commitRatePerMinute,
                   samples: progressView.commitSamples,
+                  secondsPerPage: progressView.commitSecondsPerPage,
                   msPerPage: progressView.renderMsPerPage,
                 ),
                 // Without this note a live "Recognized 8/82" beside a static
@@ -2381,3 +2403,13 @@ String formatTaskDuration(Duration? d) {
   if (h <= 0) return '$m:${s.toString().padLeft(2, '0')}';
   return '$h:${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}';
 }
+
+/// One decimal for a per-page figure of a second or more, two below that: the
+/// throughput number is a *rounded reciprocal* of the rate printed beside it,
+/// so `0.3` where the rate says 240 页/分钟 would be a visible disagreement.
+///
+/// Top-level and public for the same reason [formatTaskDuration] is: the
+/// consistency acceptance asserts the rendered string through the function the
+/// card calls, not a copy of it.
+String formatSecondsPerPage(double seconds) =>
+    seconds >= 1 ? seconds.toStringAsFixed(1) : seconds.toStringAsFixed(2);

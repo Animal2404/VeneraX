@@ -2131,6 +2131,33 @@ void _drawErasedRegion(
 /// box goes to the light branch on purpose — dark lettering ringed in white
 /// reads on a black bubble too, while white lettering ringed in black destroys
 /// a bright page. Where the mean and the majority agree, nothing changes.
+///
+/// Phase 13-F13.3's sibling, in this file. The majority test above was still a
+/// test of *dark-pixel coverage* — and a screentone is made of dark pixels. Its
+/// dots are near-black at every dot coverage a page actually prints, so a
+/// light-grey toned bubble counted as a dark background, took the dark branch,
+/// and picked up the black pen. The erasure ledger on the reported page reads
+/// `erased=32 skipped=0 rolled_back=0`: the eraser never rolled a window back,
+/// so the black mass is not ink it left behind — it is this line choosing a
+/// black halo on a toned background. The question is therefore asked of the
+/// background's **low-frequency** content instead: [_blurredLum] averages a
+/// 5×5 window, and a box position is *solid dark* only when that average is
+/// under [kSolidBackgroundLum]. A screentone of any coverage averages to the
+/// grey the page reads as (a 50% tone lands near 127, a heavy 70% one near 84)
+/// and never clears it; solid ink averages to itself (0–20) and always does.
+/// The level is the same judgement `inpaint.dart`'s `kRingDarkLumMean` records
+/// for the eraser's own guard, derived here independently — this file imports
+/// none of that file's private symbols and does not modify it.
+///
+/// Sampling still happens on the **erased** base ([decoded]) on the same stride
+/// grid as before. A box whose grown box catches *un-erased source ink* is
+/// answered honestly by the same measurement: leftover lettering is thin (1–3
+/// px strokes), and a 5×5 average over thin strokes stays bright, so it cannot
+/// vote the box dark. Only a *solid* leftover mass covering more than half the
+/// box can, and a block whose source lettering is still on the page is an
+/// eraser defect the ledger names (`skipped`/`rolled_back`) before it is ever a
+/// halo-colour question — the halo cannot make that page worse than the
+/// original ink already on it.
 bool backgroundReadsDark(RgbaImage image, ui.Rect rect) {
   final w = image.width;
   final left = rect.left.round().clamp(0, math.max(0, w - 1)).toInt();
@@ -2146,34 +2173,77 @@ bool backgroundReadsDark(RgbaImage image, ui.Rect rect) {
     return false;
   }
 
-  var sum = 0.0, bright = 0, dark = 0, count = 0;
+  var solid = 0, count = 0;
   var stepX = math.max(1, (right - left) ~/ 24);
   var stepY = math.max(1, (bottom - top) ~/ 24);
   for (var y = top; y < bottom; y += stepY) {
     for (var x = left; x < right; x += stepX) {
-      var i = (y * w + x) * 4;
-      var lum = 0.299 * pixels[i] + 0.587 * pixels[i + 1] + 0.114 * pixels[i + 2];
-      sum += lum;
-      if (lum >= kBrightPixelLum) {
-        bright++;
-      } else if (lum <= kDarkPixelLum) {
-        dark++;
-      }
       count++;
+      // Solid dark, not dark coverage: the window average is what the eye
+      // reads as the background here, and a dot lattice does not survive it.
+      if (_blurredLum(pixels, w, image.height, x, y) < kSolidBackgroundLum) {
+        solid++;
+      }
     }
   }
   if (count == 0) return false;
-  return dark > bright && sum / count < 128;
+  // A strict majority has to be solid dark. An exact 50/50 box is mixed and
+  // takes the light branch on purpose: dark lettering ringed in white reads
+  // over black art, a black halo over bright art is the reported block.
+  return solid / count > kSolidBackgroundShare;
 }
 
-/// The two poles of the majority test. Anything between them is mid-tone
-/// artwork that argues for neither branch, which is why it is counted by
-/// exclusion rather than as a third class.
-const double kBrightPixelLum = 140;
-const double kDarkPixelLum = 90;
+/// Mean luminance of the 5×5 window centred on (x, y), clamped to the image —
+/// the low-frequency content of the background at that point, which is what a
+/// reader calls "the background here is black" or "the background here is
+/// grey". The clamp means an edge position averages only pixels that exist:
+/// "cannot read" must never become "dark".
+double _blurredLum(Uint8List pixels, int w, int h, int x, int y) {
+  var sum = 0.0;
+  var n = 0;
+  for (var dy = -kSolidBackgroundProbe; dy <= kSolidBackgroundProbe; dy++) {
+    var py = y + dy;
+    if (py < 0 || py >= h) continue;
+    for (var dx = -kSolidBackgroundProbe; dx <= kSolidBackgroundProbe; dx++) {
+      var px = x + dx;
+      if (px < 0 || px >= w) continue;
+      var i = (py * w + px) * 4;
+      sum += 0.299 * pixels[i] + 0.587 * pixels[i + 1] + 0.114 * pixels[i + 2];
+      n++;
+    }
+  }
+  // n is never 0 — (x, y) itself is inside the image — but the guard keeps the
+  // "no evidence" answer on the light branch even if that ever changed.
+  return n == 0 ? 255 : sum / n;
+}
 
-/// Mean-luminance test of the region on the (erased) base, choosing the text
-/// colour. Sampled on a stride grid — a full read is needless for a summary.
+/// Radius, in pixels, of the box filter [_blurredLum] averages.
+///
+/// Two pixels is the same probe `inpaint.dart`'s `_solidDarkShare` uses to
+/// separate a *mass* of ink from a *pattern* of dots: a screentone dot is a
+/// pixel or two across, so its own window is mostly paper, while any pixel
+/// inside solid ink is still inside it two pixels in any direction.
+const int kSolidBackgroundProbe = 2;
+
+/// Blurred luminance under which a box position counts as solid dark.
+///
+/// Deliberately nowhere near a halftone's operating range: a 50%-coverage tone
+/// on paper averages ~127, a heavy 70% one still sits over 80, and a real black
+/// fill is 0–20. A dark-grey bubble (60–80) therefore takes the light branch —
+/// dark lettering ringed in white reads there, while a black halo is what fuses
+/// neighbouring glyphs on a toned page. The number is the level `inpaint.dart`'s
+/// `kRingDarkLumMean` records for "the page reads this as shadow", re-derived
+/// here so the renderer and the eraser answer the same question the same way
+/// without sharing a symbol.
+const double kSolidBackgroundLum = 60;
+
+/// Share of the sampled box that must be solid dark before the black pen is
+/// allowed out. A strict majority; ties go to the light branch.
+const double kSolidBackgroundShare = 0.5;
+
+/// Solid-dark test of the region on the (erased) base, choosing the text
+/// colour. Sampled on a stride grid — a full read is needless for a summary,
+/// and the 5×5 window at each sample is the only neighbourhood it needs.
 bool _regionIsDark(RgbaImage image, ui.Rect rect) =>
     backgroundReadsDark(image, rect);
 
