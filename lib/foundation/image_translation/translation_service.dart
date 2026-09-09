@@ -633,6 +633,23 @@ class ImageTranslationService with ChangeNotifier {
   }) async {
     var success = List.filled(pages.length, false);
     if (pages.isEmpty) return success;
+    // Stage-2 split timing (per group). The OCR worker's perf log already
+    // splits a batch internally (`parts={detMs,recGpuMs,decMsInRec,restMs}`),
+    // but until now nothing made a group's wall time separable into
+    // "waiting on the LLM endpoint" vs "drawing the page" — the two halves
+    // of stage 2 are billed to completely different resources (network vs
+    // CPU raster) and only a split number says which one to attack. The
+    // line below is additive by construction: ocr_ms + llm_ms + render_ms
+    // ≤ total_ms, with the slack being cache lookups and bookkeeping.
+    final groupSw = Stopwatch()..start();
+    final ocrRunSw = Stopwatch();
+    final llmSw = Stopwatch();
+    final renderSw = Stopwatch();
+    var bytesIn = 0;
+    for (var p in pages) {
+      bytesIn += p.imageBytes.length;
+    }
+    var bytesOut = 0;
     TranslationStore().recordExistingChapter(chapter);
     var pipeline = _pipeline ??= PageTranslationPipeline();
     var sourceLang = _effectiveSourceFor(comicKey, config);
@@ -720,6 +737,7 @@ class ImageTranslationService with ChangeNotifier {
     }
 
     if (ocrNeededIndices.isNotEmpty) {
+      ocrRunSw.start();
       final chunkSize = math.max<int>(1, perf.pagesPerOcrCall);
       final chunks = <List<int>>[];
       for (var i = 0; i < ocrNeededIndices.length; i += chunkSize) {
@@ -770,6 +788,7 @@ class ImageTranslationService with ChangeNotifier {
           ocrGate.release('ocr');
         }
       }));
+      ocrRunSw.stop();
     }
 
     // Stage 2 — one request for the whole group's pending bubbles. Language
@@ -795,6 +814,7 @@ class ImageTranslationService with ChangeNotifier {
     if (texts.isNotEmpty) {
       if (shouldCancel?.call() ?? false) throw const PipelineCanceled();
       onStage?.call(TranslationStage.translating, completedPages());
+      llmSw.start();
       try {
         var result = await LlmTranslator.translateBatch(
           texts,
@@ -807,6 +827,7 @@ class ImageTranslationService with ChangeNotifier {
         Log.warning('Image Translation', 'Batch translate failed: $e\n$s');
         batchOk = false;
       }
+      llmSw.stop();
     }
 
     for (var i = 0; i < pages.length; i++) {
@@ -829,6 +850,7 @@ class ImageTranslationService with ChangeNotifier {
     }
 
     // Stage 3 — render + cache each resolved page with bounded concurrency.
+    renderSw.start();
     final renderGate =
         ConcurrencyGate((_) => math.max(1, perf.imageConcurrency));
     final renderFutures = <Future<void>>[];
@@ -865,6 +887,7 @@ class ImageTranslationService with ChangeNotifier {
             rendered,
             _imageCacheDuration,
           );
+          bytesOut += rendered.length;
           _completed.add(renderKey);
           success[i] = true;
         } catch (e, s) {
@@ -878,6 +901,17 @@ class ImageTranslationService with ChangeNotifier {
     }
 
     await Future.wait(renderFutures);
+    renderSw.stop();
+    groupSw.stop();
+    Log.info(
+      'Image Translation',
+      'GroupPerf pages=${pages.length} in_kb=${(bytesIn / 1024).round()} '
+      'ocr_cached=$reusedOcr ocr_run=${ocrNeededIndices.length} '
+      'parts={resolveMs:${groupSw.elapsedMilliseconds - ocrRunSw.elapsedMilliseconds - llmSw.elapsedMilliseconds - renderSw.elapsedMilliseconds},ocrMs:${ocrRunSw.elapsedMilliseconds},llmMs:${llmSw.elapsedMilliseconds},renderMs:${renderSw.elapsedMilliseconds}} '
+      'llm_ms=${llmSw.elapsedMilliseconds} render_ms=${renderSw.elapsedMilliseconds} '
+      'render_pages=${renderFutures.length} out_kb=${(bytesOut / 1024).round()} '
+      'total_ms=${groupSw.elapsedMilliseconds}',
+    );
     onStage?.call(TranslationStage.rendering, completedPages());
     return success;
   }
