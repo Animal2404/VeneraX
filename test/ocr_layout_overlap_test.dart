@@ -163,40 +163,10 @@ void main() {
       expect(out[0].box.left, 100, reason: 'its own edge is not moved');
     });
 
-    test('3. two boxes whose floors collide share the band', () {
-      // Both detected boxes *themselves* overlap (this is the pair the merge
-      // gate declined), so there is no growth to take back and neither box
-      // moves: the band between them is cut down the middle.
-      final regions = [
-        _region(IntRect(100, 100, 300, 180), '左边的气泡里有六个汉字'),
-        _region(IntRect(270, 100, 470, 180), '右边气泡里也是六个汉字'),
-      ];
-      final out = resolvePlacementOverlaps(
-        placements: [
-          paint(0, const ui.Rect.fromLTRB(100, 100, 300, 180)),
-          paint(1, const ui.Rect.fromLTRB(270, 100, 470, 180)),
-        ],
-        regions: regions,
-        page: _page,
-      );
-      _expectNoDoubleCoverage(out);
-      expect(out[0].box.left, 100, reason: 'nothing was pushed off anything');
-      expect(out[1].box.right, 470);
-      expect(out[0].box.right, out[1].box.left, reason: 'tangent, not apart');
-      // A block whose reduced box can no longer hold its text is *not drawn*
-      // (S1's keepOriginal) rather than squeezed or clipped.
-      for (final p in out) {
-        if (p.decision == OverflowDecision.keepOriginal) {
-          expect(p.paints, isFalse);
-          expect(p.size, 0);
-        }
-      }
-    });
-
-    test('2. a step aside is only taken inside the block’s own envelope', () {
-      // One block is pinned between the page edge and a neighbour it cannot
-      // overlap: pushing it has nowhere legal to go, so the pass must fall
-      // back to sharing the band instead of sliding text off the artwork.
+    test('2. with free gutter on its far side, a block steps aside', () {
+      // Neither box borrowed anything, so there is nothing to give back; the
+      // trailing block has the whole page to its right, so the second move is
+      // available and it is the one that keeps both texts at full width.
       final regions = [
         _region(IntRect(0, 100, 120, 180), '贴边的一块文字内容'),
         _region(IntRect(90, 100, 210, 180), '压在它上面的一块'),
@@ -210,11 +180,52 @@ void main() {
         page: _page,
       );
       _expectNoDoubleCoverage(out);
+      // The leading block is never the one moved: reading order stays in order.
+      expect(out[0].box, const ui.Rect.fromLTRB(0, 100, 120, 180));
+      expect(
+        out[1].box.left,
+        greaterThan(90),
+        reason: 'the trailing box slid forward instead of being cut',
+      );
+      expect(out[1].box.width, 120, reason: 'a move costs no width');
       for (final p in out.where((p) => p.paints)) {
         expect(p.box.left, greaterThanOrEqualTo(0));
         expect(p.box.top, greaterThanOrEqualTo(0));
         expect(p.box.right, lessThanOrEqualTo(_page.width));
         expect(p.box.bottom, lessThanOrEqualTo(_page.height));
+      }
+    });
+
+    test('3. with nowhere to step, two colliding floors share the band', () {
+      // The trailing box is pinned against the right edge of the page, so its
+      // own envelope offers no room to slide: the pass must fall back to
+      // splitting the band — both boxes shrink, neither moves, nothing leaves
+      // the artwork.
+      const page = ui.Size(500, 600);
+      final regions = [
+        _region(IntRect(100, 100, 300, 180), '左边的气泡里有六个汉字'),
+        _region(IntRect(270, 100, 500, 180), '右边气泡里也是六个汉字'),
+      ];
+      final out = resolvePlacementOverlaps(
+        placements: [
+          paint(0, const ui.Rect.fromLTRB(100, 100, 300, 180)),
+          paint(1, const ui.Rect.fromLTRB(270, 100, 500, 180)),
+        ],
+        regions: regions,
+        page: page,
+      );
+      _expectNoDoubleCoverage(out);
+      expect(out[0].box.left, 100, reason: 'nothing was pushed off anything');
+      expect(out[1].box.right, 500, reason: 'the pinned edge stayed put');
+      expect(out[0].box.right, out[1].box.left, reason: 'tangent, not apart');
+      expect(out[0].box.right, 285, reason: 'the band is split down the middle');
+      // A block whose reduced box can no longer hold its text is *not drawn*
+      // (S1's keepOriginal) rather than squeezed or clipped.
+      for (final p in out) {
+        if (p.decision == OverflowDecision.keepOriginal) {
+          expect(p.paints, isFalse);
+          expect(p.size, 0);
+        }
       }
     });
 

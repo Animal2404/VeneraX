@@ -941,6 +941,13 @@ List<Placement> resolvePlacementOverlaps({
           boxes: boxes,
           paints: paints,
           skip: trailing,
+          // The neighbour is the thing being stepped away from: counting it as
+          // an obstacle would zero the very slack the move needs (its edge is
+          // inside this box by definition, so the gap is negative and
+          // [safeGrowRect] hands back no room on that side). Every *third*
+          // block stays an obstacle, and the landing spot is still checked
+          // against the neighbour below.
+          ignore: leading,
         )) {
       boxes[trailing] = boxes[trailing].translate(
         alongX ? need : 0,
@@ -1022,6 +1029,13 @@ List<Placement> resolvePlacementOverlaps({
 /// clipped to the page), so a step aside can never reach further than a growth
 /// would have been allowed to, can never leave the artwork, and is refused
 /// outright if the destination touches a third block's ink.
+///
+/// [ignore] is the neighbour this block is stepping away from. It is left out of
+/// the *envelope* on purpose: its edge currently lies inside this box, so the
+/// clear gap on the side of the move is negative and [safeGrowRect] would hand
+/// back no room at all there — the push could never be offered. It is still one
+/// of the boxes the *destination* is checked against, so excluding it from the
+/// budget does not mean the move may land on it.
 bool _pushClears({
   required TranslatedRegion region,
   required ui.Rect from,
@@ -1031,6 +1045,7 @@ bool _pushClears({
   required List<ui.Rect> boxes,
   required bool Function(int) paints,
   required int skip,
+  required int ignore,
 }) {
   final shifted = from.translate(alongX ? need : 0, alongX ? 0 : need);
   if (shifted.width <= 4 || shifted.height <= 4) return false;
@@ -1039,7 +1054,7 @@ bool _pushClears({
     eraseBounds: _eraseBoundsOf(region),
     obstacles: [
       for (var k = 0; k < boxes.length; k++)
-        if (k != skip && paints(k)) boxes[k],
+        if (k != skip && k != ignore && paints(k)) boxes[k],
     ],
     pageWidth: page.width,
     pageHeight: page.height,
