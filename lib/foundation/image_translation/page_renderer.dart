@@ -56,6 +56,17 @@ Future<PageRenderResult> renderTranslatedPageWithReport(
   List<TranslatedRegion> regions, {
   InpaintMode mode = InpaintMode.smart,
 }) async {
+  // Defect A: one caption can reach the renderer as two (or more) regions
+  // whose boxes cover the same art — the detector emits connected-component
+  // bounding boxes, and two clusters whose boxes overlap both get recognized
+  // whole, so the same paragraph arrives twice. The renderer paints exactly
+  // one text pass per region (`placements` ↔ `regions` is 1:1 — there is no
+  // double-draw path here), so the only way two blocks can share pixels is a
+  // colliding *input list*. Colliding regions therefore merge into a single
+  // reading-order block before anything else looks at them. A collision-free
+  // list passes through unchanged, byte for byte — every existing single-
+  // block behaviour is untouched.
+  regions = resolveRegionCollisions(regions);
   final page = ui.Size(decoded.width.toDouble(), decoded.height.toDouble());
   final outlined = mode != InpaintMode.patch;
   // Phase 11-S4: weigh the source lettering's outline before budgeting ours.
@@ -90,7 +101,7 @@ Future<PageRenderResult> renderTranslatedPageWithReport(
     if (report.keepOriginal.isNotEmpty && mode != InpaintMode.patch) {
       pristine = await _tryDecodeScaled(originalBytes, decoded);
       if (pristine != null) {
-        final source = ui.Rect.fromLTRB(
+        final pageRect = ui.Rect.fromLTRB(
           0,
           0,
           pristine.width.toDouble(),
@@ -98,10 +109,17 @@ Future<PageRenderResult> renderTranslatedPageWithReport(
         );
         for (final placement in placements) {
           if (!placement.keptOriginal) continue;
+          // Restore the same pixel area the box names on the page: pristine
+          // was decoded at exactly the working resolution, so src == dst.
+          // (src used to be the FULL page, which stamped a shrunken thumbnail
+          // of the whole artwork into every kept-original box — the opposite
+          // of "leave the source artwork untouched".)
+          final restore = placement.box.intersect(pageRect);
+          if (restore.isEmpty) continue;
           canvas.drawImageRect(
             pristine,
-            source,
-            placement.box,
+            restore,
+            restore,
             ui.Paint()..filterQuality = ui.FilterQuality.none,
           );
         }
@@ -687,6 +705,186 @@ ui.Rect _eraseBoundsOf(TranslatedRegion region) {
 double _patchPlateCoverage(ui.Rect rect) {
   final minSide = math.min(rect.width, rect.height);
   return math.max(3.0, minSide * 0.14);
+}
+
+// ---------------------------------------------------------------------------
+// Defect A fix: colliding regions merge into one painting — never two texts
+// on one rectangle
+// ---------------------------------------------------------------------------
+
+/// Share of the smaller box's area the intersection must cover before two
+/// differently-worded regions count as "the same region detected twice".
+///
+/// When the detector's component boxes split one caption into a whole-block
+/// box plus a line box (the thickness/direction guards in the worker's
+/// clustering refuse to merge them), the smaller box sits almost fully
+/// inside the bigger one — coverage near 1. Two genuinely separate bubbles
+/// that merely neighbour each other overlap by far less than a third of the
+/// smaller one. 0.35 sits between those worlds: it collapses the duplicate-
+/// caption failure (interleaved lettering on real pages) while leaving
+/// close-but-distinct bubbles to the normal per-block path, where
+/// [safeGrowRect] already keeps them out of each other's gutter.
+const double kMergeOverlapCov = 0.35;
+
+/// The same test for regions whose texts are identical: two boxes over the
+/// same art carrying the same string are one block twice whatever the
+/// detector's opinion of their borders was — so the gate sits lower.
+const double kMergeDuplicateCov = 0.15;
+
+/// Collapse every whitespace run so "同一 段文字" and "同一 段文字 " compare
+/// equal; only used to spot duplicate detections, never to rewrite text.
+String _collapseWhitespace(String text) =>
+    text.replaceAll(RegExp(r'\s+'), '');
+
+/// Merge regions whose boxes collide (see [kMergeOverlapCov]).
+///
+/// A merged block paints once, in its members' reading order — top to
+/// bottom, and right-to-left between same-row vertical columns (Japanese
+/// manga order) — with identical texts collapsed to the first copy. Its rect
+/// is the members' union, its erase footprint the members' line boxes, so
+/// nothing the detector had cleaned stops being cleaned. The returned list
+/// keeps one entry per collision group ordered by first member index;
+/// collision-free input comes back as the same list object.
+List<TranslatedRegion> resolveRegionCollisions(List<TranslatedRegion> regions) {
+  final n = regions.length;
+  if (n < 2) return regions;
+  final rects = [for (final r in regions) r.rect.toRect()];
+  final normed = [for (final r in regions) _collapseWhitespace(r.text)];
+  final parent = List<int>.generate(n, (i) => i);
+  int find(int x) {
+    while (parent[x] != x) {
+      parent[x] = parent[parent[x]];
+      x = parent[x];
+    }
+    return x;
+  }
+
+  var collisions = 0;
+  for (var i = 0; i < n; i++) {
+    for (var j = i + 1; j < n; j++) {
+      final a = rects[i], b = rects[j];
+      if (a.width <= 0 || a.height <= 0 || b.width <= 0 || b.height <= 0) {
+        continue;
+      }
+      final inter = a.intersect(b);
+      if (inter.isEmpty) continue;
+      final smaller =
+          a.width * a.height < b.width * b.height
+          ? a.width * a.height
+          : b.width * b.height;
+      final cov = inter.width * inter.height / smaller;
+      final duplicateText =
+          normed[i].isNotEmpty && normed[i] == normed[j] && cov >= kMergeDuplicateCov;
+      if (cov >= kMergeOverlapCov || duplicateText) {
+        final ri = find(i), rj = find(j);
+        if (ri != rj) {
+          collisions++;
+          parent[rj] = ri;
+        }
+      }
+    }
+  }
+  if (collisions == 0) return regions;
+
+  final groups = <int, List<int>>{};
+  for (var i = 0; i < n; i++) {
+    (groups[find(i)] ??= <int>[]).add(i);
+  }
+  final ordered = groups.values.toList()
+    ..sort((a, b) => a.first.compareTo(b.first));
+  final out = <TranslatedRegion>[];
+  for (final members in ordered) {
+    if (members.length == 1) {
+      out.add(regions[members.first]);
+      continue;
+    }
+    out.add(_mergeRegionGroup(regions, members));
+  }
+  Log.info(
+    'OCR Layout',
+    'merged $n colliding region(s) into ${out.length} block(s): overlapping '
+    'detections would have painted on top of each other',
+  );
+  return out;
+}
+
+/// One merged block from [members] (indices into [regions], ≥2 entries).
+///
+/// Text is joined in reading order with identical strings collapsed, which
+/// is what turns "the same paragraph twice, interleaved" back into the
+/// paragraph once. Colour is taken from the largest member (the plate colour
+/// of the dominant bubble wins in patch mode); lineHeight is the median of
+/// the members that carry one (the fit search's size cap stays honest).
+TranslatedRegion _mergeRegionGroup(
+  List<TranslatedRegion> regions,
+  List<int> members,
+) {
+  final sorted = members.toList()
+    ..sort((a, b) {
+      final byReading = _compareReadingOrder(regions[a], regions[b]);
+      return byReading != 0 ? byReading : a.compareTo(b);
+    });
+  var left = 1 << 30, top = 1 << 30, right = -(1 << 30), bottom = -(1 << 30);
+  var eLeft = 1 << 30, eTop = 1 << 30, eRight = -(1 << 30), eBottom = -(1 << 30);
+  final eraseLines = <IntRect>[];
+  final heights = <int>[];
+  final seen = <String>{};
+  final parts = <String>[];
+  TranslatedRegion? biggest;
+  double biggestArea = -1;
+  for (final i in sorted) {
+    final r = regions[i];
+    left = math.min(left, r.rect.left);
+    top = math.min(top, r.rect.top);
+    right = math.max(right, r.rect.right);
+    bottom = math.max(bottom, r.rect.bottom);
+    final srcErase = r.eraseRect;
+    eLeft = math.min(eLeft, srcErase.left);
+    eTop = math.min(eTop, srcErase.top);
+    eRight = math.max(eRight, srcErase.right);
+    eBottom = math.max(eBottom, srcErase.bottom);
+    for (final line in r.eraseRects) {
+      if (line.width > 0 && line.height > 0) eraseLines.add(line);
+    }
+    if (r.lineHeight > 0) heights.add(r.lineHeight);
+    final area = (r.rect.width * r.rect.height).toDouble();
+    if (area > biggestArea) {
+      biggestArea = area;
+      biggest = r;
+    }
+    final key = _collapseWhitespace(r.text);
+    if (key.isEmpty || !seen.add(key)) continue;
+    parts.add(r.text.trim());
+  }
+  heights.sort();
+  return TranslatedRegion(
+    rect: IntRect(left, top, right, bottom),
+    eraseRect: IntRect(eLeft, eTop, eRight, eBottom),
+    eraseRects: eraseLines,
+    text: parts.join('\n'),
+    backgroundColor: biggest!.backgroundColor,
+    textColor: biggest.textColor,
+    lineHeight: heights.isEmpty ? 0 : heights[heights.length ~/ 2],
+  );
+}
+
+/// Manga reading order over two regions: down the page first, and between
+/// boxes sharing a row band, vertical columns read right-to-left while
+/// horizontal runs read left-to-right. The tie-break on original index (in
+/// the caller) keeps the sort deterministic for equal boxes.
+int _compareReadingOrder(TranslatedRegion a, TranslatedRegion b) {
+  final ra = a.rect, rb = b.rect;
+  final minH = math.min(ra.height, rb.height);
+  final rowOverlap =
+      math.min(ra.bottom, rb.bottom) - math.max(ra.top, rb.top);
+  if (minH > 0 && rowOverlap >= 0.5 * minH) {
+    final bothColumns =
+        ra.height >= ra.width * 1.25 && rb.height >= rb.width * 1.25;
+    return bothColumns
+        ? rb.left.compareTo(ra.left)
+        : ra.left.compareTo(rb.left);
+  }
+  return ra.top.compareTo(rb.top);
 }
 
 // ---------------------------------------------------------------------------

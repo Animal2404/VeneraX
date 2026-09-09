@@ -229,11 +229,49 @@ class PageTranslationPipeline {
   }) async {
     var image = await _decode(imageBytes);
     if (mode != InpaintMode.patch && regions.isNotEmpty) {
-      TextInpainter.erase(image, [
-        for (var region in regions) ...region.eraseRects,
-      ]);
+      TextInpainter.erase(
+        image,
+        eraseFootprintRects(regions, image.width, image.height),
+      );
     }
     return await renderTranslatedPage(imageBytes, image, regions, mode: mode);
+  }
+
+  /// Defect B: the per-line erase footprints, grown by a bounded margin.
+  ///
+  /// The detector's line boxes come from a binary-threshold flood fill
+  /// (`_detPostprocessBatchSingle`): pixels fainter than the threshold —
+  /// anti-aliased glyph edges — are not in the component, and the box is
+  /// floored to integers, so a ring of still-readable original ink sits just
+  /// *outside* the rectangle the eraser was handed. The eraser itself will
+  /// not look further out than its own 1..3px guard (see TextInpainter's
+  /// allowed window), so that ring is what shows through under the placed
+  /// translation. Growing each erase rect by a small, source-scaled margin
+  /// sweeps it.
+  ///
+  /// The margin is deliberately tiny and hard-capped at 4px: the eraser's
+  /// contrast test cannot tell a wider window's bubble outlines and page
+  /// artwork from lettering, and eating a line is far more visible than the
+  /// 1px halo it would trade for. `2 + lineHeight/16` covers halos around
+  /// small caption text (2px) and the bolder overhang of large lettering
+  /// (capped 4px) without reaching the next line — line gaps are ≥ 0.4× the
+  /// source glyph height, always above this margin.
+  @visibleForTesting
+  static List<IntRect> eraseFootprintRects(
+    List<TranslatedRegion> regions,
+    int width,
+    int height,
+  ) {
+    final out = <IntRect>[];
+    for (final region in regions) {
+      final lineHeight = region.lineHeight > 0 ? region.lineHeight : 16;
+      final margin = (2 + lineHeight ~/ 16).clamp(2, 4);
+      for (final rect in region.eraseRects) {
+        if (rect.width <= 0 || rect.height <= 0) continue;
+        out.add(rect.inflated(margin, margin, width, height));
+      }
+    }
+    return out;
   }
 
   TranslatedRegion _region(OcrBlock block, String text) {
