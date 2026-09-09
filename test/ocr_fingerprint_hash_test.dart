@@ -134,23 +134,27 @@ void main() {
       // `missing` is the honest stamp and a test that asked for `unreadable`
       // would be asserting a distinction the filesystem cannot make.
       // createSync() returns void, so the path must come from the directory
-    // itself; chaining .path onto it is a compile error.
-    final dir = Directory('${root.path}/unreadable');
-    dir.createSync();
-    final path = dir.path;
+      // itself; chaining .path onto it is a compile error.
+      final dir = Directory('${root.path}/unreadable');
+      dir.createSync();
+      final path = dir.path;
       expect(detStamp(path), 'det:unreadable');
       expect(detStamp(path), isNot('det:missing'));
       expect(looksLikeHash(hashOf(path)), isFalse);
     });
 
     test('a sentinel never collides with a real hash', () {
-      final real = detStamp(write('real.onnx', List<int>.filled(16, 3)));
+      final realPath = write('real.onnx', List<int>.filled(16, 3));
+      final real = detStamp(realPath);
       expect(real, isNot('det:missing'));
       expect(real, isNot('det:unreadable'));
       // `real` is the whole stamp ('det:<hash>'); the shape being pinned is
-      // the hash half. Comparing the prefixed string against a bare-hex regex
-      // could never pass, whatever the file contained.
-      expect(looksLikeHash(hashOf(real)), isTrue);
+      // the hash half, so take it off the stamp itself. `hashOf` expects a
+      // *path*: calling it on a stamp asks _stampFile to hash the literal
+      // string 'det:<hash>' as a filename. That path never exists in the
+      // temp dir, so it returns the `missing` sentinel and the assertion
+      // would be false no matter what the real file's hash looked like.
+      expect(looksLikeHash(real.substring('det:'.length)), isTrue);
     });
   });
 

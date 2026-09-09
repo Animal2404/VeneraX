@@ -133,17 +133,43 @@ void main() {
     test('the window counts only recognized pages, not settled ones', () {
       final activity = PreTranslationActivity();
       final t0 = DateTime(2026, 1, 1, 0, 0, 0);
-      // 4-page chunk at t0, all stored; the next chunk throws at t0+60s.
+      final tFail = t0.add(const Duration(seconds: 30));
+      final t2 = t0.add(const Duration(seconds: 60));
+      // A 4-page chunk at t0, all stored; the next chunk throws at t+30s (0
+      // stored, so the sweep samples nothing for it — `add` ignores pages <=
+      // 0, pinned by the test above); a 2-page chunk at t+60s, all stored.
       activity.recordOcrPages(4, workMs: 4000, at: t0);
-      activity.recordOcrPages(0, at: t0.add(const Duration(seconds: 60)));
+      activity.recordOcrPages(0, at: tFail);
+      // The failed chunk leaves no trace in the window: no sample, and the
+      // sampling clock does not move.
+      expect(activity.sweepRates.samples, 1);
+      expect(activity.lastOcrSampleAt, t0);
+      activity.recordOcrPages(2, workMs: 2000, at: t2);
 
       final rates = activity.sweepRates;
-      expect(rates.samples, 1, reason: 'the failed chunk is not a sample');
-      // 4 pages over the 60 s the window spans. If the failed chunk's pages had
-      // been credited, the numerator would be 8 and this would read 8.
-      expect(rates.stablePagesPerMinute, closeTo(4, 1e-9));
-      expect(rates.msPerPage, 1000);
-      expect(activity.lastOcrSampleAt, t0);
+      expect(
+        rates.samples,
+        2,
+        reason: 'only the recognized chunks are samples',
+      );
+      // A stable rate exists only once two *recognized* samples span >= 3 s
+      // (_ThroughputTracker.add: fewer than two samples leaves it null, so a
+      // lone success plus a failure that is never sampled cannot produce
+      // one). With two, it is 6 recognized pages over the 60 s between them:
+      // the failed chunk's settled pages never enter the numerator. Had
+      // settled pages been credited, the window would read 10 pages/min.
+      expect(rates.stablePagesPerMinute, closeTo(6, 1e-9));
+      expect(
+        rates.pagesPerMinute,
+        closeTo(6, 1e-9),
+        reason: 'the shown rate is the wall-clock one once it exists',
+      );
+      expect(
+        rates.msPerPage,
+        1000,
+        reason: '(4000+2000) ms of measured work over 6 recognized pages',
+      );
+      expect(activity.lastOcrSampleAt, t2);
     });
   });
 }
