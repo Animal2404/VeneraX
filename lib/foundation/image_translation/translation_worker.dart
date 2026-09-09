@@ -1490,7 +1490,10 @@ class _WorkerState {
       BatchProfile(
         detBatch: req.detBatch > 0 ? req.detBatch : baseProfile.detBatch,
         recBatch: req.recBatch > 0 ? req.recBatch : baseProfile.recBatch,
-        decBatch: req.recBatch > 0 ? req.recBatch : baseProfile.decBatch,
+        decBatch: resolveDecBatch(
+          userRecBatch: req.recBatch,
+          baseProfile: baseProfile,
+        ),
         widthQuantum: baseProfile.widthQuantum,
         widthBuckets: baseProfile.widthBuckets,
       ),
@@ -2202,7 +2205,13 @@ class _WorkerState {
     final encoder = _session(paths.jaEncoder!);
     final decoder = _session(paths.jaDecoder!);
 
-    final results = <String>[];
+    // Slot-indexed results: chunks are consumed in [decDecodeOrder] (largest
+    // crop first), each row's text is written back at its own slot, and the
+    // list is returned in original target order. A null slot can only mean a
+    // logic bug — `?? ''` keeps the return type total, matching the old
+    // append-in-order behaviour of never skipping a row.
+    final results = List<String?>.filled(targets.length, null);
+    final order = decDecodeOrder([for (final t in targets) t.bounds]);
     // OOM shrink ladder for the manga-ocr (ja) pass — via the same shared
     // [runWithShrinkLadder] that guards rec and det (plan D-5 / §6.2.3).
     // Without it, an allocation failure inside the encoder run or any
@@ -2218,13 +2227,13 @@ class _WorkerState {
     while (cursor < targets.length) {
       void runChunk(BatchProfile plan) {
         final chunkSize = math.min(plan.decBatch, targets.length - cursor);
-        final chunkTargets = targets.sublist(cursor, cursor + chunkSize);
-        final B = chunkTargets.length;
+        final chunkIdx = order.sublist(cursor, cursor + chunkSize);
+        final B = chunkIdx.length;
         final totalPixels = B * 3 * 224 * 224;
         final off = _arena.ensure(0, totalPixels);
         const plane = 224 * 224;
         for (var b = 0; b < B; b++) {
-          final t = chunkTargets[b];
+          final t = targets[chunkIdx[b]];
           final resized = _resizeRegion(t.image, t.bounds, 224, 224);
           final bOffset = off + b * 3 * plane;
           for (var p = 0; p < plane; p++) {
@@ -2258,15 +2267,13 @@ class _WorkerState {
         );
 
         decStopwatch?.start();
-        var stepsTaken = 0;
+        final int stepsTaken;
         try {
-          while (!state.allDone &&
-              state.currentStep < MangaOcrTokens.maxTokens) {
-            final L = state.currentStep;
-            final inputIds = state.flatPrefix(L);
-            final nextTokens = decoder.runArgmaxLastPosition(
+          stepsTaken = driveDecode(
+            state: state,
+            forward: (flatIds, batch, len) => decoder.runArgmaxLastPosition(
               {
-                'input_ids': OrtInput.int64(inputIds, [B, L]),
+                'input_ids': OrtInput.int64(flatIds, [batch, len]),
                 'encoder_hidden_states': OrtInput.nativeFloat32(
                   _hiddenArena.pointerAt(0),
                   hiddenCount,
@@ -2274,12 +2281,10 @@ class _WorkerState {
                 ),
               },
               decoder.outputNames.first,
-              batch: B,
-              seqLen: L,
-            );
-            state.appendAll(nextTokens);
-            stepsTaken++;
-          }
+              batch: batch,
+              seqLen: len,
+            ),
+          );
         } finally {
           // A throw inside the step loop used to leave the stopwatch
           // running across the retry; the timing then counted failed
@@ -2289,7 +2294,9 @@ class _WorkerState {
         onStepStats?.call(B, stepsTaken);
 
         final chunkTexts = state.textOf((tokens) => _jaVocab!.decode(tokens));
-        results.addAll(chunkTexts);
+        for (var b = 0; b < B; b++) {
+          results[chunkIdx[b]] = chunkTexts[b];
+        }
         cursor += chunkSize;
       }
       runWithShrinkLadder(
@@ -2303,16 +2310,16 @@ class _WorkerState {
             'OCR Perf',
             'OOM: decBatch ${previous.decBatch}->${next.decBatch}',
           );
-          // `results.addAll` is the last statement of a successful attempt,
-          // so a failed chunk appended nothing; the retry re-slices the same
-          // targets at the smaller chunk size. Decoding is deterministic per
-          // crop and `cursor` only advances on success, so a replay can
-          // never duplicate or drop a row.
+          // Slot writes happen only after a chunk's decode fully succeeded,
+          // so a failed attempt wrote nothing; the retry re-slices the same
+          // `order` range at the smaller chunk size. Decoding is
+          // deterministic per crop and `cursor` only advances on success, so
+          // a replay can never duplicate or drop a row.
         },
       );
     }
 
-    return results;
+    return [for (final r in results) r ?? ''];
   }
 
   /// Loads (or reuses) the charset for [lang] and cross-checks it against

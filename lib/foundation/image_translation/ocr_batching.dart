@@ -315,6 +315,58 @@ class BatchDecodeState {
   }
 }
 
+/// Drives one batched auto-regressive pass to completion and returns the
+/// number of decoder forwards taken.
+///
+/// Extracted verbatim from `_mangaOcrBatchMulti`'s step loop so the unit
+/// tests can exercise the *production* control flow with a fake [forward]
+/// (no GPU, no model file — the same seam [profileAfterOom] uses). Each step
+/// re-feeds the whole `[batch, currentStep]` prefix: the shipped
+/// `decoder.onnx` exports exactly two graph inputs (`input_ids`,
+/// `encoder_hidden_states`) and one output (`logits`), with **no
+/// past_key_values**, so prefix re-feeding is forced by the model, not by a
+/// missed optimisation here. [forward] must return one greedy next-token per
+/// row, mirroring `runArgmaxLastPosition`.
+int driveDecode({
+  required BatchDecodeState state,
+  required List<int> Function(Int64List flatIds, int batch, int seqLen)
+      forward,
+}) {
+  var steps = 0;
+  while (!state.allDone && state.currentStep < state.maxTokens) {
+    final len = state.currentStep;
+    state.appendAll(forward(state.flatPrefix(len), state.batch, len));
+    steps++;
+  }
+  return steps;
+}
+
+/// Row order for the manga-ocr (ja) decode chunks: largest crop first.
+///
+/// The step loop runs until *every* row in a chunk hits EOS (or the
+/// repetition cut), so one chunk costs (longest row + 1) forwards no matter
+/// how short its other rows are: a single 80-token outlier forces ~76
+/// pad-token steps on all its co-passengers. Sorting crop areas descending
+/// groups rows of similar expected token length (glyph count scales with
+/// area), pulling each chunk's max toward its own rows' lengths and
+/// strictly reducing Σ steps in expectation.
+///
+/// Returns a permutation of `0..bounds.length-1`; chunk membership only
+/// changes *which* rows share a forward, never the prefix fed for any
+/// single row (self-attention is causal per row, cross-attention reads that
+/// row's own encoder states — rows are independent along the batch axis).
+/// Deterministic despite `List.sort` being unstable: area descending with an
+/// index tie-break is a total order.
+List<int> decDecodeOrder(List<IntRect> bounds) {
+  final n = bounds.length;
+  final order = List.generate(n, (i) => i);
+  order.sort((a, b) {
+    final byArea = bounds[b].area.compareTo(bounds[a].area);
+    return byArea != 0 ? byArea : a.compareTo(b);
+  });
+  return order;
+}
+
 /// Execution profile controlling batch sizes and bucketing.
 class BatchProfile {
   const BatchProfile({
@@ -384,6 +436,39 @@ class BatchProfile {
         return desktopCpu;
     }
   }
+}
+
+/// Decoder-pass batch size for a request.
+///
+/// Until now the worker derived `decBatch` straight from the *recognition*
+/// batch slider (`decBatch: req.recBatch > 0 ? req.recBatch : base.decBatch`),
+/// which conflates two different memory footprints: the rec slider bounds
+/// 48×W crop staging, the decoder pass costs [B,3,224,224] pixels + hidden
+/// states + per-step `logits [B,L,6144]` that grow with L. On the measured
+/// 6 GB desktop card the whole 8-page sweep peaked at 2473 MB of 6144 MB
+/// (see the `parts=` perf log), yet the autoregressive pass still crawled
+/// because one balanced-tier slider value capped it at 8 rows per forward.
+///
+/// The rule keeps every shipped configuration bit-identical unless it can
+/// only help:
+/// * `userRecBatch == 1` is an explicit memory pin (saver preset, custom
+///   default) — the decoder stays serial at 1, exactly as before.
+/// * unset (`<= 0`) — the EP profile decides, as before.
+/// * `>= 2` — the profile's own `decBatch` is allowed to lift the decoder
+///   above the rec slider; never lowered below it, so no existing user gets
+///   a smaller batch than today. Mobile profiles are `single` (decBatch 1
+///   lifted by nothing, `max(4,1)=4` stays the rec value), desktop CPU
+///   stays `max(rec,4)` — all unchanged. Only desktop GPU tiers move
+///   (directml 8→16, cuda 8→32 at recBatch 8), where the headroom is
+///   measured and the shared [runWithShrinkLadder] + sticky [cappedBy]
+///   ceiling retreat it automatically on any card that disagrees.
+int resolveDecBatch({
+  required int userRecBatch,
+  required BatchProfile baseProfile,
+}) {
+  if (userRecBatch == 1) return 1;
+  if (userRecBatch <= 0) return baseProfile.decBatch;
+  return math.max(userRecBatch, baseProfile.decBatch);
 }
 
 /// Pure decision for the OOM shrink ladder (plan D-5 / §6.2.3): given the
