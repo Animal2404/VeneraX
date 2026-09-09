@@ -61,12 +61,27 @@ class PerformanceAdvice {
     required this.preset,
     required this.values,
     required this.basis,
+    required this.isDesktop,
     this.vramMb,
   });
 
   final TranslationPerformancePreset preset;
   final TranslationPerformanceValues values;
   final AdviceBasis basis;
+
+  /// The device class this advice was computed for, carried on the result
+  /// instead of re-read from [App.isDesktop] at question time.
+  ///
+  /// This is not decoration: [values] is one of the `valuesFor` tables, and
+  /// several of them differ between desktop and mobile (`fast` in four fields,
+  /// `balanced` in four after the first-run raise). Answering "is this already
+  /// applied?" or "is this table really the tier it is named after?" with the
+  /// *ambient* platform therefore compared a desktop table against a mobile
+  /// one and got "no" on a machine the advice never described — which is
+  /// exactly what the first version of this class did, and what the two cloud
+  /// test failures caught. [advise] takes `isDesktop` as an input; every
+  /// judgement the advice supports has to use that same input.
+  final bool isDesktop;
 
   /// The adapter total this advice was banded by, when there was one. Carried on
   /// the result rather than re-read by the UI, so a row can show the machine it
@@ -80,9 +95,18 @@ class PerformanceAdvice {
   /// the suggested numbers happen to match is a different thing to have chosen
   /// than selecting a tier, and the sliders would then move if the user ever
   /// re-applied it.
+  ///
+  /// The comparison is made against this advice's own device class
+  /// ([isDesktop]), never against [TranslationPerformanceConfig.effective]:
+  /// `effective` resolves the ambient platform, and the tables are
+  /// platform-split, so an advice about a desktop would have been judged
+  /// "not yet applied" by a phone's numbers — see [isDesktop].
   bool get isActionable {
-    if (preset != TranslationPerformanceConfig.current) return true;
-    return !values.sameTuning(TranslationPerformanceConfig.effective);
+    final tier = TranslationPerformanceConfig.current;
+    if (preset != tier) return true;
+    return !values.sameTuning(
+      TranslationPerformanceConfig.valuesFor(tier, isDesktop: isDesktop),
+    );
   }
 
   /// Whether the suggestion is based on a GPU actually being present. Only
@@ -236,29 +260,40 @@ abstract final class TranslationPerformanceConfig {
       recBatch: 16,
       pagesPerOcrCall: 4,
     ),
-    TranslationPerformancePreset.custom => TranslationPerformanceValues(
-      batchPages: _intSetting(
-        'imageTranslationPreBatchPages',
-        1,
-      ).clamp(1, isDesktop ? 20 : 8),
-      ocrWorkers: _intSetting(
-        'imageTranslationOcrWorkers',
-        0,
-      ).clamp(0, isDesktop ? 6 : 2),
-      imageConcurrency: _intSetting(
-        'imageTranslationImageConcurrency',
-        3,
-      ).clamp(1, isDesktop ? 6 : 3),
-      llmConcurrency: _intSetting(
-        'imageTranslationLlmConcurrency',
-        2,
-      ).clamp(1, isDesktop ? 8 : 3),
-      ep: _epSetting(),
-      detBatch: _intSetting('imageTranslationOcrDetBatch', 1).clamp(1, 16),
-      recBatch: _intSetting('imageTranslationOcrRecBatch', 1).clamp(1, isDesktop ? 32 : 4),
-      pagesPerOcrCall: _intSetting('imageTranslationPagesPerOcrCall', 2).clamp(1, 8),
+    TranslationPerformancePreset.custom => clampTuningToCustom(
+      TranslationPerformanceValues(
+        batchPages: _intSetting('imageTranslationPreBatchPages', 1),
+        ocrWorkers: _intSetting('imageTranslationOcrWorkers', 0),
+        imageConcurrency: _intSetting('imageTranslationImageConcurrency', 3),
+        llmConcurrency: _intSetting('imageTranslationLlmConcurrency', 2),
+        ep: _epSetting(),
+        detBatch: _intSetting('imageTranslationOcrDetBatch', 1),
+        recBatch: _intSetting('imageTranslationOcrRecBatch', 1),
+        pagesPerOcrCall: _intSetting('imageTranslationPagesPerOcrCall', 2),
+      ),
+      isDesktop: isDesktop,
     ),
   };
+
+  /// The one place the `custom` ceilings are expressed. [valuesFor] applies it
+  /// when reading stored settings, and [applyAdvice] applies it before writing
+  /// a table it files under `custom`: a number stored above a ceiling the
+  /// read-back re-applies is a number the sliders silently move out from under
+  /// the user — the same "display says one number, the engine runs another"
+  /// defect this file keeps having to kill.
+  static TranslationPerformanceValues clampTuningToCustom(
+    TranslationPerformanceValues values, {
+    required bool isDesktop,
+  }) => TranslationPerformanceValues(
+    batchPages: values.batchPages.clamp(1, isDesktop ? 20 : 8),
+    ocrWorkers: values.ocrWorkers.clamp(0, isDesktop ? 6 : 2),
+    imageConcurrency: values.imageConcurrency.clamp(1, isDesktop ? 6 : 3),
+    llmConcurrency: values.llmConcurrency.clamp(1, isDesktop ? 8 : 3),
+    ep: values.ep,
+    detBatch: values.detBatch.clamp(1, 16),
+    recBatch: values.recBatch.clamp(1, isDesktop ? 32 : 4),
+    pagesPerOcrCall: values.pagesPerOcrCall.clamp(1, 8),
+  );
 
   static void apply(TranslationPerformancePreset preset) {
     if (preset == TranslationPerformancePreset.custom) {
@@ -322,6 +357,7 @@ abstract final class TranslationPerformanceConfig {
       return PerformanceAdvice(
         preset: TranslationPerformancePreset.balanced,
         values: base,
+        isDesktop: desktop,
         basis: AdviceBasis.mobile,
       );
     }
@@ -331,6 +367,7 @@ abstract final class TranslationPerformanceConfig {
       return PerformanceAdvice(
         preset: TranslationPerformancePreset.balanced,
         values: base,
+        isDesktop: desktop,
         basis: AdviceBasis.noGpuReport,
       );
     }
@@ -338,6 +375,7 @@ abstract final class TranslationPerformanceConfig {
       return PerformanceAdvice(
         preset: TranslationPerformancePreset.balanced,
         values: base,
+        isDesktop: desktop,
         basis: AdviceBasis.cpuOnly,
       );
     }
@@ -359,6 +397,7 @@ abstract final class TranslationPerformanceConfig {
           recBatch: base.recBatch,
           pagesPerOcrCall: base.pagesPerOcrCall,
         ),
+        isDesktop: desktop,
         basis: AdviceBasis.gpuStaticBatch,
       );
     }
@@ -372,6 +411,7 @@ abstract final class TranslationPerformanceConfig {
       return PerformanceAdvice(
         preset: TranslationPerformancePreset.balanced,
         values: base,
+        isDesktop: desktop,
         basis: AdviceBasis.gpuVramUnknown,
       );
     }
@@ -381,6 +421,7 @@ abstract final class TranslationPerformanceConfig {
         preset: TranslationPerformancePreset.balanced,
         values: base,
         vramMb: vram,
+        isDesktop: desktop,
         basis: AdviceBasis.gpuVramBanded,
       );
     }
@@ -400,6 +441,7 @@ abstract final class TranslationPerformanceConfig {
           pagesPerOcrCall: 2,
         ),
         vramMb: vram,
+        isDesktop: desktop,
         basis: AdviceBasis.gpuVramBanded,
       );
     }
@@ -409,11 +451,14 @@ abstract final class TranslationPerformanceConfig {
       // what cloud test CT-1 is for.
       return PerformanceAdvice(
         preset: TranslationPerformancePreset.fast,
+        // Same device class as the advice itself: a desktop table looked
+        // up for a phone would be judged a foreign table by applyAdvice.
         values: valuesFor(
           TranslationPerformancePreset.fast,
-          isDesktop: true,
+          isDesktop: desktop,
         ),
         vramMb: vram,
+        isDesktop: desktop,
         basis: AdviceBasis.gpuVramBanded,
       );
     }
@@ -447,6 +492,7 @@ abstract final class TranslationPerformanceConfig {
         pagesPerOcrCall: 4,
       ),
       vramMb: vram,
+      isDesktop: desktop,
       basis: AdviceBasis.gpuVramBanded,
     );
   }
@@ -494,21 +540,33 @@ abstract final class TranslationPerformanceConfig {
     return _measuredVramMb;
   }
 
-  /// Write an [advise] result. The tier name is only kept when the numbers
-  /// really are that tier's own table: a named tier's values are recomputed by
-  /// [valuesFor] on every read, so writing a table under a name whose table it
-  /// is not would leave the sliders showing one thing and the engine running
-  /// another — the exact failure this whole file exists to avoid.
+  /// Write an [advise] result. Both branches exist to keep the label honest,
+  /// and both answer from the advice's own device class
+  /// ([PerformanceAdvice.isDesktop]) rather than from the ambient platform —
+  /// `fast` and `balanced` have different desktop and mobile tables, so a
+  /// comparison that mixed the two classes decided "is this the tier's own
+  /// table?" by comparing a desktop table against a phone's (that mismatch is
+  /// what filed the desktop `fast` table under `custom`).
+  ///
+  /// * **Named tier, and the numbers are that tier's own** → store them under
+  ///   that tier name. A named tier is recomputed by [valuesFor] on every read,
+  ///   so what matters is that the recomputation lands on the advised numbers;
+  ///   the stored keys then mirror them, exactly as in [apply].
+  /// * **Anything else — including every advice that already says `custom`** →
+  ///   the numbers are clamped to that class's ceilings *before* the write,
+  ///   then filed under `custom`. `custom` is the one tier read back *through*
+  ///   those ceilings, so an uncapped number stored there is a number the
+  ///   sliders move out from under the user on the next read.
   static void applyAdvice(PerformanceAdvice advice) {
-    var tierTable = valuesFor(advice.preset, isDesktop: App.isDesktop);
-    var keepsName =
-        advice.preset == TranslationPerformancePreset.custom ||
-        advice.values.sameTuning(tierTable);
+    final tierTable = valuesFor(advice.preset, isDesktop: advice.isDesktop);
+    final named = advice.preset != TranslationPerformancePreset.custom;
+    if (named && advice.values.sameTuning(tierTable)) {
+      applyValues(advice.values, preset: advice.preset);
+      return;
+    }
     applyValues(
-      advice.values,
-      preset: keepsName
-          ? advice.preset
-          : TranslationPerformancePreset.custom,
+      clampTuningToCustom(advice.values, isDesktop: advice.isDesktop),
+      preset: TranslationPerformancePreset.custom,
     );
   }
 

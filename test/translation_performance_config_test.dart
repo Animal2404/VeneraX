@@ -393,6 +393,75 @@ void main() {
       expect(advice.isActionable, isFalse);
     });
 
+    // Regression for the above: `isActionable` used to resolve the *ambient*
+    // platform through `TranslationPerformanceConfig.effective`. On a runner
+    // where that disagreed with the device class the advice was computed for,
+    // a "keep what you have" answer (the under-2 GB and unreadable-VRAM
+    // branches both return exactly the shipped tier) came out actionable, and
+    // the UI would have offered to "apply" a change that was no change at all.
+    // Both device classes are asserted here, so the answer cannot depend on
+    // which machine runs the suite.
+    test('"leave it alone" is not actionable on either device class', () {
+      var saved = <String, Object?>{};
+      for (var key in _tuningKeys) {
+        saved[key] = appdata.settings[key];
+      }
+      addTearDown(() {
+        for (var key in _tuningKeys) {
+          appdata.settings[key] = saved[key];
+        }
+      });
+      for (var desktop in [true, false]) {
+        var shipped = TranslationPerformanceConfig.valuesFor(
+          TranslationPerformancePreset.balanced,
+          isDesktop: desktop,
+        );
+        appdata.settings[TranslationPerformanceConfig.settingKey] = 'balanced';
+        appdata.settings['imageTranslationOcrDetBatch'] = shipped.detBatch;
+        appdata.settings['imageTranslationOcrRecBatch'] = shipped.recBatch;
+        appdata.settings['imageTranslationPagesPerOcrCall'] =
+            shipped.pagesPerOcrCall;
+        appdata.settings['imageTranslationPreBatchPages'] = shipped.batchPages;
+        var advice = TranslationPerformanceConfig.advise(
+          isDesktop: desktop,
+          ep: OrtEpKind.directml,
+          batchCapable: true,
+          totalVramMb: 1024,
+        );
+        expect(
+          advice.isActionable,
+          isFalse,
+          reason: 'a $desktop-class advice judged a $desktop-class machine',
+        );
+        // …and the flag is not simply always false.
+        var nudged = TranslationPerformanceConfig.advise(
+          isDesktop: desktop,
+          ep: OrtEpKind.directml,
+          batchCapable: false,
+          totalVramMb: 1024,
+        );
+        if (desktop) {
+          // A desktop whose detection graph is static gets a table that is not
+          // the balanced tier's own, which is a real change and must read as
+          // one.
+          expect(nudged.basis, AdviceBasis.gpuStaticBatch);
+          expect(nudged.preset, TranslationPerformancePreset.custom);
+          expect(
+            nudged.isActionable,
+            isTrue,
+            reason: 'the static-batch table read as no change',
+          );
+        } else {
+          // A phone never reaches the hardware bands at all: `advise` stops at
+          // the device class, so the answer is the shipped table and there is
+          // nothing to apply.
+          expect(nudged.basis, AdviceBasis.mobile);
+          expect(nudged.preset, TranslationPerformancePreset.balanced);
+          expect(nudged.isActionable, isFalse);
+        }
+      }
+    });
+
     test('a 3 GB adapter trades recognition and the worker pool down', () {
       var advice = TranslationPerformanceConfig.advise(
         isDesktop: true,
@@ -520,6 +589,97 @@ void main() {
         isDesktop: true,
       );
       expect(read.sameTuning(advice.values), isTrue);
+    });
+
+    // Regression: the first version of `applyAdvice` looked the tier table up
+    // with the *ambient* `App.isDesktop`, so on a runner where that disagreed
+    // with the device class the advice was computed for, the desktop `fast`
+    // table was compared against the mobile one, declared foreign, and filed
+    // under `custom` — a tier label lying about the machine. `fast` is split
+    // across four fields between the two classes (batchPages 8/4, ocrWorkers
+    // 3/2, imageConcurrency 6/3, llmConcurrency 4/3), which is what made the
+    // mismatch observable. Nothing here reads the host, so both directions
+    // hold on every runner.
+    test('the tier lookup follows the advice device class, not the host', () {
+      saveTuning();
+      for (var desktop in [true, false]) {
+        var table = TranslationPerformanceConfig.valuesFor(
+          TranslationPerformancePreset.fast,
+          isDesktop: desktop,
+        );
+        TranslationPerformanceConfig.applyAdvice(
+          PerformanceAdvice(
+            preset: TranslationPerformancePreset.fast,
+            values: table,
+            basis: AdviceBasis.gpuVramBanded,
+            isDesktop: desktop,
+            vramMb: 24576,
+          ),
+        );
+        // The name is what the old code got wrong: it compared the advice's
+        // table against the *host* class's table, so on a runner whose
+        // `App.isDesktop` disagreed with the advice this filed the fast table
+        // under `custom` and the row then showed "Custom".
+        expect(
+          TranslationPerformanceConfig.current,
+          TranslationPerformancePreset.fast,
+          reason: 'a $desktop-class fast table lost its tier name',
+        );
+        // A named tier is recomputed from its own table on every read, so the
+        // numbers the engine runs are the advised ones whatever the stored
+        // keys happen to say. (They are not all in range for `custom` on this
+        // class — mobile `fast` ships recBatch 16 above the mobile custom
+        // ceiling of 4 — but that is a preset-vs-ceiling inconsistency in the
+        // shipped table, reported separately, not a leak through this path.)
+        var runs = TranslationPerformanceConfig.valuesFor(
+          TranslationPerformanceConfig.current,
+          isDesktop: desktop,
+        );
+        expect(
+          runs.sameTuning(table),
+          isTrue,
+          reason: 'a $desktop-class fast table did not survive the apply',
+        );
+      }
+    });
+
+    test('a table filed as custom is clamped before it is written', () {
+      saveTuning();
+      TranslationPerformanceConfig.applyAdvice(
+        PerformanceAdvice(
+          preset: TranslationPerformancePreset.custom,
+          // Values no slider could produce, on the class with the tighter caps.
+          values: const TranslationPerformanceValues(
+            batchPages: 99,
+            ocrWorkers: 9,
+            imageConcurrency: 9,
+            llmConcurrency: 99,
+            detBatch: 99,
+            recBatch: 99,
+            pagesPerOcrCall: 99,
+          ),
+          basis: AdviceBasis.gpuVramBanded,
+          isDesktop: false,
+        ),
+      );
+      // Stored == read-back: the sliders cannot move after Apply.
+      expect(appdata.settings['imageTranslationOcrDetBatch'], 16);
+      expect(appdata.settings['imageTranslationOcrRecBatch'], 4);
+      expect(appdata.settings['imageTranslationPagesPerOcrCall'], 8);
+      expect(appdata.settings['imageTranslationPreBatchPages'], 8);
+      expect(appdata.settings['imageTranslationOcrWorkers'], 2);
+      expect(appdata.settings['imageTranslationImageConcurrency'], 3);
+      expect(appdata.settings['imageTranslationLlmConcurrency'], 3);
+      var read = TranslationPerformanceConfig.valuesFor(
+        TranslationPerformancePreset.custom,
+        isDesktop: false,
+      );
+      expect(read.detBatch, appdata.settings['imageTranslationOcrDetBatch']);
+      expect(read.recBatch, appdata.settings['imageTranslationOcrRecBatch']);
+      expect(
+        read.pagesPerOcrCall,
+        appdata.settings['imageTranslationPagesPerOcrCall'],
+      );
     });
   });
 
