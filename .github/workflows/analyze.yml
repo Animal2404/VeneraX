@@ -41,15 +41,25 @@ jobs:
         run: |
           set +e
           flutter analyze --no-pub > analyze.log 2>&1
-          rc=$?
           cat analyze.log
-          errors=$(grep -cE "^ *error - " analyze.log || true)
-          warnings=$(grep -cE "^ *warning - " analyze.log || true)
-          hints=$(grep -cE "^ *info - " analyze.log || true)
+          # Flutter 3.47 changed the diagnostic separator from `info - msg` to
+          # `info • msg`, so a pattern pinned to one spelling silently counts
+          # zero of everything: this gate reported errors=0 while the run had
+          # just printed twelve issues. Match both, and refuse to call the step
+          # green when the summary line is missing at all — that means the
+          # analyzer never really ran, which is the one outcome this job must
+          # never present as a pass.
+          if ! grep -qE "(No issues found!|[0-9]+ issues? found\.)" analyze.log; then
+            echo "::error::flutter analyze produced no parseable summary (did it run at all?)"
+            exit 1
+          fi
+          errors=$(grep -cE "^ *error +([-•]) " analyze.log || true)
+          warnings=$(grep -cE "^ *warning +([-•]) " analyze.log || true)
+          hints=$(grep -cE "^ *info +([-•]) " analyze.log || true)
           echo "analyzer: errors=$errors warnings=$warnings info=$hints"
           if [ "$errors" != "0" ]; then
             echo "::error::flutter analyze reported $errors error(s)"
-            grep -E "^ *error - " analyze.log
+            grep -E "^ *error +([-•]) " analyze.log
             exit 1
           fi
           if [ "$warnings" != "0" ]; then
