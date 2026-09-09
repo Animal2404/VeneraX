@@ -7,10 +7,22 @@ class PaneItemEntry {
 
   IconData activeIcon;
 
+  /// Optional fixed id so tests and callers can identify an entry without
+  /// depending on its position in the list.
+  final Object? id;
+
+  /// Optional custom activation. A selection-based entry switches the page
+  /// slot at its own index; an entry given an [onTap] manages its content
+  /// itself (the AI Translation entry pushes a sub-page over the current
+  /// slot), and the bar only moves the selection highlight to it.
+  final VoidCallback? onTap;
+
   PaneItemEntry({
     required this.label,
     required this.icon,
     required this.activeIcon,
+    this.id,
+    this.onTap,
   });
 }
 
@@ -70,6 +82,46 @@ class NaviPaneState extends State<NaviPane>
 
   late int _currentPage = widget.initialPage;
 
+  /// The pane item currently shown as selected. Normally `null` (the current
+  /// page slot owns the highlight); an entry with a custom
+  /// [PaneItemEntry.onTap] (the AI Translation entry) owns it while the
+  /// screen it pushed is on top, with the page slot staying put underneath.
+  PaneItemEntry? _selectedEntry;
+
+  /// Whether [entry] (rendered at [renderedIndex] on the calling surface) is
+  /// highlighted: custom-tap entries compare by identity (they never own a
+  /// page slot), regular entries by their position, which matches the slot
+  /// index on every surface that renders them.
+  bool isEntrySelected(PaneItemEntry entry, int renderedIndex) {
+    if (entry.onTap != null) {
+      return identical(_selectedEntry, entry);
+    }
+    return renderedIndex == _currentPage;
+  }
+
+  /// Item tap from any navigation surface (compact sidebar, bottom bar,
+  /// expanded side bar). Entries with a custom [PaneItemEntry.onTap] take
+  /// over routing: the highlight moves to them and they push their own
+  /// screen; everything else switches the page slot at [index].
+  void handleItemTap(int index, PaneItemEntry entry) {
+    final action = entry.onTap;
+    if (action == null) {
+      updatePage(index);
+      return;
+    }
+    if (!identical(_selectedEntry, entry)) {
+      setState(() => _selectedEntry = entry);
+    }
+    action();
+  }
+
+  /// Hands the selection highlight back to the current page slot after a
+  /// custom-tap entry's pushed screen was popped (or replaced).
+  void restoreSelection() {
+    if (_selectedEntry == null) return;
+    setState(() => _selectedEntry = null);
+  }
+
   int get currentPage => _currentPage;
 
   set currentPage(int value) {
@@ -115,11 +167,17 @@ class NaviPaneState extends State<NaviPane>
     if (widget.observer.routes.length > 1) {
       widget.navigatorKey.currentState!.popUntil((route) => route.isFirst);
     }
-    if (currentPage == index) {
+    // Any custom-tap highlight (AI Translation) ends as soon as a page slot
+    // switches; its pushed screen was just popped by popUntil above.
+    final wasCustom = _selectedEntry != null;
+    if (currentPage == index && !wasCustom) {
       return;
     }
     setState(() {
       currentPage = index;
+      if (wasCustom) {
+        _selectedEntry = null;
+      }
     });
     mainViewUpdateHandler?.call();
   }
@@ -315,10 +373,10 @@ class NaviPaneState extends State<NaviPane>
           children: List<Widget>.generate(widget.paneItems.length, (index) {
             return Expanded(
               child: _SingleBottomNaviWidget(
-                enabled: currentPage == index,
+                enabled: isEntrySelected(widget.paneItems[index], index),
                 entry: widget.paneItems[index],
                 onTap: () {
-                  updatePage(index);
+                  handleItemTap(index, widget.paneItems[index]);
                 },
                 key: ValueKey(index),
               ),
@@ -419,11 +477,11 @@ class NaviPaneState extends State<NaviPane>
                   ...List<Widget>.generate(
                     widget.paneItems.length,
                     (index) => _SideNaviWidget(
-                      enabled: currentPage == index,
+                      enabled: isEntrySelected(widget.paneItems[index], index),
                       entry: widget.paneItems[index],
                       showTitle: value == 3,
                       onTap: () {
-                        updatePage(index);
+                        handleItemTap(index, widget.paneItems[index]);
                       },
                       key: ValueKey(index),
                     ),

@@ -47,6 +47,24 @@ class _MainPageState extends State<MainPage> {
     super.initState();
   }
 
+  /// [PaneItemEntry.id] of the AI Translation entry below; tests and callers
+  /// use it instead of positions, which shift when entries are inserted.
+  static const aiTranslationEntryId = 'ai-translation';
+
+  /// Pushes the AI-translation management screen without taking a page slot:
+  /// the sidebar entry below keeps the current page in place, the pushed
+  /// screen sits on top, and the highlight moves to the entry itself (see
+  /// [NaviPaneState.handleItemTap]).
+  void _openTranslationModels() {
+    _navigatorKey!.currentContext!
+        .to(() => const TranslationModelsPage())
+        .whenComplete(() {
+      if (mounted) {
+        NaviPane.of(context).restoreSelection();
+      }
+    });
+  }
+
   final _pages = [
     const HomePage(),
     const FavoritesPage(key: PageStorageKey('favorites')),
@@ -82,6 +100,13 @@ class _MainPageState extends State<MainPage> {
           label: 'Categories'.tl,
           icon: Icons.category_outlined,
           activeIcon: Icons.category,
+        ),
+        PaneItemEntry(
+          id: aiTranslationEntryId,
+          label: 'AI Translation (experimental)'.tl,
+          icon: Icons.translate,
+          activeIcon: Icons.translate,
+          onTap: _openTranslationModels,
         ),
       ],
       onPageChanged: (i) {
