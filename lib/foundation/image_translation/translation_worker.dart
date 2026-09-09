@@ -1410,6 +1410,33 @@ List<String> loadCharset(String dictPath, {int? expectedClasses}) {
   return charset;
 }
 
+/// One cluster's contribution to [OcrPageFunnel.recLinesDropped], tallied once.
+///
+/// The 8 px recognition floor is applied per *line*, inside a cluster that can
+/// be attempted twice: Pass A by its preferred engine, then Pass B by the
+/// fallback engine when Pass A's text came back implausible (auto source
+/// language). `executeMultiEngineBatch` runs both passes through the same code,
+/// so a cluster rejected by Pass A reached the tally again in Pass B and the
+/// same sub-8-px lines were counted twice — the funnel promises "each is
+/// counted once, per page", and a doubled number reads as twice the real loss.
+///
+/// [alreadyTallied] is the cluster's own flag, carried across both passes; the
+/// caller stores the returned `tallied` back on the cluster. Returns
+/// `(count, tallied)` where `count` is what to add this time: `lostLines` on
+/// the first pass that sees any, `0` on every later pass, and `false`/`0` for a
+/// cluster that lost nothing (so nothing is ever written to the funnel).
+///
+/// Extracted as a pure function for one reason: the double-count lives in
+/// control flow two GPU calls deep, which no test can drive (R3 — no isolate,
+/// no ONNX session, no GPU). Here the invariant itself is testable.
+({int count, bool tallied}) tallyClusterLineLoss({
+  required bool alreadyTallied,
+  required int lostLines,
+}) {
+  if (lostLines <= 0 || alreadyTallied) return (count: 0, tallied: alreadyTallied);
+  return (count: lostLines, tallied: true);
+}
+
 class _ClusterWork {
   _ClusterWork({
     this.pageIndex = 0,
@@ -1451,6 +1478,15 @@ class _ClusterWork {
   // rejected twice is tallied once, under its final reason — not once per
   // pass, which is what a call-site counter would have done.
   OcrReject? reject;
+
+  /// Set the first time this cluster's sub-8-px lines were tallied into
+  /// [OcrPageFunnel.recLinesDropped], and never cleared. Pass B re-enters the
+  /// same code for a cluster Pass A already saw, so without this flag the same
+  /// lost lines were added twice (S2). Like [reject] it is observability-only:
+  /// nothing routes on it, and the tally it guards is the one the funnel's
+  /// "counted once, per page" promise is about. The decision itself lives in
+  /// [tallyClusterLineLoss] so it is unit-testable without a GPU.
+  bool linesTallied = false;
 }
 
 /// Debug aid for acceptance criterion V9-5: with
@@ -2224,11 +2260,20 @@ class _WorkerState {
             ]..sort((a, b) => a.top.compareTo(b.top));
             final validLines = sortedLines.where((r) => r.width >= 8 && r.height >= 8).toList();
             final lostLines = sortedLines.length - validLines.length;
-            if (lostLines > 0) {
+            // Counted once per cluster, not once per pass: Pass B re-enters
+            // this branch for a cluster Pass A already measured, and the same
+            // sub-8-px lines must not be billed to the page twice (S2). The
+            // flag rides on the work item, which both passes share.
+            final loss = tallyClusterLineLoss(
+              alreadyTallied: t.linesTallied,
+              lostLines: lostLines,
+            );
+            t.linesTallied = loss.tallied;
+            if (loss.count > 0) {
               // Partial loss inside a cluster that survives: the block comes
               // back translated with a line missing. F13.5's "not recognized"
               // reports often mean exactly this, and it was invisible.
-              funnels[t.pageIndex]?.recLinesDropped += lostLines;
+              funnels[t.pageIndex]?.recLinesDropped += loss.count;
             }
             sentToRec[i] = validLines.isNotEmpty;
             for (var l in validLines) {

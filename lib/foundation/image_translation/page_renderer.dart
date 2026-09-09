@@ -2166,10 +2166,20 @@ bool backgroundReadsDark(RgbaImage image, ui.Rect rect) {
   final right = rect.right.round().clamp(left + 1, w).toInt();
   final bottom = rect.bottom.round().clamp(top + 1, image.height).toInt();
   final pixels = image.pixels;
-  if (pixels.length < (bottom * w) * 4) {
-    // The box does not fit the buffer it was measured against: no evidence,
-    // and "no evidence" is the light branch (dark ink, white halo), never the
-    // one that picks up a thick black pen.
+  // The buffer must cover every row the sampling below can read — and that is
+  // NOT just the box: [_blurredLum] averages a ±[kSolidBackgroundProbe] window
+  // around each sample, so a box ending at `bottom` reads through row
+  // `bottom + kSolidBackgroundProbe`, clamped to the image's own last row
+  // (`h - 1`, i.e. row `h` exclusive). `decoded.pixels` can be shorter than the
+  // declared `width * height` — `inpaint.dart`'s `keptBadBuffer` documents that
+  // truncated inputs reach this path — and with the old `bottom * w * 4` bound
+  // a box that did not touch the bottom passed the guard and then read past the
+  // end of the buffer: a RangeError on the main-isolate render path. Requiring
+  // the probe rows up front answers "no evidence" instead, which is the light
+  // branch (dark ink, white halo), never the one that picks up a thick black
+  // pen.
+  if (pixels.length <
+      (math.min(bottom + kSolidBackgroundProbe, image.height) * w) * 4) {
     return false;
   }
 

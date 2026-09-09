@@ -186,10 +186,24 @@ void main() {
         view.recognitionSecondsPerPage! * view.recognitionRatePerMinute!,
         closeTo(60, 1e-9),
       );
-      // Translation row is a warm-up: rate only, and the service time beside
-      // it is the request's own 2000 ms/page.
+      // Translation row: a warm-up rate and nothing else. The sweep owns the
+      // card, and the live fold hides *all three* stage-2 figures then — rate,
+      // sample count and the per-page service time — because mid-sweep no
+      // stage-2 request can be landing and quoting the last chapter's number
+      // beside a recognition row would read as the current speed
+      // (`pre_translation_tasks.dart:1000-1004`; the same rule is pinned by
+      // "a sweep still hides the stage-2 rows: no borrowed numbers" in
+      // test/pre_translation_phase_timing_test.dart:440). This line used to
+      // expect 2000, which contradicted that sibling test: the tracker does
+      // hold 2000 ms/page, but the live fold must not show it here.
+      expect(view.translationRatePerMinute, isNull);
+      expect(view.translationSamples, isNull);
       expect(view.translationSecondsPerPage, isNull);
-      expect(view.translationMsPerPage, 2000);
+      expect(view.translationMsPerPage, isNull);
+      // …and the number is genuinely there to be shown once the sweep ends:
+      // 8000 ms of request time over 4 pages. Asserting the tracker keeps the
+      // null above from being satisfied by a broken measurement.
+      expect(activity.translateRates.msPerPage, 2000);
       // Rendered row: pace and service time both present, reciprocal exact.
       expect(view.commitRatePerMinute, closeTo(8, 1e-9));
       expect(view.commitSecondsPerPage, closeTo(7.5, 1e-9));

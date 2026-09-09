@@ -211,6 +211,58 @@ class PreTranslationTask {
   }
 }
 
+/// One step of the stage-1 sweep's page accounting, as a pure function.
+///
+/// The sweep has two different notions of "this page is done", and collapsing
+/// them was S1: a page whose fetch failed, or whose OCR chunk threw, is
+/// *settled* — the sweep will not visit it again, so the bar's denominator must
+/// move or the job reads as frozen — but it was never *recognized*, and the
+/// figure printed next to the page total is called "recognized X / total".
+/// Crediting a failure there (and, worse, sampling it into [_sweepRate]) makes
+/// "已识别 X/Y" claim pages the OCR never read, and inflates the window's page
+/// count while its wall-clock span stays the same: a rate too high and an ETA
+/// too optimistic. The repository's rule is the one asserted here — unreadable
+/// is N/A, never a fake credit.
+///
+/// [settledPages] / [recognizedPages] are the running totals before this call,
+/// [chunkPages] the pages this chunk settled, [storedPages] the subset whose
+/// `putOcr` succeeded (0 on the throw path and for a fetch failure).
+///
+/// Returned `completedPages` is the bar's page-equivalent (`settled × 0.55`,
+/// the phase weight the sweep has always used) and `recognizedPages` is the raw
+/// count for the "recognized X / total" line. `tallied` reports whether this
+/// call changed either total, so a caller can tell "settled but not recognized"
+/// (advance the bar, say nothing about recognition, sample nothing) from a real
+/// recognition step.
+///
+/// Public and top-level for the same reason `tallyClusterLineLoss` is: the
+/// arithmetic lives two GPU calls deep inside a private sweep and no test can
+/// drive that (R3 — no isolate, no ONNX session, no GPU).
+({
+  int settledPages,
+  int recognizedPages,
+  double completedPages,
+  bool tallied,
+}) sweepPageAccounting({
+  required int settledPages,
+  required int recognizedPages,
+  required int chunkPages,
+  required int storedPages,
+}) {
+  // `storedPages` can never exceed the chunk: the producer counts a stored page
+  // once, inside the chunk's own loop. The clamp is belt-and-braces so a future
+  // caller cannot credit recognition for pages this chunk never carried.
+  final stored = storedPages.clamp(0, chunkPages);
+  final settled = settledPages + (chunkPages > 0 ? chunkPages : 0);
+  final recognized = recognizedPages + stored;
+  return (
+    settledPages: settled,
+    recognizedPages: recognized,
+    completedPages: settled * 0.55,
+    tallied: settled != settledPages || recognized != recognizedPages,
+  );
+}
+
 /// Live view of one in-flight page group.
 ///
 /// Never persisted and never folded into [PreTranslationChapter.done] /
@@ -2192,7 +2244,15 @@ class PreTranslationTaskManager with ChangeNotifier {
         fetch: (idx) => _fetchPageBytes(task, chapter.eid, pageKeys[idx]),
       );
       final pending = <({int index, String cacheKey, Uint8List bytes})>[];
-      var processed = 0;
+      // Two counts on purpose (S1, telemetry honesty). A page can leave the
+      // sweep without having been recognised — its fetch failed, or the chunk
+      // that carried it threw — and the sweep must not call that "recognized".
+      // `settledProcessed` only drives the bar (the denominator keeps moving,
+      // so the job never freezes at 0 %), `recognizedProcessed` is the raw
+      // figure printed as "recognized X / total" and is incremented *only*
+      // where `putOcr` succeeded. "Unreadable is N/A, never a fake credit."
+      var settledProcessed = 0;
+      var recognizedProcessed = 0;
 
       Future<void> runChunk(
         List<({int index, String cacheKey, Uint8List bytes})> chunkData,
@@ -2215,6 +2275,7 @@ class PreTranslationTaskManager with ChangeNotifier {
             sourceLang: sourceLang,
             targetLang: task.config.targetLang,
           );
+          var stored = 0;
           for (var c = 0; c < chunkData.length; c++) {
             if (c < results.length && !results[c].hasError) {
               store.putOcr(
@@ -2222,6 +2283,7 @@ class PreTranslationTaskManager with ChangeNotifier {
                 results[c],
                 fingerprint: ocrFp,
               );
+              stored++;
             }
           }
           recognized = true;
@@ -2229,16 +2291,36 @@ class PreTranslationTaskManager with ChangeNotifier {
           Log.warning('Pre-translation', 'GPU OCR sweep chunk failed: $e\n$s');
         }
         chunkSw.stop();
-        processed += chunkData.length;
-        ocrSlot.completedPages = processed * 0.55;
+        // The chunk is settled either way — it is not retried — so the bar's
+        // denominator always advances. Its *recognition* only advanced by the
+        // pages `putOcr` actually stored, which on the throw path is zero.
+        // [sweepPageAccounting] holds that arithmetic so it can be tested
+        // without a GPU.
+        final step = sweepPageAccounting(
+          settledPages: settledProcessed,
+          recognizedPages: recognizedProcessed,
+          chunkPages: chunkData.length,
+          storedPages: stored,
+        );
+        settledProcessed = step.settledPages;
+        recognizedProcessed = step.recognizedPages;
+        ocrSlot.completedPages = step.completedPages;
         // Raw count for the "recognized X / total" line: the 0.55 weight
         // above is for the bar's page-equivalents and must not leak into a
         // figure that is printed next to a page total.
-        ocrSlot.recognizedPages = processed;
-        activity?.recordOcrPages(
-          chunkData.length,
-          workMs: recognized ? chunkSw.elapsedMilliseconds : null,
-        );
+        ocrSlot.recognizedPages = step.recognizedPages;
+        // A failed chunk is not billed to the sweep's rate either: with
+        // `stored == 0` the producer adds nothing at all, because a zero-page
+        // sample is not a measurement of anything (`_ThroughputTracker.add`
+        // ignores pages <= 0). Only a chunk that really produced recognition
+        // carries its wall time — the same rule the fetch-failure path below
+        // already follows.
+        if (stored > 0) {
+          activity?.recordOcrPages(
+            stored,
+            workMs: recognized ? chunkSw.elapsedMilliseconds : null,
+          );
+        }
         _notifyActivity();
       }
 
@@ -2303,10 +2385,23 @@ class PreTranslationTaskManager with ChangeNotifier {
             'Pre-translation',
             'Fetch failed in OCR sweep (page ${page.index}): $fetchError',
           );
-          processed++;
-          ocrSlot.completedPages = processed * 0.55;
-          ocrSlot.recognizedPages = processed;
-          activity?.recordOcrPages(1);
+          // Settled, not recognized: nothing was read on this page, so it must
+          // not move the "recognized X / total" figure — and, for the same
+          // reason, it must not be billed to the sweep's rate. The old
+          // `recordOcrPages(1)` here credited a fetch failure as a recognized
+          // page with no duration, which inflated the window's numerator while
+          // the wall denominator stayed put: a rate too high, an ETA too
+          // optimistic. The page still settles for the bar above.
+          final step = sweepPageAccounting(
+            settledPages: settledProcessed,
+            recognizedPages: recognizedProcessed,
+            chunkPages: 1,
+            storedPages: 0,
+          );
+          settledProcessed = step.settledPages;
+          recognizedProcessed = step.recognizedPages;
+          ocrSlot.completedPages = step.completedPages;
+          ocrSlot.recognizedPages = step.recognizedPages;
           _notifyActivity();
           continue;
         }

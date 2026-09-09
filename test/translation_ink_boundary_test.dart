@@ -233,9 +233,9 @@ void main() {
         '3', () {
       clearOcrInkTraces();
       final outlined = page(255);
-      paint(outlined, 0, 36, 200, 38, 0);
-      // Five stacked lines, 20 px apart, so each inflated pair overlaps the
-      // next: four facing pairs, i.e. more rejections than the detail cap.
+      // Five stacked lines, 20 px apart. Every consecutive pair is a *facing*
+      // pair: box height 14 and pitch 20 leave a 6 px band between them, so
+      // there are four candidate gaps (not one).
       final five = [
         IntRect(20, 20, 100, 34),
         IntRect(24, 40, 104, 54),
@@ -243,10 +243,22 @@ void main() {
         IntRect(24, 80, 104, 94),
         IntRect(24, 100, 104, 114),
       ];
+      // Each band gets the bubble-outline stroke the probe is built to refuse:
+      // a 2 px dark run with a bright row on both sides, well under the 0.6 ×
+      // 14 = 8 px run ceiling. Painting only one band — which this fixture used
+      // to do — leaves the other three gaps blank, so the probe *allows* those
+      // merges and the trace honestly reports one rejection. The rejection
+      // count is therefore a property of the pixels, and this test pins it by
+      // giving every candidate the stroke.
+      for (var i = 0; i + 1 < five.length; i++) {
+        final gapTop = five[i].bottom;
+        paint(outlined, 0, gapTop + 2, 200, gapTop + 4, 0);
+      }
 
       clusterOcrBoxes(five, 200, 200, pageIndex: 3, image: outlined);
 
       final trace = takeOcrInkTrace(3)!;
+      expect(trace.candidates, 4, reason: 'four facing pairs, four bands');
       expect(trace.rejected, 4);
       expect(trace.details.length, OcrInkTrace.maxDetails);
       expect(trace.line(), contains('more]'));
