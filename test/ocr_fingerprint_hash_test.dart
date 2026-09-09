@@ -133,7 +133,11 @@ void main() {
       // deliberately not used here — nothing exists at it any more, so
       // `missing` is the honest stamp and a test that asked for `unreadable`
       // would be asserting a distinction the filesystem cannot make.
-      final path = Directory('${root.path}/unreadable').createSync().path;
+      // createSync() returns void, so the path must come from the directory
+    // itself; chaining .path onto it is a compile error.
+    final dir = Directory('${root.path}/unreadable');
+    dir.createSync();
+    final path = dir.path;
       expect(detStamp(path), 'det:unreadable');
       expect(detStamp(path), isNot('det:missing'));
       expect(looksLikeHash(hashOf(path)), isFalse);
