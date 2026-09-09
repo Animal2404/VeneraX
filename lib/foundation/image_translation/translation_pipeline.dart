@@ -11,12 +11,87 @@ import 'package:venera/foundation/image_translation/translation_worker.dart';
 import 'package:venera/foundation/log.dart';
 import 'package:venera/utils/opencc.dart';
 
+/// Why a recognized block produced no drawn region.
+///
+/// Both of these used to be a bare `continue`: the block was recognized, the
+/// page looked healthy, and the line was simply not translated — with nothing
+/// in the log to say which of the two silent drops had eaten it (F13.7 named
+/// the counts; this names each block).
+enum BlockDropReason {
+  /// [PageTranslationPipeline.classifyBlocks]: the block's detected
+  /// language equals the target, so it is never sent to the model. An
+  /// `auto`-mode page whose target is `zh` puts every pure-kanji line here,
+  /// because the non-Japanese recognizer reads kanji-only Japanese as `zh`.
+  targetLanguage,
+
+  /// A `zh` block on a `zh-TW` target whose OpenCC conversion was a no-op, so
+  /// there is nothing to draw: `erased` stays empty on purpose.
+  targetUnconverted,
+
+  /// The model answered with an empty string for this block (a dropped id, or
+  /// an empty translation).
+  modelEmpty,
+
+  /// The model echoed the source text back unchanged.
+  modelEchoed,
+}
+
+/// One block that reached the pipeline and left it without a region.
+class BlockDrop {
+  const BlockDrop({
+    required this.index,
+    required this.reason,
+    required this.language,
+    required this.text,
+  });
+
+  /// Position of the block in the list it was dropped from (`pending` for the
+  /// model reasons, the recognized block list for the language reasons) —
+  /// the same index the model's answer was aligned to.
+  final int index;
+
+  final BlockDropReason reason;
+
+  final String language;
+
+  /// The block's text, cut to [kBlockDropPreviewChars] so one line stays one
+  /// line whatever the page holds.
+  final String text;
+
+  Map<String, dynamic> toJson() => {
+    'i': index,
+    'reason': reason.name,
+    'lang': language,
+    'text': text,
+  };
+
+  factory BlockDrop.fromJson(Map<String, dynamic> json) => BlockDrop(
+    index: (json['i'] as num?)?.toInt() ?? 0,
+    reason: BlockDropReason.values.firstWhere(
+      (r) => r.name == json['reason'],
+      orElse: () => BlockDropReason.modelEmpty,
+    ),
+    language: json['lang'] as String? ?? '',
+    text: json['text'] as String? ?? '',
+  );
+}
+
+/// How much of a dropped block's text a log line carries. Long enough to
+/// recognize the line, short enough that a page of drops cannot bury the rest
+/// of the log.
+const int kBlockDropPreviewChars = 24;
+
 /// Result of the analysis stage: render-ready regions plus the language
 /// distribution of ALL translatable blocks (including ones skipped for
 /// already being in the target language) — the service uses the votes to
 /// lock a comic's dominant language.
 class PageAnalysis {
-  PageAnalysis(this.regions, this.languageVotes, [this.newGlossary = const {}]);
+  PageAnalysis(
+    this.regions,
+    this.languageVotes, [
+    this.newGlossary = const {},
+    this.dropped = const [],
+  ]);
 
   final List<TranslatedRegion> regions;
   final Map<String, int> languageVotes;
@@ -24,6 +99,13 @@ class PageAnalysis {
   /// Name/proper-noun translations the model reported for this page, to be
   /// merged into the comic's running glossary for later pages.
   final Map<String, String> newGlossary;
+
+  /// Blocks that were recognized and then dropped without a region, each with
+  /// the reason it was dropped. Empty means "nothing was dropped", not "not
+  /// measured": a page that produced regions and dropped nothing is exactly
+  /// this. Used by the service's `BlockFunnel` line and by the log lines the
+  /// drop sites emit — never for control flow.
+  final List<BlockDrop> dropped;
 }
 
 /// Result of the OCR-only stage ([PageTranslationPipeline.ocrPage]): everything
@@ -32,7 +114,13 @@ class PageAnalysis {
 /// then fold the results back per page. [ready] holds regions that need no LLM
 /// (an already-target-language block converted zh→zh-TW).
 class PageOcr {
-  PageOcr(this.ready, this.pending, this.languageVotes, {this.error});
+  PageOcr(
+    this.ready,
+    this.pending,
+    this.languageVotes, {
+    this.error,
+    this.dropped = const [],
+  });
 
   /// Regions already finalized without translation (e.g. zh→zh-TW conversion).
   final List<TranslatedRegion> ready;
@@ -44,6 +132,16 @@ class PageOcr {
   final Map<String, int> languageVotes;
 
   final String? error;
+
+  /// Blocks the language filter dropped while this page was recognized — see
+  /// [BlockDropReason.targetLanguage] / [BlockDropReason.targetUnconverted].
+  ///
+  /// Carried on the OCR result (not only logged) so a caller that folds a
+  /// batch back per page can still count *why* a block went nowhere. It is
+  /// **not** part of [toJson]: the durable OCR cache is a performance
+  /// artifact, and a page restored from it was never dropped on this run —
+  /// reporting a cached drop as this run's would be a fabricated measurement.
+  final List<BlockDrop> dropped;
 
   bool get hasError => error != null;
 
@@ -91,6 +189,7 @@ class PageTranslationPipeline {
     required String targetLang,
     Map<String, String> glossary = const {},
     PageOcr? existingOcr,
+    String page = '0',
   }) async {
     var ocr = (existingOcr != null && !existingOcr.hasError)
         ? existingOcr
@@ -100,18 +199,30 @@ class PageTranslationPipeline {
             targetLang: targetLang,
           );
     if (ocr.pending.isEmpty) {
-      return PageAnalysis(ocr.ready, ocr.languageVotes, const {});
+      return PageAnalysis(
+        ocr.ready,
+        ocr.languageVotes,
+        const {},
+        ocr.dropped,
+      );
     }
     var result = await LlmTranslator.translateBatch(
       ocr.pending.map((b) => b.text).toList(),
       targetLang,
       glossary: glossary,
     );
-    var regions = [
-      ...ocr.ready,
-      ...regionsFromTranslation(ocr.pending, result.texts),
-    ];
-    return PageAnalysis(regions, ocr.languageVotes, result.glossary);
+    var folded = regionsFromTranslation(
+      ocr.pending,
+      result.texts,
+      page: page,
+    );
+    var regions = [...ocr.ready, ...folded.regions];
+    return PageAnalysis(
+      regions,
+      ocr.languageVotes,
+      result.glossary,
+      [...ocr.dropped, ...folded.dropped],
+    );
   }
 
   /// Whether the OCR isolate already holds its models — see
@@ -140,9 +251,9 @@ class PageTranslationPipeline {
     );
 
     final output = <PageOcr>[];
-    final targetBase = targetLang == 'zh-TW' ? 'zh' : targetLang;
-
+    var pageCounter = 0;
     for (var res in pageResults) {
+      final pageIndex = pageCounter++;
       if (res.error != null) {
         output.add(PageOcr(const [], const [], const {}, error: res.error));
         continue;
@@ -159,23 +270,89 @@ class PageTranslationPipeline {
         continue;
       }
 
-      var ready = <TranslatedRegion>[];
-      var pending = <OcrBlock>[];
-      for (var block in blocks) {
-        if (block.language == targetBase) {
-          if (targetLang == 'zh-TW' && block.language == 'zh') {
-            var converted = OpenCC.simplifiedToTraditional(block.text);
-            if (converted != block.text) {
-              ready.add(_region(block, converted));
-            }
-          }
-          continue;
-        }
-        pending.add(block);
+      final classified = classifyBlocks(blocks, targetLang);
+      for (final drop in classified.dropped) {
+        // Defect B (drop site 1 of 2): this branch used to be a bare
+        // `continue` with no line and no counter, so a line the recognizer
+        // read as the target language — e.g. kanji-only Japanese read as `zh`
+        // on an `auto`→`zh` page — vanished between two log lines that both
+        // looked healthy. The block is still dropped: that is the right call
+        // (there is nothing to translate), and changing it would spend a paid
+        // LLM request on text the user already reads. What changes is that it
+        // is now named. The decision itself lives in [classifyBlocks] so it
+        // can be pinned without a GPU.
+        _logDrop(
+          pageIndex.toString(),
+          drop.index,
+          drop.reason,
+          blocks[drop.index],
+        );
       }
-      output.add(PageOcr(ready, pending, votes));
+      output.add(
+        PageOcr(
+          classified.ready,
+          classified.pending,
+          votes,
+          dropped: classified.dropped,
+        ),
+      );
     }
     return output;
+  }
+
+  /// The language-filter half of [ocrPages], as a pure function: which blocks
+  /// are render-ready, which still await the model, and which are dropped with
+  /// what reason.
+  ///
+  /// Split out so the drop reasons — and above all the fact that this filter
+  /// still *drops* rather than translating — can be asserted in a unit test
+  /// without a GPU, a model file or an image. [ocrPages] calls it with its own
+  /// target base and converts the dropped list to log lines; the classification
+  /// is identical either way, which is what makes the test meaningful.
+  @visibleForTesting
+  static ({
+    List<TranslatedRegion> ready,
+    List<OcrBlock> pending,
+    List<BlockDrop> dropped,
+  })
+  classifyBlocks(List<OcrBlock> blocks, String targetLang) {
+    final targetBase = targetLang == 'zh-TW' ? 'zh' : targetLang;
+    var ready = <TranslatedRegion>[];
+    var pending = <OcrBlock>[];
+    var dropped = <BlockDrop>[];
+    for (var i = 0; i < blocks.length; i++) {
+      final block = blocks[i];
+      if (block.language != targetBase) {
+        pending.add(block);
+        continue;
+      }
+      var reason = BlockDropReason.targetLanguage;
+      if (targetLang == 'zh-TW' && block.language == 'zh') {
+        final converted = OpenCC.simplifiedToTraditional(block.text);
+        if (converted != block.text) {
+          ready.add(_region(block, converted));
+          continue;
+        }
+        reason = BlockDropReason.targetUnconverted;
+      }
+      dropped.add(_drop(i, reason, block));
+    }
+    return (ready: ready, pending: pending, dropped: dropped);
+  }
+
+  /// The one `BlockDrop` log line for a language-filter drop, in the same
+  /// `key=value` shape as the model-drop site below so both are one grep apart.
+  static void _logDrop(
+    String page,
+    int index,
+    BlockDropReason reason,
+    OcrBlock block,
+  ) {
+    Log.info(
+      'Inpaint',
+      'BlockDrop page=$page index=$index reason=${reason.name} '
+      'lang=${block.language} text="${_preview(block.text)}"',
+    );
   }
 
   /// OCR-only stage: decode, recognize, vote on language and apply the
@@ -204,17 +381,56 @@ class PageTranslationPipeline {
   /// Turns [pending] blocks and their aligned [texts] into render-ready
   /// regions, dropping empties and no-ops. [texts] must align with [pending]
   /// (extra entries are ignored, missing ones treated as empty).
-  List<TranslatedRegion> regionsFromTranslation(
+  ///
+  /// Both drops are logged here and returned in the record's `dropped` list —
+  /// see [BlockDropReason.modelEmpty] / [BlockDropReason.modelEchoed]. The
+  /// behaviour is deliberately unchanged: an empty or echoed answer has
+  /// nothing to draw, and re-asking the model would spend another request on
+  /// a block it already declined. What changes is that the drop is a named,
+  /// counted event instead of a `continue` nobody can see.
+  ({List<TranslatedRegion> regions, List<BlockDrop> dropped})
+  regionsFromTranslation(
     List<OcrBlock> pending,
-    List<String> texts,
-  ) {
+    List<String> texts, {
+    String page = '0',
+  }) {
     var regions = <TranslatedRegion>[];
+    var dropped = <BlockDrop>[];
     for (var i = 0; i < pending.length; i++) {
       var text = (i < texts.length ? texts[i] : '').trim();
-      if (text.isEmpty || text == pending[i].text) continue;
+      if (text.isEmpty || text == pending[i].text) {
+        var reason = text.isEmpty
+            ? BlockDropReason.modelEmpty
+            : BlockDropReason.modelEchoed;
+        dropped.add(_drop(i, reason, pending[i]));
+        Log.info(
+          'Inpaint',
+          'BlockDrop page=$page index=$i reason=${reason.name} '
+          'lang=${pending[i].language} '
+          'text="${_preview(pending[i].text)}"',
+        );
+        continue;
+      }
       regions.add(_region(pending[i], text));
     }
-    return regions;
+    return (regions: regions, dropped: dropped);
+  }
+
+  static BlockDrop _drop(int index, BlockDropReason reason, OcrBlock block) =>
+      BlockDrop(
+        index: index,
+        reason: reason,
+        language: block.language,
+        text: _preview(block.text),
+      );
+
+  /// A block's text cut to [kBlockDropPreviewChars], whitespace collapsed so
+  /// one drop is one log line whatever the recognizer returned.
+  static String _preview(String text) {
+    var flat = text.replaceAll(RegExp(r'\s+'), ' ').trim();
+    return flat.length > kBlockDropPreviewChars
+        ? '${flat.substring(0, kBlockDropPreviewChars)}…'
+        : flat;
   }
 
   /// Renders [regions] over the page. Split from [analyzePage] so a page
@@ -228,15 +444,34 @@ class PageTranslationPipeline {
     InpaintMode mode = InpaintMode.smart,
   }) async {
     var image = await _decode(imageBytes);
-    if (mode != InpaintMode.patch && regions.isNotEmpty) {
-      // Defect A: the eraser keeps a per-rectangle account. A rectangle whose
-      // reconstruction could not be completed — or completed by turning bright
-      // artwork near-black — is put back exactly as it was, so what is left on
-      // the page is the original lettering, never a black block. That is a
-      // visible difference from "erased", so it has to be a *logged* one too:
-      // without this line a rolled-back page looks like an eraser that
-      // misfired, and the one person who can tell the two apart is reading the
-      // log over the screenshot.
+    final reason = ledgerReason(mode, regions);
+    if (reason == kLedgerReasonPatch) {
+      // Defect A, branch 1: `patch` never runs the eraser at all — the
+      // original lettering is covered by opaque plates instead of erased. No
+      // ledger was printed, so the most common mode on a slow device produced
+      // a page whose "did the eraser run?" answer was, again, silence. It did
+      // not run: `erased=0` is the honest count, and `reason=` says why.
+      Log.info(
+        'Inpaint',
+        'erasure ledger: ${describeLedger(mode: mode, reason: reason)}',
+      );
+    } else if (reason == kLedgerReasonNoRegions) {
+      // Defect A, branch 2: nothing to erase. This is the "no image to run
+      // on" case that used to read identically to "the eraser never fired" —
+      // and it is the one where a reader must not blame the eraser.
+      Log.info(
+        'Inpaint',
+        'erasure ledger: ${describeLedger(mode: mode, reason: reason)}',
+      );
+    } else {
+      // Defect A, branch 3 (the old one): the eraser keeps a per-rectangle
+      // account. A rectangle whose reconstruction could not be completed — or
+      // completed by turning bright artwork near-black — is put back exactly
+      // as it was, so what is left on the page is the original lettering,
+      // never a black block. That is a visible difference from "erased", so it
+      // has to be a *logged* one too: without this line a rolled-back page
+      // looks like an eraser that misfired, and the one person who can tell
+      // the two apart is reading the log over the screenshot.
       final ledger = TextInpainter.eraseReport(
         image,
         eraseFootprintRects(regions, image.width, image.height),
@@ -251,8 +486,17 @@ class PageTranslationPipeline {
       // two are separable only by these counts; the third is separable from the
       // second only because the count of what it *declined* to do is on the
       // same line. The alarm keeps its own wording below so grepping an old
-      // page still works.
-      Log.info('Inpaint', 'erasure ledger: ${ledger.describeLedger()}');
+      // page still works. `mode=` and `reason=` are appended so this line and
+      // the two branches above are one grep away from each other.
+      final ledgerHead = describeLedger(
+        mode: mode,
+        reason: kLedgerReasonRan,
+        erased: ledger.erased,
+      );
+      Log.info(
+        'Inpaint',
+        'erasure ledger: $ledgerHead ${ledger.describeLedger()}',
+      );
       if (ledger.rolledBack > 0) {
         Log.warning(
           'Inpaint',
@@ -263,6 +507,51 @@ class PageTranslationPipeline {
       }
     }
     return await renderTranslatedPage(imageBytes, image, regions, mode: mode);
+  }
+
+  /// The erasure-ledger line's leading fields: which render mode the page was
+  /// drawn in and whether the eraser ran at all.
+  ///
+  /// [reason] is one of `ran` (the eraser ran, the counts follow),
+  /// `patch` (the mode never calls the eraser), `no-regions` (nothing to
+  /// erase) or `cache-hit` (the page was served from the rendered-image cache
+  /// and never reached [renderPage] — logged by
+  /// [ImageTranslationService.renderStoredPage]). Every one of them prints
+  /// `erased=0` for the reasons where no pixel could have been written, so the
+  /// three states a screenshot cannot tell apart — "never ran", "ran clean",
+  /// "nothing to run on" — are three different lines instead of one absence.
+  @visibleForTesting
+  static String describeLedger({
+    required InpaintMode mode,
+    required String reason,
+    int erased = 0,
+  }) => 'mode=${mode.name} reason=$reason erased=$erased';
+
+  /// `reason=` value for "the eraser ran and its own counts follow".
+  static const String kLedgerReasonRan = 'ran';
+
+  /// `reason=` value for [InpaintMode.patch]: the mode never calls the eraser.
+  static const String kLedgerReasonPatch = 'patch';
+
+  /// `reason=` value for "there was nothing to erase on this page".
+  static const String kLedgerReasonNoRegions = 'no-regions';
+
+  /// `reason=` value for "the rendered image was already cached, so this page
+  /// was never re-rendered" — emitted by the service, not by [renderPage].
+  static const String kLedgerReasonCacheHit = 'cache-hit';
+
+  /// Which ledger line [renderPage] will print, as a pure function of the mode
+  /// and the region list.
+  ///
+  /// Split out so the three branches — and the fact that the choice does not
+  /// depend on anything else — can be asserted without decoding an image or
+  /// running the eraser. [renderPage] uses exactly this, so a test over it is a
+  /// test over the branch the page actually takes.
+  @visibleForTesting
+  static String ledgerReason(InpaintMode mode, List<TranslatedRegion> regions) {
+    if (mode == InpaintMode.patch) return kLedgerReasonPatch;
+    if (regions.isEmpty) return kLedgerReasonNoRegions;
+    return kLedgerReasonRan;
   }
 
   /// Defect B: the per-line erase footprints, grown by a bounded margin.
@@ -302,7 +591,7 @@ class PageTranslationPipeline {
     return out;
   }
 
-  TranslatedRegion _region(OcrBlock block, String text) {
+  static TranslatedRegion _region(OcrBlock block, String text) {
     return TranslatedRegion(
       rect: block.rect,
       eraseRect: block.eraseRect,

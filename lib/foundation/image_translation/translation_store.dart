@@ -456,7 +456,26 @@ class TranslationStore with ChangeNotifier {
     }
   }
 
+  /// How many `hasOcr` probes have failed because the database threw — a
+  /// broken/foreign table, a corrupted file, a closed handle. Monotonic for
+  /// the process.
+  int _ocrProbeFailures = 0;
+
+  /// Exposed so the diagnostics page (and a test) can tell "the probe keeps
+  /// failing" apart from "the cache is genuinely empty".
+  int get ocrProbeFailures => _ocrProbeFailures;
+
   /// Whether an OCR result produced by **this** model set exists for [cacheKey].
+  ///
+  /// Returns `false` both when no row matches and when the query itself threw,
+  /// because the caller's next move is the same either way: recognize the page.
+  /// The two are **not** the same fact, though, and they used to be
+  /// indistinguishable — the sibling [getOcr] logs its failure while this probe
+  /// swallowed it, so a database that could never answer looked exactly like a
+  /// page that was simply never recognized, and the GPU ran again on every
+  /// read with nothing in the log to say why. Now the failure is a `Log.error`
+  /// naming the key plus [_ocrProbeFailures], and the genuinely-empty case
+  /// stays quiet: one line, no noise per page.
   bool hasOcr(String cacheKey, {required String fingerprint}) {
     if (!isInitialized) return false;
     try {
@@ -466,7 +485,14 @@ class TranslationStore with ChangeNotifier {
         [cacheKey, fingerprint],
       );
       return rows.isNotEmpty;
-    } catch (_) {
+    } catch (e, s) {
+      _ocrProbeFailures++;
+      Log.error(
+        "TranslationStore",
+        "hasOcr failed (probe #$_ocrProbeFailures): $e — treated as a miss, "
+        "not as an empty cache; cache_key=$cacheKey fingerprint=$fingerprint",
+        s,
+      );
       return false;
     }
   }

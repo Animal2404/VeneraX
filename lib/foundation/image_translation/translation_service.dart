@@ -191,18 +191,24 @@ class GroupPerf {
 /// the two gaps it names are the ones no existing line could name:
 ///
 ///  * `skippedAsTarget` — blocks whose detected language equals the target and
-///    which `translation_pipeline.dart:165-173` therefore drops without a word.
-///    A kanji-only Japanese line read by the non-Japanese recognizer lands here
+///    which `PageTranslationPipeline.classifyBlocks` therefore drops without a
+///    word. A kanji-only Japanese line read by the non-Japanese recognizer
+///    lands here
 ///    (see `_detectLanguage` in the worker), which is one of the two ways a
 ///    fully recognized line can end up untranslated on a page whose funnel
 ///    looks healthy.
 ///  * `modelDropped` — blocks the model answered with an empty string or with
-///    the source text unchanged, dropped by `translation_pipeline.dart:213-214`
+///    the source text unchanged, dropped by
+///    `PageTranslationPipeline.regionsFromTranslation`
 ///    (`text.isEmpty || text == pending[i].text`) — the other way.
 ///
 /// `null` means "not measurable on this path" and prints `?`, never 0: the
 /// reader's per-page path cannot see the pending split without re-running the
 /// pipeline's own composition, so it reports only `votes` and `regions`.
+///
+/// [skippedAsTarget] is optional: when a caller has the pipeline's own drop
+/// list it can pass the real count instead of the `votes - pending - ready`
+/// recovery, and when it has neither the field prints `?`.
 String blockFunnelLine({
   required String page,
   required int? votes,
@@ -212,10 +218,11 @@ String blockFunnelLine({
   required int? llmOut,
   required int regions,
   required int? modelDropped,
+  int? skippedAsTarget,
 }) {
   String show(int? value) => value == null ? '?' : '$value';
-  int? skipped;
-  if (votes != null && pending != null && ready != null) {
+  int? skipped = skippedAsTarget;
+  if (skipped == null && votes != null && pending != null && ready != null) {
     skipped = math.max(0, votes - pending - ready);
   }
   return 'BlockFunnel page=$page votes=${show(votes)} '
@@ -224,6 +231,13 @@ String blockFunnelLine({
       'llm_out=${show(llmOut)} regions=$regions '
       'modelDropped=${show(modelDropped)}';
 }
+
+/// Whether [reason] is the model declining a block (rather than the language
+/// filter never sending it). Shared by the reader path's `BlockFunnel` split
+/// so the two counts stay complementary.
+bool _isModelDrop(BlockDropReason reason) =>
+    reason == BlockDropReason.modelEmpty ||
+    reason == BlockDropReason.modelEchoed;
 
 class _TranslationTask {
   _TranslationTask(
@@ -626,6 +640,20 @@ class ImageTranslationService with ChangeNotifier {
     var renderKey = renderedKey(cacheKey, mode);
     var cached = await CacheManager().findCache(renderKey);
     if (cached != null) {
+      // Defect A, branch 3 of the erasure ledger: this page never reached
+      // `renderPage`, so the pipeline printed no ledger line at all — and on a
+      // re-read of an already-translated chapter that is *every* page. Without
+      // this line the most common page in the app is the one whose ledger is
+      // missing, and "no ledger" again reads as "the eraser misfired". It did
+      // not run: the pixels were served from cache, and `reason=cache-hit`
+      // says so in the same shape the pipeline's three branches use. The
+      // literal is kept in step with
+      // `PageTranslationPipeline.kLedgerReasonCacheHit` by a test rather than
+      // imported, because that member is `@visibleForTesting`.
+      Log.info(
+        'Inpaint',
+        'erasure ledger: mode=${mode.name} reason=cache-hit erased=0',
+      );
       _completed.add(renderKey);
       return await cached.readAsBytes();
     }
@@ -755,16 +783,19 @@ class ImageTranslationService with ChangeNotifier {
         targetLang: config.targetLang,
         glossary: _glossaryFor(comicKey),
         existingOcr: cached.ocr,
+        page: cacheKey,
       );
       _updateLanguageLock(comicKey, analysis.languageVotes, config);
       _mergeGlossary(comicKey, analysis.newGlossary);
       regions = analysis.regions;
-      // F13.7: the reader path can see the language votes and the regions but
-      // not the pending split (that lives inside `analyzePage`), so it reports
-      // the pair it has and prints `?` for the rest rather than a fake 0.
-      // `votes - regions` is the count of recognized blocks that produced no
-      // drawn region on this page — the number that says "text was recognized
-      // and then went nowhere".
+      // F13.7: the reader path can see the language votes, the regions and —
+      // since the pipeline reports them — the blocks it dropped. The pending
+      // split still lives inside `analyzePage`, so those two fields stay `?`
+      // rather than a fake 0; `skippedAsTarget` and `modelDropped` are now
+      // real counts of the two silent drops (an OCR row restored from the
+      // durable cache reports neither, because it was not dropped on this
+      // run). `votes - regions` remains the count of recognized blocks that
+      // produced no drawn region.
       var votesTotal = analysis.languageVotes.values.fold<int>(
         0,
         (a, b) => a + b,
@@ -779,7 +810,16 @@ class ImageTranslationService with ChangeNotifier {
           llmIn: null,
           llmOut: null,
           regions: regions.length,
-          modelDropped: null,
+          modelDropped: cached.fromCache
+              ? null
+              : analysis.dropped
+                    .where((d) => _isModelDrop(d.reason))
+                    .length,
+          skippedAsTarget: cached.fromCache
+              ? null
+              : analysis.dropped
+                    .where((d) => !_isModelDrop(d.reason))
+                    .length,
         ),
       );
       TranslationStore().put(cacheKey, regions, chapter: chapter);
@@ -1070,31 +1110,26 @@ class ImageTranslationService with ChangeNotifier {
               sliceAt[i].clamp(0, translated.length),
               (sliceAt[i] + po.pending.length).clamp(0, translated.length),
             );
-      var regions = [
-        ...po.ready,
-        ...pipeline.regionsFromTranslation(po.pending, slice),
-      ];
+      var folded = pipeline.regionsFromTranslation(
+        po.pending,
+        slice,
+        page: '$i',
+      );
+      var regions = [...po.ready, ...folded.regions];
       regionsOf[i] = regions;
-      // F13.7: name the two silent drops of the pipeline stage from the
-      // service's own view of the data. `modelDropped` mirrors
-      // `translation_pipeline.dart:213-214` exactly (`text.isEmpty ||
-      // text == pending[i].text`); `skippedAsTarget` is the target-language
-      // filter at `translation_pipeline.dart:165-173`, recovered as
-      // `votes - pending - ready` because `votes` is counted over the blocks
-      // that survived `_isTranslatable` and `pending`/`ready` over the ones
-      // that survived the language filter. Nothing here is used for control
-      // flow.
+      // F13.7: name the two silent drops of the pipeline stage from the data
+      // the pipeline itself returned. `modelDropped` counts only the model's
+      // own declines (`regionsFromTranslation`'s `text.isEmpty || text ==
+      // pending[i].text`) — the same predicate the reader path uses, so the
+      // two paths cannot disagree; the language-filter drops ride in
+      // `po.dropped` and are counted as `skippedAsTarget`. Nothing here is
+      // used for control flow.
       if (po.pending.isNotEmpty || po.ready.isNotEmpty) {
-        var llmOut = 0;
-        var modelDropped = 0;
-        for (var k = 0; k < po.pending.length; k++) {
-          var out = k < slice.length ? slice[k].trim() : '';
-          if (out.isEmpty || out == po.pending[k].text) {
-            modelDropped++;
-          } else {
-            llmOut++;
-          }
-        }
+        var llmOut = folded.regions.length;
+        var modelDropped = folded.dropped.where(
+          (d) => _isModelDrop(d.reason),
+        ).length;
+        var skippedAsTarget = folded.dropped.length - modelDropped;
         var votesTotal = po.languageVotes.values.fold<int>(0, (a, b) => a + b);
         Log.info(
           'Image Translation',
@@ -1107,6 +1142,7 @@ class ImageTranslationService with ChangeNotifier {
             llmOut: llmOut,
             regions: regions.length,
             modelDropped: modelDropped,
+            skippedAsTarget: skippedAsTarget,
           ),
         );
       }
@@ -1593,14 +1629,48 @@ class ImageTranslationService with ChangeNotifier {
     appdata.writeImplicitData();
   }
 
-  void _notifyDone(_TranslationTask task) {
-    _completed.add(task.cacheKey);
-    for (var listener in task.listeners) {
+  /// How many completion callbacks have thrown. A listener is a UI refresh
+  /// (the reader evicting an image provider); one broken listener must not
+  /// stop the others, and it must not be silent either.
+  int _listenerFailures = 0;
+
+  /// Exposed for the reader's diagnostics; monotonic for the process.
+  int get listenerFailures => _listenerFailures;
+
+  /// Marks [task]'s page done and calls every completion callback it carries.
+  ///
+  /// One listener throwing is swallowed **for that listener only**: the loop
+  /// keeps going, because a page that finished is finished, and the other
+  /// listeners (other reader positions, other providers) still need their
+  /// refresh. What used to be `catch (_) {}` — an invisible failure that made
+  /// a reader stuck on the untranslated image look like a translation that
+  /// never completed — is now a warning naming the page and the listener, plus
+  /// a counter. The semantics are unchanged on purpose: nothing here rethrows,
+  /// retries or stops the loop.
+  ///
+  /// `@visibleForTesting` so a test can drive the loop directly with throwing
+  /// and recording callbacks, instead of standing up a whole translation just
+  /// to reach it through [_process].
+  @visibleForTesting
+  void notifyDoneForTest(String cacheKey, List<VoidCallback> listeners) {
+    _completed.add(cacheKey);
+    for (var i = 0; i < listeners.length; i++) {
       try {
-        listener();
-      } catch (_) {}
+        listeners[i]();
+      } catch (e) {
+        _listenerFailures++;
+        Log.warning(
+          'Image Translation',
+          'Translation listener #$i threw on $cacheKey: $e '
+          '(other listeners still notified)',
+        );
+      }
     }
     notifyListeners();
+  }
+
+  void _notifyDone(_TranslationTask task) {
+    notifyDoneForTest(task.cacheKey, task.listeners);
   }
 
   /// Frees model memory after the reader has been idle for a while.

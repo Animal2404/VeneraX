@@ -59,6 +59,7 @@ class _StubPipeline extends PageTranslationPipeline {
     required String targetLang,
     Map<String, String> glossary = const {},
     PageOcr? existingOcr,
+    String page = '0',
   }) async {
     lastExistingOcr = existingOcr;
     lastSourceLang = sourceLang;
@@ -68,6 +69,7 @@ class _StubPipeline extends PageTranslationPipeline {
       targetLang: targetLang,
       glossary: glossary,
       existingOcr: existingOcr,
+      page: page,
     );
   }
 
