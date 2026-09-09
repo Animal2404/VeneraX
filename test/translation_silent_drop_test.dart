@@ -300,7 +300,11 @@ void main() {
         BlockDropReason.targetUnconverted,
         reason: 'simplified == traditional: nothing to draw',
       );
-      expect(classified.dropped.single.index, 0);
+      // The dropped block is the already-traditional one — the second block
+      // in the list. Index 0 is the block that *did* convert, and it is in
+      // `ready`, not in `dropped`.
+      expect(classified.dropped.single.index, 1);
+      expect(classified.dropped.single.text, '漢字');
     });
 
     test('indices are positions in the recognized list, so a drop can be '

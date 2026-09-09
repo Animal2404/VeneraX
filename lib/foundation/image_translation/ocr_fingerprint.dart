@@ -40,7 +40,8 @@ class OcrInputs {
 
   /// `id@stamp` for each component actually selected, where stamp is the
   /// SHA-256 prefix of the file's content — or the sentinel `missing` /
-  /// `unreadable` when no bytes could be read (see [_stampFile]).
+  /// `unreadable` when no bytes could be read (see [_stampFile]). A sentinel is
+  /// never shaped like a hash, so it cannot collide with a real stamp.
   final List<String> componentStamps;
 
   @override
@@ -119,7 +120,15 @@ const int kStampSamples = 4;
 ///    their own model files, not an attacker shipping one.
 ///
 /// `missing` and `unreadable` are kept as their own sentinels: they are not
-/// hashes and can never collide with one.
+/// hashes and can never collide with one — a stamp is either 16 lowercase hex
+/// digits, or one of those two words.
+///
+/// The two sentinels mean different things and must not be conflated:
+/// `missing` is "nothing exists at this path" (the model is not installed),
+/// `unreadable` is "something is there but its bytes could not be read" — a
+/// transient IO failure, a deleted-under-us file, a path that is not a regular
+/// file at all. A transient failure reported as `missing` would say the user
+/// has no model, and the caller cannot tell that from a first-run install.
 ///
 /// USER-VISIBLE COST: this stamp feeds [ocrFingerprintOf], which is the match
 /// key of the OCR intermediate cache. Changing it at all — including this
@@ -132,10 +141,17 @@ const int kStampSamples = 4;
 /// longer be installed.
 String _stampFile(String path) {
   try {
+    // The two sentinels are decided here, before any read is attempted, and
+    // they are decided from the entity type rather than from "did the read
+    // throw". A path that does not exist is `missing`; a path that exists as
+    // anything other than a regular file (a directory, a device, a link to
+    // nowhere) is `unreadable` — it is present, so "the user has no model" is
+    // the wrong thing to say about it, and hashing it is not possible.
+    final stat = File(path).statSync();
+    if (stat.type == FileSystemEntityType.notFound) return 'missing';
+    if (stat.type != FileSystemEntityType.file) return 'unreadable';
     final file = File(path);
-    if (!file.existsSync()) return 'missing';
-    final length = file.lengthSync();
-    final digest = sha256.convert(_sampleBytes(file, length));
+    final digest = sha256.convert(_sampleBytes(file, stat.size));
     return digest.toString().substring(0, 16);
   } catch (_) {
     return 'unreadable';

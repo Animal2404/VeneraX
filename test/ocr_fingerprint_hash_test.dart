@@ -118,13 +118,22 @@ void main() {
       expect(detStamp('${root.path}/nope.onnx'), 'det:missing');
     });
 
-    test('a path that cannot be read stamps as unreadable, and is not '
-        'confused with missing', () {
+    test('a file deleted after being written stamps as missing, not unreadable '
+        '— nothing is left at the path', () {
       final path = write('gone.onnx', List<int>.filled(16, 7));
       File(path).deleteSync();
-      // Deleted between the existence check and the read: on Windows the
-      // open fails, on POSIX it raises too. Either way it must not read as
-      // "missing", which would mean "the user has no model".
+      expect(detStamp(path), 'det:missing');
+    });
+
+    test('a path that cannot be read stamps as unreadable, and is not '
+        'confused with missing', () {
+      // A directory is the portable "exists, but has no bytes to hash" path:
+      // it is a real entry, and every platform refuses to read it as a file
+      // (Windows denies the open, POSIX raises EISDIR). A *deleted* path is
+      // deliberately not used here — nothing exists at it any more, so
+      // `missing` is the honest stamp and a test that asked for `unreadable`
+      // would be asserting a distinction the filesystem cannot make.
+      final path = Directory('${root.path}/unreadable').createSync().path;
       expect(detStamp(path), 'det:unreadable');
       expect(detStamp(path), isNot('det:missing'));
       expect(looksLikeHash(hashOf(path)), isFalse);
@@ -134,7 +143,10 @@ void main() {
       final real = detStamp(write('real.onnx', List<int>.filled(16, 3)));
       expect(real, isNot('det:missing'));
       expect(real, isNot('det:unreadable'));
-      expect(looksLikeHash(real), isTrue);
+      // `real` is the whole stamp ('det:<hash>'); the shape being pinned is
+      // the hash half. Comparing the prefixed string against a bare-hex regex
+      // could never pass, whatever the file contained.
+      expect(looksLikeHash(hashOf(real)), isTrue);
     });
   });
 
