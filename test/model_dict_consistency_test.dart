@@ -181,18 +181,31 @@ void main() {
       }
     });
 
-    test('every published component is listed exactly once', () {
+    test('every listable component is listed exactly once', () {
       final listed = [
         for (final s in ModelSection.values)
           ...TranslationModels.listedComponents(s),
       ].map((c) => c.id).toList();
-      final published = TranslationModels.all
-          .where((c) => c.enabled)
+      // The right-hand side is what the list may show, which is NOT the same
+      // as what is published/installable. "Published" already has one pinned
+      // meaning in this repo — the seven `enabled` components, asserted by
+      // local_model_import_test.dart "every published component file carries
+      // an expectedSha256" — and `text_detector_manga` is not one of them: its
+      // `files` list is empty, so it has nothing to download, nothing to
+      // install, and ASSETS.md §2 records it as reserved. It is nevertheless
+      // listed on purpose, as a "Coming soon" placeholder (the case below, and
+      // `isUnpublishedAsset` keys off `files.isNotEmpty`). Comparing the union
+      // of the three sections against `enabled` alone therefore demanded that
+      // a reserved placeholder be either published or hidden, and made this
+      // equality unsatisfiable; it is stated over listable components instead:
+      // enabled ones plus file-less placeholders.
+      final listable = TranslationModels.all
+          .where((c) => c.enabled || c.files.isEmpty)
           .map((c) => c.id)
           .toList();
       // Hiding the dead rows must not have swallowed a real one, and the
       // three sections must not overlap.
-      expect(listed.toSet(), published.toSet());
+      expect(listed.toSet(), listable.toSet());
       expect(listed.length, listed.toSet().length);
     });
 

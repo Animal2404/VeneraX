@@ -501,11 +501,22 @@ class NaviPaneState extends State<NaviPane>
                             const SizedBox(width: 8),
                             buildAppLogo(),
                             const SizedBox(width: 10),
-                            const Text(
-                              'VeneraX',
-                              style: TextStyle(
-                                fontSize: 22,
-                                fontWeight: FontWeight.w800,
+                            // Flexible + ellipsis: the wordmark is the only
+                            // elastic child of a row that lives inside a fixed
+                            // 224 px side bar. With a wider glyph set (the
+                            // test font, a large textScaler, or a translated
+                            // label) the intrinsic width exceeded the bar and
+                            // the row painted "RenderFlex overflowed by 6.8
+                            // pixels" instead of a readable label.
+                            const Flexible(
+                              child: Text(
+                                'VeneraX',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                  fontSize: 22,
+                                  fontWeight: FontWeight.w800,
+                                ),
                               ),
                             ),
                           ],
@@ -593,19 +604,44 @@ class _SideNaviWidget extends StatelessWidget {
     return InkWell(
       borderRadius: BorderRadius.circular(12),
       onTap: onTap,
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 180),
-        padding: const EdgeInsets.symmetric(horizontal: 12),
-        height: 38,
-        decoration: BoxDecoration(
-          color: enabled ? colorScheme.primaryContainer : null,
-          borderRadius: BorderRadius.circular(12),
+      // The side bar is the navigation surface that stays visible next to a
+      // screen a custom-tap entry pushed, so it has to carry the same
+      // selection semantics the bottom-bar row already does
+      // (`_SingleBottomNaviWidget`). Without `selected`, "which row is the
+      // current one" is a colour only — and the compact surface that would
+      // have answered it is offstage underneath the pushed opaque route.
+      // No `label` here: the visible Text is the label whenever the bar is
+      // expanded, and a second copy would be announced twice.
+      child: Semantics(
+        button: true,
+        selected: enabled,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 180),
+          padding: const EdgeInsets.symmetric(horizontal: 12),
+          height: 38,
+          decoration: BoxDecoration(
+            color: enabled ? colorScheme.primaryContainer : null,
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: showTitle
+              ? Row(
+                  children: [
+                    icon,
+                    const SizedBox(width: 12),
+                    // Same reason as the wordmark above: a long localized
+                    // label ("AI Translation (experimental)") must ellipsize
+                    // inside the 224 px bar instead of overflowing it.
+                    Flexible(
+                      child: Text(
+                        entry.label,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                  ],
+                )
+              : Align(alignment: Alignment.centerLeft, child: icon),
         ),
-        child: showTitle
-            ? Row(
-                children: [icon, const SizedBox(width: 12), Text(entry.label)],
-              )
-            : Align(alignment: Alignment.centerLeft, child: icon),
       ),
     ).paddingVertical(4);
   }
@@ -634,7 +670,19 @@ class _PaneActionWidget extends StatelessWidget {
         height: 38,
         child: showTitle
             ? Row(
-                children: [icon, const SizedBox(width: 12), Text(entry.label)],
+                children: [
+                  icon,
+                  const SizedBox(width: 12),
+                  // Elastic like the nav rows: a long action label must not
+                  // overflow the fixed-width side bar.
+                  Flexible(
+                    child: Text(
+                      entry.label,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ],
               )
             : Align(alignment: Alignment.centerLeft, child: icon),
       ),

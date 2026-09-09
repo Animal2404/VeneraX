@@ -595,12 +595,18 @@ class _ThroughputTracker {
       measuredPagesPerMinute: measured,
       msPerPage: _msPerPage,
       // Wall-clock seconds per page at the rate printed beside it — the exact
-      // reciprocal, so the two figures can never contradict each other. Null
-      // while the shown rate is the measured warm-up one: there the reciprocal
-      // *is* [msPerPage], and printing one number twice under two names is
-      // noise, not evidence.
+      // reciprocal (60 s / (pages per minute)), so the two figures can never
+      // contradict each other. Null while the shown rate is the measured
+      // warm-up one: there the reciprocal *is* [msPerPage], and printing one
+      // number twice under two names is noise, not evidence.
+      //
+      // Seconds, not milliseconds: the row renders this through
+      // `formatSecondsPerPage` under the `@s s/page throughput` key (whose
+      // zh_CN text is `吞吐 @s 秒/页`). The old `60000 / stable` was the
+      // millisecond form, so a 32 pages/min row printed `1875.0 s/page`
+      // beside `32.0 页/分` — the same measurement told in the wrong unit.
       throughputSecondsPerPage:
-          stable != null && stable > 0 ? 60000 / stable : null,
+          stable != null && stable > 0 ? 60 / stable : null,
       // The count has to back the number it is printed next to: a wall-clock
       // window is made of every sample in it, a measured warm-up rate only of
       // the samples that carried a duration. Claiming "3 samples" behind a
