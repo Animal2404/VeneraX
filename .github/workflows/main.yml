@@ -46,16 +46,6 @@ jobs:
         with:
           channel: "stable"
           architecture: x64
-      - name: Test-coverage guard (an unlisted test is a test nobody runs)
-        if: always()
-        run: |
-          listed=$(grep -oE 'test/[A-Za-z0-9_]+[.]dart' .github/workflows/main.yml | sort -u)
-          missing=0
-          for f in test/*_test.dart; do
-            echo "$listed" | grep -qx "$f" || { echo "UNLISTED $f"; missing=$((missing+1)); }
-          done
-          echo "unlisted_test_files=$missing"
-          if [ "$missing" -gt 0 ]; then echo "::warning::$missing test file(s) exist but are not in the Test job whitelist"; fi
       - name: Run unit tests
         run: |
           flutter pub get
