@@ -2269,13 +2269,17 @@ class PreTranslationTaskManager with ChangeNotifier {
         // sweep's ms/page — the fetch-failure path below already credits pages
         // without a duration for exactly this reason, and the two must agree.
         var recognized = false;
+        // Declared outside the try on purpose: the accounting below runs
+        // whether the chunk succeeded or threw, and a `stored` scoped to the
+        // try block does not exist there (this compiled as a getter lookup on
+        // the class and failed the whole suite for 109 cases).
+        var stored = 0;
         try {
           final results = await pipeline.ocrPages(
             chunkData.map((e) => e.bytes).toList(),
             sourceLang: sourceLang,
             targetLang: task.config.targetLang,
           );
-          var stored = 0;
           for (var c = 0; c < chunkData.length; c++) {
             if (c < results.length && !results[c].hasError) {
               store.putOcr(
