@@ -258,8 +258,16 @@ class FileDownloader {
       }
       block.downloading = true;
       var task = _fetchBlock(block);
-      task.then((value) => tasks.remove(task), onError: (e) {
-        if(_canceled) return;
+      // Block body, not `=> tasks.remove(task)`: the arrow form returns bool,
+      // which infers `then`'s R as bool and then demands a value from the bare
+      // `return;` in onError ("The return value is missing after 'return'", the
+      // one analyzer error keeping the analyze workflow red). Dropping the value
+      // restores R = void and changes nothing at runtime — the result was never
+      // read.
+      task.then((value) {
+        tasks.remove(task);
+      }, onError: (e) {
+        if (_canceled) return;
         throw e;
       });
       tasks.add(task);
