@@ -381,6 +381,25 @@ class Placement {
     layoutGroup: group,
   );
 
+  /// The same placement decided for a different box (defect B's collision
+  /// pass). Only the box, the size that box pays for and — when the new box
+  /// cannot hold the text at all — the decision move; orientation, stroke
+  /// weight and group membership are the block's own and stay put.
+  Placement boxed(
+    ui.Rect newBox,
+    double newSize,
+    OverflowDecision newDecision,
+  ) => Placement(
+    index: index,
+    box: newBox,
+    size: newSize,
+    vertical: vertical,
+    decision: newDecision,
+    skips: skips,
+    sourceStrokeRatio: sourceStrokeRatio,
+    layoutGroup: layoutGroup,
+  );
+
   /// A degenerate region (tiny box, empty text): never entered layout, so it
   /// is not an overflow either — and never painted.
   Placement.of(this.index, TranslatedRegion region)
@@ -672,11 +691,25 @@ List<Placement> planRegions(
       ),
     );
   }
-  if (!normalizeGroups) return placements;
-  // S5: the per-block decisions are made; sizes within a shared bubble are not
-  // yet agreed. Harmonisation only ever *shrinks* (to a size every member was
-  // itself measured to fit), so no decision can be invalidated by it.
-  return unifyPlacementGroups(placements, regions, outlined: outlined);
+  // Defect B: the per-block decisions are made, and every one of them was
+  // taken against its *own* box. Two blocks that each fit themselves can still
+  // cover the same pixels — the merge only folds a pair up when the overlap is
+  // big enough to be one detection twice, and safeGrowRect is a growth rule,
+  // so it never runs on a block that already fitted. This is where the page
+  // gets checked as a whole.
+  final resolved = resolvePlacementOverlaps(
+    placements: placements,
+    regions: regions,
+    page: page,
+    outlined: outlined,
+  );
+  if (!normalizeGroups) return resolved;
+  // S5: the per-block decisions are made and the boxes no longer overlap; the
+  // sizes within a shared bubble are not yet agreed. Harmonisation only ever
+  // *shrinks* (to a size every member was itself measured to fit, against the
+  // box this pass settled on), so no decision can be invalidated by it and no
+  // ink can grow back into a neighbour.
+  return unifyPlacementGroups(resolved, regions, outlined: outlined);
 }
 
 ui.Rect _obstacleOf(
@@ -706,6 +739,326 @@ double _patchPlateCoverage(ui.Rect rect) {
   final minSide = math.min(rect.width, rect.height);
   return math.max(3.0, minSide * 0.14);
 }
+
+// ---------------------------------------------------------------------------
+// Defect B: two blocks of lettering must never cover one pixel area
+// ---------------------------------------------------------------------------
+
+/// Pull colliding *placements* apart, after the merge could not.
+///
+/// [resolveRegionCollisions] folds two regions into one only when they really
+/// are the same detection twice (overlap ≥ [kMergeOverlapCov], or ≥
+/// [kMergeDuplicateCov] with identical text). Two separate bubbles whose
+/// detected boxes overlap by, say, a fifth of the smaller one sit below that
+/// gate — and [safeGrowRect], which *does* treat neighbours as obstacles,
+/// never runs on them: it is only consulted once a block has bottomed out in
+/// the shrink search and wants to grow (see [decideOverflow]). A block that
+/// fits its own box paints it as it arrived, so on a grey-zone pair both
+/// blocks lay their centred paragraph into the shared band and the reader sees
+/// two sentences woven through each other. The grow path is safe; **the base
+/// path was unchecked**, and that is what this pass closes.
+///
+/// It resolves a collision in the order of what the reader can least afford:
+///
+/// 1. **give the borrowed gutter back** — the block that grew pulls its inner
+///    edge off the neighbour's box, stopping at its own detected box plus erase
+///    footprint. Only the borrower is asked, because only the borrower has
+///    anything to give, and a cut can only ever *shrink* a box: it cannot
+///    create a collision somewhere else on the page.
+/// 2. **step aside along the cut axis** — only as far as the block's own
+///    [safeGrowRect] envelope already permits (the same 40%-of-the-gutter
+///    budget, never more), and only if the destination is clear of every other
+///    block and wholly on the artwork. This is the one move that can put ink
+///    somewhere new, so it is gated by the envelope the rest of the layout
+///    already trusts.
+/// 3. **share the band** — when the two floors genuinely overlap, both are cut
+///    to the middle line. Neither moves; every pixel of the page is now
+///    claimed by at most one block.
+///
+/// Then every box that was touched is **re-measured**, not re-guessed: if its
+/// text no longer fits at a legible size, the block goes the way [S1] sends
+/// anything that cannot be placed — `keepOriginal`, drawn as nothing at all.
+/// No text is ever clipped (the reality gate in [planRegions] and the
+/// `clipRect` in [_placeText] both still hold), nothing is pushed off the page,
+/// and no block is moved onto another's ink.
+///
+/// Returns a new list when anything changed; otherwise the same list object,
+/// so a collision-free page is provably untouched by this pass.
+@visibleForTesting
+List<Placement> resolvePlacementOverlaps({
+  required List<Placement> placements,
+  required List<TranslatedRegion> regions,
+  required ui.Size page,
+  bool outlined = true,
+}) {
+  final n = placements.length;
+  if (n < 2) return placements;
+
+  final boxes = [for (final p in placements) p.box];
+  final sizes = [for (final p in placements) p.size];
+  final decisions = [for (final p in placements) p.decision];
+  final touched = <int>{};
+  var cuts = 0, pushes = 0, shares = 0, drops = 0;
+
+  bool paints(int i) =>
+      !placements[i].skips &&
+      decisions[i] != OverflowDecision.keepOriginal &&
+      !boxes[i].isEmpty;
+
+  TranslatedRegion regionOf(int i) => regions[placements[i].index];
+
+  /// The floor a box may be pulled back to: its detected rect with the erase
+  /// footprint unioned in. Everything outside it was borrowed from the gutter.
+  ui.Rect floorOf(int i) => _rectOf(regionOf(i)).expandToInclude(
+    _eraseBoundsOf(regionOf(i)),
+  );
+
+  /// Move [box]'s inner edge (the one facing [cutAt]) onto the cut line,
+  /// keeping everything on the artwork. Shrinking only ever *removes* area, so
+  /// a cut can never manufacture a collision with a third block.
+  ui.Rect cutTo(
+    ui.Rect box,
+    double cutAt, {
+    required bool alongX,
+    required bool fromLeft,
+  }) {
+    if (!alongX) {
+      return fromLeft
+          ? box.intersect(ui.Rect.fromLTRB(0, 0, page.width, cutAt))
+          : box.intersect(ui.Rect.fromLTRB(0, cutAt, page.width, page.height));
+    }
+    return fromLeft
+        ? box.intersect(ui.Rect.fromLTRB(0, 0, cutAt, page.height))
+        : box.intersect(ui.Rect.fromLTRB(cutAt, 0, page.width, page.height));
+  }
+
+  for (var sweep = 0; sweep < 8 * n; sweep++) {
+    int? first, second;
+    var worst = 0.0;
+    for (var i = 0; i < n; i++) {
+      if (!paints(i)) continue;
+      for (var j = i + 1; j < n; j++) {
+        if (!paints(j)) continue;
+        final inter = boxes[i].intersect(boxes[j]);
+        if (inter.isEmpty) continue;
+        final area = inter.width * inter.height;
+        if (area > worst) {
+          worst = area;
+          first = i;
+          second = j;
+        }
+      }
+    }
+    if (first == null || second == null) break;
+
+    final inter = boxes[first].intersect(boxes[second]);
+    // Cut along the shallower intrusion: it costs the fewer pixels of moved
+    // lettering, and moved lettering is what this pass is trying to avoid.
+    final alongX = inter.width <= inter.height;
+    // Whichever box starts earlier on the cut axis keeps the near side.
+    final leading =
+        alongX
+        ? (boxes[first].left <= boxes[second].left ? first : second)
+        : (boxes[first].top <= boxes[second].top ? first : second);
+    final trailing = leading == first ? second : first;
+    final cutAt = alongX
+        ? inter.left + inter.width / 2
+        : inter.top + inter.height / 2;
+
+    // 1. The box that borrowed gutter gives it back — all the way off the
+    //    neighbour's box, and never past its own floor. Only the borrower moves
+    //    (and only if it really has room), which is the point: a block that was
+    //    never grown has nothing to apologise for. [safeGrowRect] already
+    //    treated the neighbour as an obstacle *while growing*; this is the same
+    //    rule applied afterwards, to the case growth never covered — a pair
+    //    whose boxes overlap on their own, below the merge gate.
+    double innerEdge(int i) => alongX
+        ? (i == leading ? boxes[i].right : boxes[i].left)
+        : (i == leading ? boxes[i].bottom : boxes[i].top);
+    double innerFloor(int i) {
+      final floor = floorOf(i);
+      return (alongX
+              ? (i == leading ? floor.right : floor.left)
+              : (i == leading ? floor.bottom : floor.top))
+          .toDouble();
+    }
+
+    double innerRoom(int i) => (innerEdge(i) - innerFloor(i)).abs();
+
+    double pullTarget(int i) {
+      final facing = alongX
+          ? (i == leading ? boxes[trailing].left : boxes[leading].right)
+          : (i == leading ? boxes[trailing].top : boxes[leading].bottom);
+      return i == leading
+          ? math.max(facing, innerFloor(i))
+          : math.min(facing, innerFloor(i));
+    }
+
+    bool pull(int i, double to) {
+      final box = boxes[i];
+      final next = alongX
+          ? (i == leading
+                ? box.intersect(ui.Rect.fromLTRB(0, 0, to, page.height))
+                : box.intersect(ui.Rect.fromLTRB(to, 0, page.width, page.height)))
+          : (i == leading
+                ? box.intersect(ui.Rect.fromLTRB(0, 0, page.width, to))
+                : box.intersect(ui.Rect.fromLTRB(0, to, page.width, page.height)));
+      if (next == box || next.isEmpty) return false;
+      boxes[i] = next;
+      touched.add(i);
+      cuts++;
+      return true;
+    }
+
+    final giveFirst = innerRoom(leading) >= innerRoom(trailing)
+        ? leading
+        : trailing;
+    final giveSecond = giveFirst == leading ? trailing : leading;
+    pull(giveFirst, pullTarget(giveFirst));
+    if (!boxes[leading].intersect(boxes[trailing]).isEmpty) {
+      pull(giveSecond, pullTarget(giveSecond));
+    }
+    if (!paints(leading) || !paints(trailing)) continue;
+    if (boxes[leading].intersect(boxes[trailing]).isEmpty) continue;
+
+    // 2. One of them may still be able to step aside — inside the very
+    //    envelope the gutter growth would already have allowed it, never
+    //    further, and only into space no other block claims. It is always the
+    //    *trailing* block that moves: pushing it forward keeps the reading
+    //    order the merged blocks were sorted by, and the leading one is the
+    //    one whose bubble the eye reaches first.
+    final need =
+        alongX
+        ? boxes[leading].right - boxes[trailing].left
+        : boxes[leading].bottom - boxes[trailing].top;
+    if (need > 0 &&
+        _pushClears(
+          region: regionOf(trailing),
+          from: boxes[trailing],
+          need: need,
+          alongX: alongX,
+          page: page,
+          boxes: boxes,
+          paints: paints,
+          skip: trailing,
+        )) {
+      boxes[trailing] = boxes[trailing].translate(
+        alongX ? need : 0,
+        alongX ? 0 : need,
+      );
+      touched.add(trailing);
+      pushes++;
+      continue;
+    }
+
+    // 3. The floors themselves overlap: split the band down the middle. Both
+    //    boxes shrink, neither moves, so this cannot disturb a third block and
+    //    cannot leave the artwork.
+    boxes[leading] = cutTo(
+      boxes[leading],
+      cutAt,
+      alongX: alongX,
+      fromLeft: true,
+    );
+    boxes[trailing] = cutTo(
+      boxes[trailing],
+      cutAt,
+      alongX: alongX,
+      fromLeft: false,
+    );
+    touched.add(leading);
+    touched.add(trailing);
+    shares++;
+    if (!boxes[leading].intersect(boxes[trailing]).isEmpty) {
+      // Numerically impossible — the two halves meet on one line. If the
+      // floating point ever says otherwise, stop here rather than spin: the
+      // re-measure below turns a box that cannot hold its text into a block
+      // that keeps the original, which is the safe end state.
+      break;
+    }
+  }
+
+  if (touched.isEmpty) return placements;
+
+  // Re-measure what moved: the box is the budget, and a box that was cut is a
+  // smaller budget. Nothing is painted that has not fitted its own box.
+  for (final i in touched) {
+    if (placements[i].skips) continue;
+    final fit = _fitRegion(
+      regionOf(i),
+      boxes[i],
+      placements[i].vertical,
+      outlined: outlined,
+      sourceStrokeRatio: placements[i].sourceStrokeRatio,
+    );
+    if (fit.fits) {
+      sizes[i] = fit.size;
+      continue;
+    }
+    if (decisions[i] != OverflowDecision.keepOriginal) {
+      decisions[i] = OverflowDecision.keepOriginal;
+      sizes[i] = 0;
+      drops++;
+    }
+  }
+
+  Log.info(
+    'OCR Layout',
+    'collision pass: $cuts side(s) gave back grown gutter, $pushes stepped '
+    'aside, $shares band(s) split — ${touched.length} box(es) re-measured, '
+    '$drops of them now keep the original (nothing is drawn twice)',
+  );
+  return [
+    for (var i = 0; i < n; i++)
+      placements[i].boxed(boxes[i], sizes[i], decisions[i]),
+  ];
+}
+
+/// Whether block [from] can slide [need] px forward along the cut axis and land
+/// inside its own [safeGrowRect] envelope with nothing in the way.
+///
+/// The envelope is the same budget the layout already spends when it grows a
+/// box into the gutter (40% of the clear distance to the nearest obstacle,
+/// clipped to the page), so a step aside can never reach further than a growth
+/// would have been allowed to, can never leave the artwork, and is refused
+/// outright if the destination touches a third block's ink.
+bool _pushClears({
+  required TranslatedRegion region,
+  required ui.Rect from,
+  required double need,
+  required bool alongX,
+  required ui.Size page,
+  required List<ui.Rect> boxes,
+  required bool Function(int) paints,
+  required int skip,
+}) {
+  final shifted = from.translate(alongX ? need : 0, alongX ? 0 : need);
+  if (shifted.width <= 4 || shifted.height <= 4) return false;
+  final envelope = safeGrowRect(
+    rect: _rectOf(region),
+    eraseBounds: _eraseBoundsOf(region),
+    obstacles: [
+      for (var k = 0; k < boxes.length; k++)
+        if (k != skip && paints(k)) boxes[k],
+    ],
+    pageWidth: page.width,
+    pageHeight: page.height,
+  );
+  if (!_envelopes(envelope, shifted)) return false;
+  for (var k = 0; k < boxes.length; k++) {
+    if (k == skip || !paints(k)) continue;
+    if (!shifted.intersect(boxes[k]).isEmpty) return false;
+  }
+  return true;
+}
+
+/// Whether [outer] holds [inner] whole. `Rect.contains` answers for a point,
+/// not a box, so the containment a push needs is spelled out here.
+bool _envelopes(ui.Rect outer, ui.Rect inner) =>
+    inner.left >= outer.left &&
+    inner.top >= outer.top &&
+    inner.right <= outer.right &&
+    inner.bottom <= outer.bottom;
 
 // ---------------------------------------------------------------------------
 // Defect A fix: colliding regions merge into one painting — never two texts
@@ -1515,30 +1868,70 @@ void _drawErasedRegion(
   _placeText(canvas, region, placement, textColor, outline: outline);
 }
 
-/// Mean-luminance test of the region on the (erased) base, choosing the text
-/// colour. Sampled on a stride grid — a full read is needless for a summary.
-bool _regionIsDark(RgbaImage image, ui.Rect rect) {
-  var w = image.width;
-  var left = rect.left.round().clamp(0, w - 1);
-  var top = rect.top.round().clamp(0, image.height - 1);
-  var right = rect.right.round().clamp(1, w);
-  var bottom = rect.bottom.round().clamp(1, image.height);
-  var pixels = image.pixels;
+/// Whether this block's lettering should be light-on-dark.
+///
+/// The old test was a plain mean over the box — and the box is a *grown* box
+/// ([safeGrowRect] borrows gutter on every side). A caption living in a white
+/// bubble whose grown box also caught a strip of night sky, a black panel or a
+/// screentone shadow therefore averaged dark, took the dark branch, and painted
+/// its outline in 90%-opaque black at up to 35% of the glyph size **across
+/// bright artwork**. That halo covers three to five times the area of the ink
+/// it rings and fuses neighbouring glyphs into one mass: it is the black block
+/// the screenshots show. The eraser never wrote it — [TextInpainter] can only
+/// ever copy a pixel that already existed on the page — this line chose the
+/// colour, and a wrong choice of a thick black pen is a drawn black block.
+///
+/// So the question is answered as it is actually asked: which background does
+/// this box *mostly contain*, rather than what does its average come to. A box
+/// that is dark on the mean but bright on the majority is mixed, and a mixed
+/// box goes to the light branch on purpose — dark lettering ringed in white
+/// reads on a black bubble too, while white lettering ringed in black destroys
+/// a bright page. Where the mean and the majority agree, nothing changes.
+bool backgroundReadsDark(RgbaImage image, ui.Rect rect) {
+  final w = image.width;
+  final left = rect.left.round().clamp(0, math.max(0, w - 1)).toInt();
+  final top =
+      rect.top.round().clamp(0, math.max(0, image.height - 1)).toInt();
+  final right = rect.right.round().clamp(left + 1, w).toInt();
+  final bottom = rect.bottom.round().clamp(top + 1, image.height).toInt();
+  final pixels = image.pixels;
+  if (pixels.length < (bottom * w) * 4) {
+    // The box does not fit the buffer it was measured against: no evidence,
+    // and "no evidence" is the light branch (dark ink, white halo), never the
+    // one that picks up a thick black pen.
+    return false;
+  }
 
-  var sum = 0.0;
-  var count = 0;
+  var sum = 0.0, bright = 0, dark = 0, count = 0;
   var stepX = math.max(1, (right - left) ~/ 24);
   var stepY = math.max(1, (bottom - top) ~/ 24);
   for (var y = top; y < bottom; y += stepY) {
     for (var x = left; x < right; x += stepX) {
       var i = (y * w + x) * 4;
-      sum += 0.299 * pixels[i] + 0.587 * pixels[i + 1] + 0.114 * pixels[i + 2];
+      var lum = 0.299 * pixels[i] + 0.587 * pixels[i + 1] + 0.114 * pixels[i + 2];
+      sum += lum;
+      if (lum >= kBrightPixelLum) {
+        bright++;
+      } else if (lum <= kDarkPixelLum) {
+        dark++;
+      }
       count++;
     }
   }
   if (count == 0) return false;
-  return sum / count < 128;
+  return dark > bright && sum / count < 128;
 }
+
+/// The two poles of the majority test. Anything between them is mid-tone
+/// artwork that argues for neither branch, which is why it is counted by
+/// exclusion rather than as a third class.
+const double kBrightPixelLum = 140;
+const double kDarkPixelLum = 90;
+
+/// Mean-luminance test of the region on the (erased) base, choosing the text
+/// colour. Sampled on a stride grid — a full read is needless for a summary.
+bool _regionIsDark(RgbaImage image, ui.Rect rect) =>
+    backgroundReadsDark(image, rect);
 
 /// Paints one already-decided placement.
 ///

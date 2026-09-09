@@ -3,6 +3,7 @@ import 'dart:ffi';
 import 'dart:isolate';
 import 'dart:math' as math;
 
+import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:venera/foundation/app.dart';
 import 'package:venera/foundation/image_translation/hf_tokenizer.dart';
 import 'package:venera/foundation/image_translation/ocr_batching.dart';
@@ -554,31 +555,76 @@ class TranslationWorker {
   ///
   /// Await this from any path whose purpose is "give the memory back": task
   /// finish, cancel, pause-out, reader close, the diagnostics button.
-  Future<void> shutdownAll({
+  ///
+  /// When a lease is held the isolates cannot be killed without pulling them
+  /// out from under whoever is still reading them, so that branch now *awaits*
+  /// each release ack too and reports what came back: `shutdownAll` used to
+  /// answer nothing at all there, which is precisely the case a user cancels a
+  /// job in.
+  Future<PoolTeardown> shutdownAll({
     Duration timeout = const Duration(seconds: 8),
   }) async {
     if (_leases > 0) {
       // Someone is still using these sessions; free what is safe to free and
       // leave the isolates alive rather than pulling them out from under it.
-      release();
-      Log.info('OCR Lifecycle', 'shutdownAll deferred: $_leases lease(s) held');
-      return;
+      final held = _leases;
+      final observed = await Future.wait(
+        [for (final w in List.of(_workers)) w.releaseConfirmed(timeout: timeout)],
+      );
+      _isWarm = false;
+      final teardown = PoolTeardown(
+        workers: _workers.length,
+        sessions: foldSessionObservations(observed),
+        deferred: true,
+        leasesHeld: held,
+      );
+      Log.info(
+        'OCR Lifecycle',
+        'shutdownAll deferred: $held lease(s) held — sessions released, '
+        '${teardown.evidence} (still loaded if a lease re-opens them)',
+      );
+      return teardown;
     }
     final workers = List.of(_workers);
     _workers.clear();
     _isWarm = false;
-    var unconfirmed = 0;
+    final observed = <int?>[];
     for (var w in workers) {
-      if (!await w.shutdown(timeout: timeout)) unconfirmed++;
+      observed.add(await w.shutdown(timeout: timeout));
     }
-    // Report the observed count, never a hard-coded "0" — a log line that
-    // asserts success unconditionally is how D-13 hid the leak.
+    // Report the observed count, never a hard-coded "0" — and never a number
+    // from a *pre-release* report either, which is what `liveSessions=` used to
+    // print from the shared `_lastReport` slot (plan D-13).
+    final teardown = PoolTeardown(
+      workers: workers.length,
+      sessions: foldSessionObservations(observed),
+      deferred: false,
+      leasesHeld: 0,
+    );
+    final unconfirmed = observed.where((s) => s == null).length;
     Log.info(
       'OCR Lifecycle',
-      'shutdownAll: ${workers.length} worker(s), '
-      'liveSessions=${_lastReport?.sessionCount ?? -1}'
+      'shutdownAll: ${workers.length} worker(s), ${teardown.evidence}'
       '${unconfirmed == 0 ? '' : ', unconfirmed=$unconfirmed'}',
     );
+    return teardown;
+  }
+
+  /// Fold per-worker observations into one answer for the pool: the worst
+  /// (highest) count anyone still reports, and `null` the moment a worker
+  /// failed to confirm — an unknown in the pool is an unknown for the page.
+  ///
+  /// An empty list is `0`: no workers existed, so nothing was loaded. That is
+  /// the one `0` here that is a measurement rather than an assumption.
+  @visibleForTesting
+  static int? foldSessionObservations(List<int?> observed) {
+    if (observed.isEmpty) return 0;
+    var worst = 0;
+    for (final s in observed) {
+      if (s == null) return null;
+      if (s > worst) worst = s;
+    }
+    return worst;
   }
 
   /// Kills all worker isolates without releasing them first. Test-only:
@@ -589,6 +635,45 @@ class TranslationWorker {
     }
     _workers.clear();
   }
+}
+
+/// What a teardown actually saw.
+///
+/// [sessions] is the highest post-release session count any worker in the pool
+/// reported, or `null` when at least one worker never confirmed its release —
+/// and `null` prints as `sessions=N/A`, never as `0`. A pool cannot claim the
+/// memory came back on the strength of having asked for it (plan D-13).
+///
+/// [deferred] marks the branch that freed the native sessions but left the
+/// isolates standing, because an [OcrLease] was still held; [leasesHeld] says
+/// how many. While any lease is held the next request re-opens a session
+/// lazily, so a deferred release describes a moment, not a state — which is
+/// why cancelling a job has to drop its own lease before it can mean anything.
+class PoolTeardown {
+  const PoolTeardown({
+    required this.workers,
+    required this.sessions,
+    required this.deferred,
+    required this.leasesHeld,
+  });
+
+  final int workers;
+  final int? sessions;
+  final bool deferred;
+  final int leasesHeld;
+
+  /// Whether the observation is that **nothing** is loaded any more: zero
+  /// sessions confirmed, and no lease left that could load something again.
+  bool get freed => sessions == 0 && leasesHeld == 0;
+
+  /// The clause every lifecycle line ends with: the count, or the admission
+  /// that nobody could read it.
+  String get evidence => 'sessions=${sessions ?? 'N/A'}';
+
+  @override
+  String toString() =>
+      'PoolTeardown(workers=$workers, $evidence, deferred=$deferred, '
+      'leases=$leasesHeld)';
 }
 
 /// Handle returned by [TranslationWorker.acquireLease]; call [release] exactly
@@ -652,6 +737,10 @@ class _IsolateWorker {
         if (message.report != null) {
           TranslationWorker.instance._lastReport = message.report;
         }
+        // Recorded on the worker that acked, not on a pool-wide slot: this is
+        // the only number that can honestly answer "how many sessions does
+        // *this* isolate still hold".
+        _lastReleaseSessions = message.report?.sessionCount;
         final ack = _releaseAck;
         _releaseAck = null;
         if (ack != null && !ack.isCompleted) ack.complete();
@@ -768,6 +857,51 @@ class _IsolateWorker {
 
   Completer<void>? _releaseAck;
 
+  /// Session count as reported by the most recent **release ack**, or `null`
+  /// when no release has been confirmed since the last one was asked for.
+  ///
+  /// Per worker, deliberately: [TranslationWorker]'s single `_lastReport` slot
+  /// is shared by the whole pool, so whichever isolate acked last answered for
+  /// all of them — a two-worker pool where one acked clean and one never
+  /// answered reported the clean one. That is the "0 冒充" shape this field
+  /// exists to rule out.
+  int? _lastReleaseSessions;
+
+  /// Free this isolate's native sessions and **wait for it to say it did**.
+  ///
+  /// Answers the number of sessions still open afterwards (`0` on a clean
+  /// hand-back), or `null` when nothing could be observed: no ack in time, or
+  /// an isolate that is still spawning and so could not be reached. `null` is
+  /// not `0`, and the difference is the point — a teardown line that prints
+  /// `sessions=0` on the strength of "we asked" is how D-13 hid a leak for as
+  /// long as it did.
+  Future<int?> releaseConfirmed({
+    Duration timeout = const Duration(seconds: 8),
+  }) async {
+    final port = _sendPort;
+    if (port == null) {
+      // No isolate behind the worker: nothing was ever loaded, so nothing is
+      // held. An isolate that is *still starting* has no send port either, and
+      // what it is about to load is unknown — that answers `null`, not `0`.
+      return _isolate == null ? 0 : null;
+    }
+    _lastReleaseSessions = null;
+    final ack = Completer<void>();
+    _releaseAck = ack;
+    port.send(const _ReleaseRequest());
+    try {
+      await ack.future.timeout(timeout);
+    } catch (_) {
+      // release-ack-timeout: the only place allowed to go on without an ack.
+      Log.error(
+        'OCR Lifecycle',
+        'release ack timeout: live sessions unobserved (VRAM may stay pinned)',
+      );
+      return null;
+    }
+    return _lastReleaseSessions;
+  }
+
   /// Frees the native sessions inside the isolate, waits for its ack, and only
   /// then kills it.
   ///
@@ -777,32 +911,18 @@ class _IsolateWorker {
   /// first therefore does not "release memory early", it makes the memory
   /// permanently unreclaimable (plan D-1).
   ///
-  /// Returns `false` when the ack never arrived; the isolate is killed anyway
-  /// so a wedged worker cannot hang shutdown, but the caller learns the
-  /// release was not confirmed.
-  Future<bool> shutdown({Duration timeout = const Duration(seconds: 8)}) async {
-    var port = _sendPort;
-    if (port == null) {
+  /// Returns the isolate's post-release session count, or `null` when the ack
+  /// never arrived; the isolate is killed either way so a wedged worker cannot
+  /// hang shutdown, but the caller learns the release was not confirmed.
+  Future<int?> shutdown({Duration timeout = const Duration(seconds: 8)}) async {
+    if (_sendPort == null) {
       killNow();
-      return true;
+      return 0;
     }
-    final ack = Completer<void>();
-    _releaseAck = ack;
-    port.send(const _ReleaseRequest());
-    var confirmed = true;
-    try {
-      await ack.future.timeout(timeout);
-    } catch (_) {
-      confirmed = false;
-      // release-ack-timeout: the only place allowed to kill without an ack.
-      Log.error(
-        'OCR Lifecycle',
-        'release ack timeout, force kill (VRAM may stay pinned)',
-      );
-    }
+    final sessions = await releaseConfirmed(timeout: timeout);
     _releaseAck = null;
     killNow();
-    return confirmed;
+    return sessions;
   }
 
   /// Kills the isolate without giving it a chance to release anything.

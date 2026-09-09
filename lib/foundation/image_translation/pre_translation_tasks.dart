@@ -882,6 +882,24 @@ class PreTranslationTaskManager with ChangeNotifier {
     if (!_runningIds.contains(id)) {
       _canceledIds.remove(id);
     }
+    // Defect C. Cancelling is an explicit statement of intent, and until now
+    // the teardown it asked for could not happen: this job's own [OcrLease]
+    // was still in [_ocrLeases] (the loop releases it only in its `finally`),
+    // so `shutdownAll()` below always took its "a lease is held" branch — free
+    // the sessions, keep the isolates, return without ever observing whether
+    // the memory came back. Then the loop's remaining pages asked the worker
+    // for one more recognition, which re-opened every session lazily, and the
+    // VRAM the user had just cancelled was loaded again on their side of the
+    // screen.
+    //
+    // Dropping *our own* lease here is the step that was missing, and it is
+    // the same move [_waitWhilePaused] already makes on pause: a task that is
+    // going away does not need the pool, and no *other* task's lease is
+    // touched, so the rule the lease exists for — never pull the isolates out
+    // from under someone still reading them — stays intact. What is in flight
+    // right now completes with an error and is discarded, which is exactly
+    // what a cancellation is for.
+    _ocrLeases.remove(id)?.release();
     if (currentTasks.every((t) => !t.isRunning)) {
       unawaited(TranslationWorker.instance.shutdownAll());
     }
@@ -1013,9 +1031,24 @@ class PreTranslationTaskManager with ChangeNotifier {
             : PreTranslationTaskStatus.completed;
       }
     } catch (e, s) {
-      Log.error('Pre-translation', '$e', s);
-      task.status = PreTranslationTaskStatus.failed;
+      // A cancelled job tears its own worker pool down, and whatever was in
+      // flight when it did answers back with "worker disposed". That is the
+      // cancellation working, not the job failing — and rewriting `canceled`
+      // into `failed` here is what makes a job the user stopped show up red in
+      // the list, which reads as "your cancel did something bad".
+      if (_canceledIds.contains(task.id) ||
+          task.status == PreTranslationTaskStatus.canceled) {
+        Log.info('Pre-translation', 'cancelled job aborted in flight: $e');
+      } else {
+        Log.error('Pre-translation', '$e', s);
+        task.status = PreTranslationTaskStatus.failed;
+      }
     } finally {
+      // Captured before the id goes: the line below is the only place that
+      // still knows *why* this loop ended.
+      final wasCanceled =
+          _canceledIds.contains(task.id) ||
+          task.status == PreTranslationTaskStatus.canceled;
       _canceledIds.remove(task.id);
       _runningIds.remove(task.id);
       // Drop our own lease *before* shutting down: shutdownAll() defers while
@@ -1029,7 +1062,21 @@ class PreTranslationTaskManager with ChangeNotifier {
         BackgroundKeepAlive.instance.remove(
           BackgroundKeepAlive.tagPreTranslate,
         );
-        unawaited(TranslationWorker.instance.shutdownAll());
+        // Defect C: awaited, not fired-and-forgotten. The drain above can
+        // perfectly well have re-opened the sessions a cancel had already
+        // freed — a chunk admitted before the flag was set runs to completion
+        // on purpose — so this is the last word on them, and `shutdownAll`
+        // answers with what it *observed*: `sessions=0` when the isolates
+        // confirmed, `sessions=N/A` when one did not. Both land in the log the
+        // user reads next to Task Manager; neither is a claim of success.
+        final teardown = await TranslationWorker.instance.shutdownAll();
+        if (wasCanceled) {
+          Log.info(
+            'Pre-translation',
+            'cancel of "${task.title}" released the OCR pool: '
+            '${teardown.evidence} (workers=${teardown.workers})',
+          );
+        }
       }
       onTaskFinished?.call(task);
       notifyListeners();
@@ -1051,6 +1098,13 @@ class PreTranslationTaskManager with ChangeNotifier {
       // Poll every second. Resume() flips the status and the next iteration
       // exits immediately.
       await Future.delayed(const Duration(seconds: 1));
+    }
+    // A job the user cancelled on its way out of pause does not get a pool
+    // lease back — it has no work left to protect, and holding one would defer
+    // the very teardown the cancel asked for.
+    if (_canceledIds.contains(task.id) ||
+        task.status == PreTranslationTaskStatus.canceled) {
+      return;
     }
     _ocrLeases[task.id] ??= TranslationWorker.instance.acquireLease();
   }
@@ -1409,9 +1463,18 @@ class PreTranslationTaskManager with ChangeNotifier {
       // throughput: keep the pool warm so the next chapter's sweep reuses the
       // loaded sessions while this chapter's stage 2 burns network time
       // (ruling R-4). The default stays freeVram until gate G2 measures that
-      // release really frees VRAM; task end / pause / cancel still shut the
-      // pool down in both modes.
-      if (TranslationPerformanceConfig.pipelineMode == PipelineMode.freeVram) {
+      // release really frees VRAM — **and the warm-pool half of that bargain
+      // is only about work that is still going on.** A cancelled chapter has no
+      // such work: it is draining, and everything it recognises from here is
+      // thrown away. Warming a pool for a job the user just stopped is how
+      // "取消即释放" turned into "取消后显存还在", so the cancel path ignores
+      // [PipelineMode] entirely. (Nothing else about the modes changes here,
+      // and the factory default is still freeVram — gate G2 has not passed.)
+      final canceled = _canceledIds.contains(task.id) || chapter.canceled;
+      if (releasesPoolOnSweepEnd(
+        mode: TranslationPerformanceConfig.pipelineMode,
+        canceled: canceled,
+      )) {
         await TranslationWorker.instance.shutdownAll();
       }
     }
@@ -1450,6 +1513,22 @@ class PreTranslationTaskManager with ChangeNotifier {
       }
     }
   }
+
+  /// Whether the OCR pool is given back when a chapter's stage-1 sweep ends.
+  ///
+  /// [PipelineMode] is a *throughput* policy: `throughput` keeps the loaded
+  /// sessions around so the next chunk does not pay for them twice. A cancelled
+  /// job has no next chunk — everything it does from here is discarded — so the
+  /// mode has nothing left to optimise, and holding the VRAM for it is pure
+  /// cost. Hence: **any** cancel releases, in either mode. This is not a change
+  /// to the factory default (`freeVram` it stays, gate G2 has not measured the
+  /// release otherwise) and not a change to what `throughput` does for work
+  /// that is still running.
+  @visibleForTesting
+  static bool releasesPoolOnSweepEnd({
+    required PipelineMode mode,
+    required bool canceled,
+  }) => canceled || mode == PipelineMode.freeVram;
 
   /// How many OCR chunks the stage-1 sweep keeps in flight, given the worker
   /// pool's real dispatch capacity. Floor 1 (work must still flow when the

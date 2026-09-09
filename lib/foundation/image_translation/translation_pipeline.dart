@@ -229,10 +229,26 @@ class PageTranslationPipeline {
   }) async {
     var image = await _decode(imageBytes);
     if (mode != InpaintMode.patch && regions.isNotEmpty) {
-      TextInpainter.erase(
+      // Defect A: the eraser keeps a per-rectangle account. A rectangle whose
+      // reconstruction could not be completed — or completed by turning bright
+      // artwork near-black — is put back exactly as it was, so what is left on
+      // the page is the original lettering, never a black block. That is a
+      // visible difference from "erased", so it has to be a *logged* one too:
+      // without this line a rolled-back page looks like an eraser that
+      // misfired, and the one person who can tell the two apart is reading the
+      // log over the screenshot.
+      final ledger = TextInpainter.eraseReport(
         image,
         eraseFootprintRects(regions, image.width, image.height),
       );
+      if (ledger.rolledBack > 0) {
+        Log.warning(
+          'Inpaint',
+          'erasure rolled back to the original pixels on '
+          '${ledger.rolledBack} of ${ledger.results.length} rectangle(s): '
+          'source lettering stays visible there — ${ledger.describe()}',
+        );
+      }
     }
     return await renderTranslatedPage(imageBytes, image, regions, mode: mode);
   }

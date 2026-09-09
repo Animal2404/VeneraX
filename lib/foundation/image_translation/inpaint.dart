@@ -14,6 +14,121 @@ class TextMask {
   final Uint8List mask;
 }
 
+/// How one erase attempt ended. Naming these is the point: every `kept*`
+/// outcome means **the source pixels are still there, byte for byte**, because
+/// a leftover piece of original lettering is a readable page while a black
+/// rectangle is not. Defect A's rule — "a failed erase falls back to the
+/// original pixels, never to black" — is enforced per window in
+/// [TextInpainter.eraseWindow], not by hoping the classifier behaved.
+enum EraseOutcome {
+  /// Masked pixels were reconstructed from the surrounding artwork.
+  erased,
+
+  /// Nothing plausible was classified as lettering ([computeMask] declined):
+  /// the window was never touched.
+  keptNoMask,
+
+  /// The reconstruction could not finish — a masked pixel had no unmasked
+  /// source anywhere in its own window, which means the classifier had taken
+  /// the entire background for text. The window was put back.
+  keptUnfilled,
+
+  /// The reconstruction ran and left the window a near-black mass it had not
+  /// been before: the contrast test had the two classes the wrong way round
+  /// and "filled" bright artwork with the darkest pixel in reach. The window
+  /// was put back. [kDarkMassAfterShare] explains why this is a *transition*
+  /// test rather than a "is it dark?" test.
+  keptDarkMass,
+
+  /// The window does not fit the pixel buffer (a stride/length disagreement
+  /// between the decoded page and the rectangles handed to us). Nothing was
+  /// written: a short buffer reads as zero bytes, and zeros are black pixels.
+  keptBadBuffer,
+}
+
+/// One line of the erase ledger: what happened to one requested rectangle.
+class EraseResult {
+  const EraseResult(this.rect, this.outcome, [this.detail]);
+
+  /// The rectangle as the caller asked for it.
+  final IntRect rect;
+
+  final EraseOutcome outcome;
+
+  /// Short machine-readable reason for a rollback (`null` otherwise), carried
+  /// straight into the log so a rollback can be told apart from a skip
+  /// without re-running the eraser.
+  final String? detail;
+
+  /// Whether any pixel of the page changed because of this rectangle.
+  bool get wrotePixels => outcome == EraseOutcome.erased;
+}
+
+/// What an erase pass did to a page, per rectangle. The caller logs it: this
+/// file stays free of `dart:ui` *and* of the app logger, so it can keep
+/// running anywhere a plain RGBA buffer can be handed to it.
+class EraseReport {
+  const EraseReport(this.results);
+
+  final List<EraseResult> results;
+
+  int get erased => results.where((r) => r.wrotePixels).length;
+
+  int get rolledBack =>
+      results
+      .where(
+        (r) =>
+            r.outcome == EraseOutcome.keptUnfilled ||
+            r.outcome == EraseOutcome.keptDarkMass ||
+            r.outcome == EraseOutcome.keptBadBuffer,
+      )
+      .length;
+
+  int get skipped =>
+      results.where((r) => r.outcome == EraseOutcome.keptNoMask).length;
+
+  /// One grep-able line. Only the first few rollback reasons are spelled out:
+  /// a page carries dozens of rectangles, and a log that repeats one failure
+  /// forty times hides every other line in it.
+  String describe({int detailLimit = 4}) {
+    final parts = <String>['erased=$erased', 'skipped=$skipped'];
+    if (rolledBack > 0) {
+      parts.add('rolled_back=$rolledBack');
+      final reasons =
+          results
+              .where((r) => r.detail != null)
+              .take(detailLimit)
+              .map(
+                (r) =>
+                    '${r.outcome.name}@${r.rect.left},${r.rect.top}(${r.detail})',
+              )
+              .join(' ');
+      parts.add('reasons={$reasons}');
+    }
+    return parts.join(' ');
+  }
+}
+
+/// A window whose luminance distribution went from "mostly not black" to
+/// "mostly black" across one reconstruction did not have its lettering
+/// removed — it had its background replaced by ink. These two numbers are the
+/// definition of "mostly", and the delta between them is what a *legitimate*
+/// erase can never produce.
+const double kDarkMassAfterShare = 0.55;
+const double kDarkMassRise = 0.35;
+
+/// How dark the artwork *around* the window has to be for a dark result to be
+/// believed. Above this share the neighbourhood is itself black — a dark speech
+/// bubble, a night panel — and a window that ends up black there is the eraser
+/// doing its job, so the guard stands down.
+const double kDarkMassRingLimit = 0.35;
+
+/// Luminance below which a pixel counts as black enough to be a block. Set
+/// well under any screentone: a grey bubble (lum ≈ 60) that legitimately
+/// receives dark lettering must not read as a black block, and a *real* one of
+/// these is what the roll back exists for.
+const int kNearBlackLum = 24;
+
 /// Pure-Dart text removal: erases the original lettering inside each text region
 /// and reconstructs the pixels underneath from the surrounding artwork, so the
 /// translated text sits on a clean background instead of a pasted-on patch.
@@ -24,19 +139,209 @@ class TextMask {
 /// in place to avoid cloning a possibly-huge page.
 abstract final class TextInpainter {
   static RgbaImage erase(RgbaImage image, List<IntRect> regions) {
-    for (var rect in regions) {
-      var m = computeMask(image, rect);
-      if (m == null) continue;
-      eraseWithMask(image, m);
-    }
+    eraseReport(image, regions);
     return image;
   }
 
-  /// Erases a single already-computed mask. Used by the AI path as a fallback
-  /// when the model rejects a tile, so both paths share the fill.
+  /// [erase], with a per-rectangle account of what it decided.
+  ///
+  /// The page is still mutated in place; the report only *describes* it. Two
+  /// of the outcomes change behaviour and not merely wording: a reconstruction
+  /// that cannot finish, and one that finishes by turning a bright window into
+  /// a black mass, are both undone — the window goes back to the bytes it had
+  /// before the rectangle. So the eraser's failure mode is "the original
+  /// lettering is still readable", never "there is a black block where the
+  /// lettering was".
+  static EraseReport eraseReport(RgbaImage image, List<IntRect> regions) {
+    final results = <EraseResult>[];
+    for (final rect in regions) {
+      final m = computeMask(image, rect);
+      if (m == null) {
+        results.add(EraseResult(rect, EraseOutcome.keptNoMask));
+        continue;
+      }
+      final (outcome, detail) = eraseWindow(image, m);
+      results.add(EraseResult(rect, outcome, detail));
+    }
+    return EraseReport(results);
+  }
+
+  /// Erases a single already-computed mask, best effort. Used by the AI path as
+  /// a fallback when the model rejects a tile, so both paths share the fill.
+  /// See [eraseWindow] for the variant that reports what it could not do — and
+  /// puts the pixels back when it could not.
   static void eraseWithMask(RgbaImage image, TextMask m) {
-    _fillNearest(image.pixels, image.width, m.left, m.top, m.rw, m.rh, m.mask);
-    _relax(image.pixels, image.width, m.left, m.top, m.rw, m.rh, m.mask, 2);
+    eraseWindow(image, m);
+  }
+
+  /// Reconstruct one mask window, atomically.
+  ///
+  /// The window is snapshotted before a single pixel is written, and the
+  /// snapshot goes back over it if either check fails: [EraseOutcome.keptUnfilled]
+  /// when some masked pixel had no source at all (the classifier had taken the
+  /// whole background for text), [EraseOutcome.keptDarkMass] when the finished
+  /// fill left a window mostly near-black where it had mostly not been **and
+  /// the artwork around it is bright** — a black result inside a black
+  /// neighbourhood is a correctly cleaned dark bubble, not a block.
+  /// [EraseOutcome.keptBadBuffer] means the window was never touched because it
+  /// does not fit the buffer it would be written into.
+  ///
+  /// Nothing here ever *invents* a colour: the only pixels this function can
+  /// leave behind are ones that already existed on the page, or the page's own
+  /// originals.
+  static (EraseOutcome, String?) eraseWindow(RgbaImage image, TextMask m) {
+    final pixels = image.pixels;
+    final w = image.width;
+    if (m.rw <= 0 || m.rh <= 0) {
+      return (EraseOutcome.keptBadBuffer, 'window=${m.rw}x${m.rh}');
+    }
+    if (m.left < 0 ||
+        m.top < 0 ||
+        m.left + m.rw > w ||
+        m.top + m.rh > image.height) {
+      return (
+        EraseOutcome.keptBadBuffer,
+        'window ${m.left},${m.top} ${m.rw}x${m.rh} vs page ${w}x${image.height}',
+      );
+    }
+    final needed = (m.top + m.rh) * w * 4;
+    if (pixels.length < needed) {
+      return (
+        EraseOutcome.keptBadBuffer,
+        'buffer=${pixels.length}B < ${needed}B for ${w}x${image.height}',
+      );
+    }
+
+    final before = _snapshotWindow(pixels, w, m.left, m.top, m.rw, m.rh);
+    final darkBefore = _darkShare(pixels, w, m.left, m.top, m.rw, m.rh);
+
+    final unfilled = _fillNearest(pixels, w, m.left, m.top, m.rw, m.rh, m.mask);
+    if (unfilled > 0) {
+      _restoreWindow(pixels, w, m.left, m.top, m.rw, m.rh, before);
+      return (
+        EraseOutcome.keptUnfilled,
+        'unfilled=$unfilled/${m.rw * m.rh} original pixels restored',
+      );
+    }
+    _relax(pixels, w, m.left, m.top, m.rw, m.rh, m.mask, 2);
+
+    final darkAfter = _darkShare(pixels, w, m.left, m.top, m.rw, m.rh);
+    final ringDark = _ringDarkShare(
+        pixels,
+        w,
+        image.height,
+        m.left,
+        m.top,
+        m.rw,
+        m.rh,
+      );
+    if (darkAfter > kDarkMassAfterShare &&
+        darkAfter - darkBefore > kDarkMassRise &&
+        ringDark < kDarkMassRingLimit) {
+      _restoreWindow(pixels, w, m.left, m.top, m.rw, m.rh, before);
+      return (
+        EraseOutcome.keptDarkMass,
+        'black=${(darkBefore * 100).round()}%->${(darkAfter * 100).round()}% '
+        'around=${(ringDark * 100).round()}%'
+        ' original pixels restored',
+      );
+    }
+    return (EraseOutcome.erased, null);
+  }
+
+  /// Share of the frame just outside the window that is near-black.
+  ///
+  /// This is what turns the mass test from a guess into a *contrast* judgement:
+  /// a black block is a black area inside bright surroundings. Take away that
+  /// precondition and the guard would roll back every legitimate erase of light
+  /// lettering out of a **black** speech bubble — there, the window going fully
+  /// black is the eraser working correctly, and the ring says so.
+  static double _ringDarkShare(
+    Uint8List pixels,
+    int imgW,
+    int imgH,
+    int left,
+    int top,
+    int rw,
+    int rh,
+  ) {
+    const band = 4;
+    final x0 = math.max(0, left - band), x1 = math.min(imgW - 1, left + rw + band);
+    final y0 = math.max(0, top - band), y1 = math.max(0, math.min(imgH - 1, top + rh + band));
+    var dark = 0, count = 0;
+    void sample(int x, int y) {
+      final i = (y * imgW + x) * 4;
+      if (i + 2 >= pixels.length) return;
+      final lum =
+          0.299 * pixels[i] + 0.587 * pixels[i + 1] + 0.114 * pixels[i + 2];
+      if (lum < kNearBlackLum) dark++;
+      count++;
+    }
+
+    for (var y = y0; y <= y1; y += 2) {
+      for (var x = x0; x <= x1; x += 2) {
+        final outside = x < left || x >= left + rw || y < top || y >= top + rh;
+        if (outside) sample(x, y);
+      }
+    }
+    return count == 0 ? 1 : dark / count;
+  }
+
+  /// Share of a window's pixels whose luminance is under [kNearBlackLum].
+  /// Sampled on a stride grid: the number decides "was this window turned into
+  /// a black block", and a few hundred samples say that without doubt.
+  static double _darkShare(
+    Uint8List pixels,
+    int imgW,
+    int left,
+    int top,
+    int rw,
+    int rh,
+  ) {
+    final step = math.max(1, math.min(rw, rh) ~/ 20);
+    var dark = 0, count = 0;
+    for (var y = 0; y < rh; y += step) {
+      final row = (top + y) * imgW + left;
+      for (var x = 0; x < rw; x += step) {
+        final i = (row + x) * 4;
+        final lum =
+            0.299 * pixels[i] + 0.587 * pixels[i + 1] + 0.114 * pixels[i + 2];
+        if (lum < kNearBlackLum) dark++;
+        count++;
+      }
+    }
+    return count == 0 ? 0 : dark / count;
+  }
+
+  static Uint8List _snapshotWindow(
+    Uint8List pixels,
+    int imgW,
+    int left,
+    int top,
+    int rw,
+    int rh,
+  ) {
+    final snap = Uint8List(rw * rh * 4);
+    for (var y = 0; y < rh; y++) {
+      final src = ((top + y) * imgW + left) * 4;
+      snap.setRange(y * rw * 4, y * rw * 4 + rw * 4, pixels, src);
+    }
+    return snap;
+  }
+
+  static void _restoreWindow(
+    Uint8List pixels,
+    int imgW,
+    int left,
+    int top,
+    int rw,
+    int rh,
+    Uint8List snap,
+  ) {
+    for (var y = 0; y < rh; y++) {
+      final dst = ((top + y) * imgW + left) * 4;
+      pixels.setRange(dst, dst + rw * 4, snap, y * rw * 4);
+    }
   }
 
   /// Splits the region's luminance (Otsu) into background and text strokes,
@@ -309,7 +614,13 @@ abstract final class TextInpainter {
 
   /// Fills each masked pixel with its nearest non-masked colour via a two-pass
   /// chamfer sweep. Clean flat fill on solid bubbles, good over gradients.
-  static void _fillNearest(
+  ///
+  /// Returns how many masked pixels had **no** source to borrow — the whole
+  /// window was masked, so the sweep had nowhere to start from. Those pixels
+  /// are left exactly as they were (this function never writes a substitute
+  /// colour), and the caller uses the count to decide whether to keep the
+  /// result or roll the window back.
+  static int _fillNearest(
     Uint8List pixels,
     int imgW,
     int left,
@@ -363,12 +674,20 @@ abstract final class TextInpainter {
       }
     }
 
+    var unfilled = 0;
     for (var y = 0; y < rh; y++) {
       for (var x = 0; x < rw; x++) {
         var i = y * rw + x;
         if (mask[i] == 0) continue;
         var src = srcOf[i];
-        if (src < 0) continue;
+        if (src < 0) {
+          // No colour to borrow: leave the original pixel standing — it is
+          // either lettering or artwork, and both beat an invented fill — and
+          // count it, so the caller can roll the whole window back instead of
+          // shipping a half-cleaned rectangle.
+          unfilled++;
+          continue;
+        }
         var di = ((top + y) * imgW + (left + x)) * 4;
         var si = src * 4;
         pixels[di] = pixels[si];
@@ -377,6 +696,7 @@ abstract final class TextInpainter {
         pixels[di + 3] = pixels[si + 3];
       }
     }
+    return unfilled;
   }
 
   /// Jacobi relaxation over masked pixels only: softens seams left by the
