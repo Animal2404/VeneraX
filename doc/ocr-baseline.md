@@ -135,3 +135,33 @@ ec.onnx`、`ocr_ja\{encoder,decoder}.onnx` 无此名；两个检测模型完全�
 | `nvidia-smi --query-gpu=memory.used` | 可用（整卡粒度） | 实测 1781/6144 MB；**不是本进程**，故采样需关闭其它 GPU 程序 |
 | `nvidia-smi --query-compute-apps` | 本机不可用 | 本进程走图形引擎而非 compute 引擎，故不在列表中 → 记 `N/A`，不记 0 |
 | `IDXGIAdapter3::QueryVideoMemoryInfo` | **未采用** | 本 SDK（10.0.26100.0）的 `IDXGIFactory1Vtbl` 头文件缺少 `GetSharedResourceAdapterLuid`（声明在未随包发布的 `dxgi1_1.h`），按头文件数出的槽位与真实 vtable 差一位：实测 slot12 返回 S_OK 却不写输出（它把 LUID 写进了我当作 riid 的缓冲区），slot13 返回 1（`IsCurrent()`）。**未经验证的 COM 槽位不得进产品代码** —— 误调不是降级而是访问违例（已实测崩溃）。详见 `process_diagnostics.dart` 的 P-2 注释 |
+### B0 —— 首次真实基线（2026-09-09，RTX 3060 Laptop 6144 MiB，DirectML，tier=fast）
+
+产物：云端 run `34292265463` / sha `53487bb`（含 D-15 修复 + 测量工具容错），下载自 `windows_build` 后本机运行。
+命令：`--headless ocr-golden --batches 1,4,16,32 --tier fast --repeat 2 --resource-probe --offline`
+
+| 页 | lang | b=1 | b=4 | b=16 | b=32 |
+| :-- | :-- | --: | --: | --: | --: |
+| 01_ja_vertical | ja | 1655 | 284 | 255 | 283 |
+| 02_zh_horizontal | zh | 345 | 260 | 258 | 391 |
+| 03_ko_webtoon | ko | 471 | 467 | 498 | 481 |
+| 04_en_sfx | en | 417 | 312 | 255 | 348 |
+| 05_mixed_halftone | auto | 336 | 289 | 331 | 362 |
+
+单位 ms/页，取 `totalMsMedian`。`samples 20/20`、`errors 0`、`verdict.consistent=true`。
+资源：GPU 1426 → 2473 MB，RSS 144 → 509 MB（整轮 sweep 前后）。
+
+**读数须知（每条都是限度，不是装饰）**
+- **`ja` 的 1655 ms 是冷启动**（首次调用含模型加载），不是批大小为 1 的稳态成本；同页在 b=4/16/32 是 255–284 ms。跨列比较必须排除第一格。
+- **`gitsha` 为空** ⇒ 按本文件自订规矩，这一行是**未背书（unattested）**：产物没带 `--dart-define=GIT_SHA`，Windows 那条构建走 `windows/build.py`，其 argv 固定、不透传 define（`tool/ocr_run_stats.dart` 现在会因此 exit 1）。sha 归属目前只能靠 run 号人工对照。
+- **`repeat=2`，不是协议要求的 3** ⇒ "中位数"只有两个样本，抖动量被低估。补测请 `--repeat 3`。
+- **`decMs` 全为 `None`**：manga-ocr 解码器耗时没有上报，`ja` 那列的内部拆分（det/rec/dec）拿不到；`resource.sessions` 也是 `None`。
+- 单机单环境，禁止跨机比较（§3.9）。
+
+**门 G1：通过。** 金标文本在 recBatch 1/4/16/32 下逐字节一致（`consistent=true`，20 样本，0 错误）—— 这是本项目第一次由真机测出的正确性门，而不是推断出来的。
+
+**D-15 的最终定论（一次字符修复）**：崩的不是"en/ko 模型在 DML 上必崩"，也不是跨语言共存 —— 是**我那个"钉 CPU"的补丁本身是死代码**（`replaceAll(r'', '/')` 在每字符间插 `/`，匹配恒 false）。修复后：韩文单页 `1/1 row、0 error、2.6 s`，全语料 `0` 次 Softmax。假设①胜出，②③不需要再查。
+
+**门 G2：仍未判定。** 本轮没有 pause→resume 的显存斜率测量；且 sweep 结束时 GPU 比开始时**高 1047 MB**（会话常驻，符合 `freeVram` 之外的路径预期，但不能当释放证据）。`PipelineMode` 出厂默认继续留在 `freeVram`。
+
+
