@@ -28,6 +28,10 @@ on:
           # workflow change can be proven without waiting for six platform
           # builds.
           - test
+          # Diagnostic only (TestBisect job below): locates the file behind the
+          # "exit 1 while every case is green" failure mode of run 34364131841.
+          # Gates nothing; the Test job stays the only test verdict.
+          - bisect
           - ios
           - android
           - windows
@@ -133,6 +137,144 @@ jobs:
         with:
           name: test-machine-report
           path: ci-out/
+          retention-days: 5
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # DIAGNOSTIC ONLY — added to locate the culprit of the run-34364131841 shape:
+  # `flutter test` exits 1 while the machine report attributes no failure at
+  # all (1298/1298 green, 144/144 suites, zero error events, 0-byte stderr,
+  # done.success=false). That shape means the failure is produced after the
+  # last testDone (process teardown), and the JSON protocol never re-announces
+  # it, so the only way to localise it is to re-run the suite in shrinking
+  # file subsets until one subset reproduces exit != 0.
+  #
+  # Strategy: reproduce the full set once (proves the precondition), then
+  # recursive bisection on the alphabetically-sorted file list: run the left
+  # half; if it exits != 0 descend left, else the culprit is in the right half
+  # by inference (the parent set was proven bad) — one batch run per level,
+  # 144 files -> 8 levels -> one exact file. Worst-case test time ~= one full
+  # suite for the repro + one for the bisection ladder + a few single-file
+  # confirmations. The step ALWAYS exits 0: this job gates nothing; its verdict
+  # is the "VERDICT ..." line in the log, in ci-bisect/verdict.txt and in the
+  # run summary. The Test job above remains the only test verdict in the repo.
+  # ---------------------------------------------------------------------------
+  TestBisect:
+    runs-on: windows-latest
+    timeout-minutes: 50
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.platform == 'bisect' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: "stable"
+          architecture: x64
+      - name: Show toolchain version
+        shell: bash
+        run: flutter --version
+      - name: Fetch packages
+        shell: bash
+        run: flutter pub get
+      - name: Bisect for the exit-1-with-zero-failures culprit
+        shell: bash
+        run: |
+          set -u
+          LOGDIR=ci-bisect
+          mkdir -p "$LOGDIR"
+          : > "$LOGDIR/verdict.txt"
+          echo "commit: $(git rev-parse --short HEAD)"
+
+          mapfile -t ALL < <(find test -name '*_test.dart' | sort)
+          echo "test files on disk: ${#ALL[@]}"
+
+          BATCH_IDX=0
+          run_batch() {
+            local label="$1"; shift
+            BATCH_IDX=$((BATCH_IDX + 1))
+            local tag="b$BATCH_IDX"
+            local first="$1" last="${@: -1}"
+            local t0 t1 st errs nonpass done_line
+            t0=$(date +%s)
+            timeout 1500 flutter test --no-pub --machine "$@" \
+              > "$LOGDIR/$tag.jsonl" 2> "$LOGDIR/$tag.err"
+            st=$?
+            t1=$(date +%s)
+            errs=$(grep -c '"type":"error"' "$LOGDIR/$tag.jsonl" 2>/dev/null || true)
+            nonpass=$(grep -c -E '"result":"(failure|error)"' "$LOGDIR/$tag.jsonl" 2>/dev/null || true)
+            done_line=$(grep -E '"type":"done"' "$LOGDIR/$tag.jsonl" 2>/dev/null | tail -1 || true)
+            echo "[$tag $label] files=$# exit=$st done=($done_line) error_events=$errs nonpassing_test_done=$nonpass stderr_bytes=$(wc -c < "$LOGDIR/$tag.err") secs=$((t1 - t0)) range=$first..$last"
+            [ "$st" -eq 124 ] && echo "[$tag $label] TIMEOUT(1500s): a batch member HANGS"
+            return $st
+          }
+
+          confirm_single() {
+            local f="$1"
+            echo "===== culprit candidate: $f ====="
+            local ok1=0 ok2=0
+            run_batch "single-1" "$f" || ok1=1
+            run_batch "single-2" "$f" || ok2=1
+            echo "--- human-readable expanded run (teardown text is visible here, machine mode hides it) ---"
+            timeout 240 flutter test --no-pub --reporter expanded "$f" \
+              > "$LOGDIR/culprit_expanded.log" 2>&1
+            local exp=$?
+            echo "expanded-run exit: $exp  (124 = HANG)"
+            tail -n 120 "$LOGDIR/culprit_expanded.log" || true
+            if [ "$ok1" -eq 0 ] && [ "$ok2" -eq 0 ]; then
+              echo "VERDICT NOTE: $f exited 0 on both single re-runs - the badness is FILE-LEVEL FLAKY or needs an interaction; the expanded run above is the evidence." | tee -a "$LOGDIR/verdict.txt"
+            fi
+            {
+              echo "VERDICT CULPRIT: $f"
+              echo "VERDICT single-machine-exits: $ok1 $ok2 expanded_exit: $exp"
+            } >> "$LOGDIR/verdict.txt"
+            echo "--- static scan of the culprit ---"
+            grep -n -E "Timer|StreamSubscription|\.listen\(|ReceivePort|Isolate|SendPort|\.cancel\(|addTearDown|tearDownAll|setUpAll|Socket|Process\.|exit\(" "$f" || echo "(no matches)"
+          }
+
+          bisect() {
+            local -a arr=("$@")
+            local n=${#arr[@]}
+            if [ "$n" -le 1 ]; then
+              confirm_single "${arr[0]}"
+              return 0
+            fi
+            local half=$(( (n + 1) / 2 ))
+            local -a left=("${arr[@]:0:half}")
+            local -a right=("${arr[@]:half}")
+            if run_batch "bisect-L-of-$n" "${left[@]}"; then
+              # Parent range is proven-bad (invariant), left is green, so the
+              # culprit is in the right half - descend without re-running it.
+              bisect "${right[@]}"
+            else
+              bisect "${left[@]}"
+            fi
+          }
+
+          # Precondition: reproduce the failure on THIS commit. Without it the
+          # "left green => right bad" inference is worthless.
+          if run_batch "root-full" "${ALL[@]}"; then
+            echo "VERDICT NO-REPRO: full suite exited 0 here; the run-34364131841 failure did not reproduce on this commit - flaky teardown." | tee -a "$LOGDIR/verdict.txt"
+            # one extra attempt to measure the flake rate
+            run_batch "root-full-2" "${ALL[@]}" || echo "VERDICT FLAKE: second full run exited $?" | tee -a "$LOGDIR/verdict.txt"
+          else
+            bisect "${ALL[@]}"
+          fi
+
+          echo "=================== BISECT VERDICT ==================="
+          cat "$LOGDIR/verdict.txt"
+          {
+            echo "## TestBisect verdict"
+            echo '```'
+            cat "$LOGDIR/verdict.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Diagnostic: never gates.
+          exit 0
+      - name: Upload bisect logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-bisect-logs
+          path: ci-bisect/
           retention-days: 5
           if-no-files-found: ignore
 

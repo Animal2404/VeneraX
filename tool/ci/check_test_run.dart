@@ -389,9 +389,22 @@ GuardResult evaluate(GuardInput input) {
   // 6. exit-code cross-check.
   if (input.flutterExit != 0 && realFailures.isEmpty && drift.isEmpty) {
     if (tolerated.isEmpty) {
-      failures.add('EXIT CODE: `flutter test` exited ${input.flutterExit}, but the report '
-          'attributes no failure and there is no drift. Treating this as a load/crash '
-          'failure; read ci-out/test_stderr.log.');
+      // This is the run-34364131841 shape: every recorded case green, no drift,
+      // no error events — yet the process exits non-zero. The machine protocol
+      // CAN represent that: a post-completion error (a suite process that dies
+      // during teardown, an uncaught async error after the last testDone)
+      // re-stamps the hidden load test's state to error, and the JSON reporter
+      // emits neither a second testDone nor an error event for it — only
+      // `done.success=false`. So: name it, keep it red, and point at the tool
+      // that localises it. "Exit 1 but everything passed" is never a pass.
+      failures.add('EXIT CODE: `flutter test` exited ${input.flutterExit} although all '
+          '${ran} case(s) are green, there is no drift and no exclusion is active. '
+          'done.success=${parse.sawDone ? (parse.doneSuccess ? 'true' : 'false') : '<missing>'}. '
+          'This is a PROCESS-TEARDOWN failure: the run attributed its failure to no '
+          'visible case (post-completion error / suite process exit). First read '
+          'ci-out/test_stderr.log and the done event in ci-out/test_report.jsonl; '
+          'then locate the file with the diagnostic job: '
+          'gh workflow run -f platform=bisect. Do not weaken this check into a pass.');
     } else {
       warnings.add('`flutter test` exited ${input.flutterExit}; the only failures are '
           'tolerated exclusions (${tolerated.join(', ')}).');
@@ -412,6 +425,7 @@ GuardResult evaluate(GuardInput input) {
   buffer.writeln('exclusions           : ${exclusions.length} (cap $maxExclusions)');
   buffer.writeln('executed floor       : ${input.minExecuted}');
   buffer.writeln('flutter test exit    : ${input.flutterExit}');
+  buffer.writeln('machine done event   : ${parse.sawDone ? (parse.doneSuccess ? 'success=true' : 'success=false') : 'MISSING (report truncated before done)'}');
   for (final note in notes) {
     buffer.writeln('note: $note');
   }
@@ -514,7 +528,7 @@ class SuiteSpec {
   final List<String> results;
 }
 
-String buildReport(List<SuiteSpec> specs) {
+String buildReport(List<SuiteSpec> specs, {bool doneSuccess = true}) {
   final buffer = StringBuffer();
   var suiteId = 0;
   var testId = 0;
@@ -551,7 +565,7 @@ String buildReport(List<SuiteSpec> specs) {
     }
     suiteId++;
   }
-  buffer.writeln(jsonEncode({'type': 'done', 'success': true}));
+  buffer.writeln(jsonEncode({'type': 'done', 'success': doneSuccess}));
   return buffer.toString();
 }
 
@@ -575,11 +589,12 @@ int runSelfTest() {
     Map<String, String> exclusions = const <String, String>{},
     int min = 1,
     int flutterExit = 0,
+    bool doneSuccess = true,
     List<String> disk = const <String>['test/a_test.dart', 'test/b_test.dart', 'test/c_test.dart'],
   }) {
     return evaluate(GuardInput(
       diskTests: disk,
-      parse: parseReport(buildReport(specs)),
+      parse: parseReport(buildReport(specs, doneSuccess: doneSuccess)),
       exclusions: exclusions,
       minExecuted: min,
       flutterExit: flutterExit,
@@ -697,10 +712,28 @@ int runSelfTest() {
         result.summary.contains('lifecycle'),
   );
 
+  // 10. THE run-34364131841 SHAPE: every case green, no drift, no exclusions,
+  //     done.success=false and exit 1. The machine protocol carries such a
+  //     post-completion/teardown failure with no error event, so the ONLY
+  //     honest verdict is red, named as a teardown failure. A guard that turns
+  //     this green is exactly what this file exists to prevent.
+  result = run(
+    [SuiteSpec(absA, ['pass']), SuiteSpec(absB, ['pass']), SuiteSpec(absC, ['pass'])],
+    min: 3,
+    flutterExit: 1,
+    doneSuccess: false,
+  );
+  expectThat(
+    'exit 1 with a fully green report stays red (teardown failure, named)',
+    !result.ok &&
+        result.failures.any((f) => f.contains('EXIT CODE') && f.contains('PROCESS-TEARDOWN')) &&
+        result.summary.contains('done.success=false'),
+  );
+
   if (problems.isEmpty) {
     stdout.writeln('GUARD SELF-TEST PASS: $checks/$checks checks behaved as specified '
         '(drift, floor, stale exclusion, cap, tolerated failure, real failure, '
-        'missing-reason rejection).');
+        'missing-reason rejection, teardown-exit-code).');
     return exitPass;
   }
   stdout.writeln('GUARD SELF-TEST FAIL: ${problems.length}/$checks check(s) wrong:');
