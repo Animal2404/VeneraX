@@ -77,6 +77,10 @@ class ReportParse {
   int unparsedLines = 0;
   int suiteEvents = 0;
   int testDones = 0;
+
+  /// Flutter-tool lifecycle events (no `type`), e.g. `test.startedProcess`.
+  /// Counted so the log can say what it skipped instead of staying silent.
+  int toolEvents = 0;
   bool sawDone = false;
   bool doneSuccess = false;
 }
@@ -100,112 +104,130 @@ String repoRelative(String rawPath) {
   return p;
 }
 
+void _recordUnparsed(ReportParse report, String line) {
+  report.unparsedLines++;
+  if (report.firstUnparsed.length < 3) {
+    report.firstUnparsed.add(line.length > 120 ? '${line.substring(0, 120)}...' : line);
+  }
+}
+
 ReportParse parseReport(String text) {
-  final r = ReportParse();
+  final report = ReportParse();
   for (final raw in const LineSplitter().convert(text)) {
     final line = raw.trim();
     if (line.isEmpty) {
       continue;
     }
-    r.lines++;
-    Map<String, dynamic> event;
+    report.lines++;
+    dynamic decoded;
     try {
-      final decoded = jsonDecode(line);
-      if (decoded is! Map<String, dynamic>) {
-        r.unparsedLines++;
-        if (r.firstUnparsed.length < 3) {
-          r.firstUnparsed.add(line.length > 120 ? '${line.substring(0, 120)}...' : line);
-        }
-        continue;
-      }
-      event = decoded;
+      decoded = jsonDecode(line);
     } catch (_) {
-      r.unparsedLines++;
-      if (r.firstUnparsed.length < 3) {
-        r.firstUnparsed.add(line.length > 120 ? '${line.substring(0, 120)}...' : line);
-      }
+      _recordUnparsed(report, line);
       continue;
     }
-
-    final type = event['type'];
-    if (type is! String) {
-      continue;
-    }
-    switch (type) {
-      case 'suite':
-        final suite = event['suite'];
-        if (suite is Map) {
-          final id = suite['id'];
-          final path = suite['path'];
-          if (id is int && path is String) {
-            final rel = repoRelative(path);
-            r.suiteIdToPath[id] = rel;
-            r.suites.putIfAbsent(rel, () => SuiteStats());
-            r.suiteEvents++;
-          }
-        }
-        break;
-      case 'testStart':
-        final test = event['test'];
-        if (test is Map) {
-          final id = test['id'];
-          final suiteId = test['suiteID'];
-          final name = test['name'];
-          if (id is int && suiteId is int && name is String) {
-            r.testIdToSuite[id] = suiteId;
-            r.testNames[id] = name;
-          }
-        }
-        break;
-      case 'testDone':
-        final id = event['testID'];
-        if (id is! int) {
-          break;
-        }
-        r.testDones++;
-        final hidden = event['hidden'] == true;
-        final skipped = event['skipped'] == true;
-        final result = event['result'];
-        if (hidden) {
-          // The synthetic "loading <file>" test: a non-success result here is
-          // a suite that failed to compile or load.
-          if (result != 'success') {
-            final path = r.suiteIdToPath[r.testIdToSuite[id]] ?? '<unknown>';
-            final detail = r.lastErrorFor[id] ?? '$result';
-            r.loadErrors.add('$path: $detail');
-          }
-          break;
-        }
-        final rel = r.suiteIdToPath[r.testIdToSuite[id]] ?? '<unknown>';
-        final stats = r.suites.putIfAbsent(rel, () => SuiteStats());
-        final name = r.testNames[id] ?? '<unnamed>';
-        if (skipped) {
-          stats.skipped++;
-        } else if (result == 'success') {
-          stats.ran++;
-          stats.passed++;
+    if (decoded is Map<String, dynamic>) {
+      _handleEvent(report, decoded);
+    } else if (decoded is List) {
+      // The flutter tool writes its own lifecycle events
+      // (`{"event":"test.startedProcess",...}`) onto the same stream as
+      // package:test's one-object-per-line events, but wrapped in a JSON
+      // *array*. They carry no "type", they are not test events, and calling
+      // them unparseable output makes the guard cry wolf about a healthy
+      // report — 139 such lines (one per suite) in the first full run.
+      for (final item in decoded) {
+        if (item is Map<String, dynamic>) {
+          _handleEvent(report, item);
         } else {
-          stats.ran++;
-          stats.failed++;
-          stats.failedNames.add(name);
+          _recordUnparsed(report, line);
         }
-        break;
-      case 'error':
-        final id = event['testID'];
-        final message = event['error'];
-        if (id is int && message is String) {
-          r.lastErrorFor[id] = message.split('\n').first;
-        }
-        break;
-      case 'done':
-        r.sawDone = true;
-        r.doneSuccess = event['success'] == true;
-        break;
-      default:
-        break;
+      }
+    } else {
+      _recordUnparsed(report, line);
     }
   }
-  return r;
+  return report;
+}
+
+void _handleEvent(ReportParse report, Map<String, dynamic> event) {
+  final type = event['type'];
+  if (type is! String) {
+    report.toolEvents++;
+    return;
+  }
+  switch (type) {
+    case 'suite':
+      final suite = event['suite'];
+      if (suite is Map) {
+        final id = suite['id'];
+        final path = suite['path'];
+        if (id is int && path is String) {
+          final rel = repoRelative(path);
+          report.suiteIdToPath[id] = rel;
+          report.suites.putIfAbsent(rel, () => SuiteStats());
+          report.suiteEvents++;
+        }
+      }
+      break;
+    case 'testStart':
+      final test = event['test'];
+      if (test is Map) {
+        final id = test['id'];
+        final suiteId = test['suiteID'];
+        final name = test['name'];
+        if (id is int && suiteId is int && name is String) {
+          report.testIdToSuite[id] = suiteId;
+          report.testNames[id] = name;
+        }
+      }
+      break;
+    case 'testDone':
+      final id = event['testID'];
+      if (id is! int) {
+        break;
+      }
+      report.testDones++;
+      final hidden = event['hidden'] == true;
+      final skipped = event['skipped'] == true;
+      final result = event['result'];
+      if (hidden) {
+        // The synthetic "loading <file>" test: a non-success result here is a
+        // suite that failed to compile or load.
+        if (result != 'success') {
+          final path = report.suiteIdToPath[report.testIdToSuite[id]] ?? '<unknown>';
+          final detail = report.lastErrorFor[id] ?? '$result';
+          report.loadErrors.add('$path: $detail');
+        }
+        break;
+      }
+      final rel = report.suiteIdToPath[report.testIdToSuite[id]] ?? '<unknown>';
+      final stats = report.suites.putIfAbsent(rel, () => SuiteStats());
+      final name = report.testNames[id] ?? '<unnamed>';
+      if (skipped) {
+        stats.skipped++;
+      } else if (result == 'success') {
+        stats.ran++;
+        stats.passed++;
+      } else {
+        stats.ran++;
+        stats.failed++;
+        stats.failedNames.add(name);
+      }
+      break;
+    case 'error':
+      final id = event['testID'];
+      final message = event['error'];
+      if (id is int && message is String) {
+        report.lastErrorFor[id] = message.split('\n').first;
+      }
+      break;
+    case 'done':
+      report.sawDone = true;
+      report.doneSuccess = event['success'] == true;
+      break;
+    default:
+      break;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -269,6 +291,10 @@ GuardResult evaluate(GuardInput input) {
   if (parse.unparsedLines > 0) {
     warnings.add('${parse.unparsedLines} machine-report line(s) were not JSON: '
         '${parse.firstUnparsed.join(' | ')}');
+  }
+  if (parse.toolEvents > 0) {
+    notes.add('${parse.toolEvents} flutter-tool lifecycle event(s) ignored '
+        '(no "type"; e.g. test.startedProcess) — not test results');
   }
 
   // 1. exclusions that no longer exist.
@@ -652,6 +678,24 @@ int runSelfTest() {
       temp.deleteSync(recursive: true);
     } catch (_) {}
   }
+
+  // 9. flutter-tool lifecycle events arrive as a JSON *array* on the same
+  //    stream; they must be counted as tool noise, never as a corrupt report.
+  final arrayReport = '[{"event":"test.startedProcess","params":{"vmServiceUri":null}}]\n'
+      '${buildReport([SuiteSpec(absA, ['pass'])])}';
+  result = evaluate(GuardInput(
+    diskTests: const <String>['test/a_test.dart'],
+    parse: parseReport(arrayReport),
+    exclusions: const <String, String>{},
+    minExecuted: 1,
+    flutterExit: 0,
+  ));
+  expectThat(
+    'array-wrapped flutter-tool events are not called unparseable',
+    result.ok &&
+        !result.summary.contains('were not JSON') &&
+        result.summary.contains('lifecycle'),
+  );
 
   if (problems.isEmpty) {
     stdout.writeln('GUARD SELF-TEST PASS: $checks/$checks checks behaved as specified '

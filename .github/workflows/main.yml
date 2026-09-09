@@ -92,8 +92,11 @@ jobs:
         env:
           # Floor for executed (non-skipped) cases: a run in which everything
           # skips is green to `flutter test` and must not be green here.
+          # Measured on the first full run (run 34352212854): 139/139 files,
+          # 1245 executed, 1 skipped. 1100 keeps ~12% headroom for a genuine
+          # test removal while still failing a swept-away or all-skipped suite.
           # Raise it as the suite grows; the step summary prints the margin.
-          MIN_EXECUTED_TESTS: "800"
+          MIN_EXECUTED_TESTS: "1100"
         run: |
           set -euo pipefail
           mkdir -p ci-out
