@@ -1,0 +1,145 @@
+name: Export manga-ocr decoder with KV cache
+
+# Manual trigger is the primary path.  The weekly run is a regression canary:
+# it re-proves the cache export still matches the shipped no-cache decoder after
+# any upstream drift (torch / transformers / onnxruntime / model repo).
+on:
+  workflow_dispatch:
+    inputs:
+      fp16:
+        description: "Also export fp16 (keep_io_types) and re-verify equivalence"
+        type: boolean
+        default: false
+      max_steps:
+        description: "Forced decode steps for the long-line case (app ceiling is 79)"
+        type: string
+        default: "79"
+      model_id:
+        description: "Source PyTorch model id"
+        type: string
+        default: "kha-white/manga-ocr-base"
+      hf_endpoint:
+        description: "Primary HF endpoint (mirror; huggingface.co is the automatic fallback)"
+        type: string
+        default: "https://hf-mirror.com"
+      opset:
+        description: "ONNX opset"
+        type: string
+        default: "17"
+  schedule:
+    - cron: "0 4 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: export-decoder-kv-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  MODEL_ID: ${{ github.event.inputs.model_id || 'kha-white/manga-ocr-base' }}
+  HF_ENDPOINT_INPUT: ${{ github.event.inputs.hf_endpoint || 'https://hf-mirror.com' }}
+  OPSET: ${{ github.event.inputs.opset || '17' }}
+  MAX_STEPS: ${{ github.event.inputs.max_steps || '79' }}
+  FP16: ${{ github.event.inputs.fp16 || 'false' }}
+  HF_HUB_DISABLE_TELEMETRY: "1"
+  HF_HUB_DISABLE_PROGRESS_BARS: "1"
+
+jobs:
+  export:
+    name: Export + verify decoder KV cache
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Cache Hugging Face downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-hub-${{ runner.os }}-${{ github.event.inputs.model_id || 'kha-white/manga-ocr-base' }}
+          restore-keys: |
+            hf-hub-${{ runner.os }}-
+
+      - name: Install CPU dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          # CPU-only torch: no GPU is needed to export or to verify.
+          if ! pip install --index-url https://download.pytorch.org/whl/cpu "torch==2.4.1"; then
+            echo "::warning::PyTorch CPU index install failed; retrying with the CPU wheel as an extra index"
+            pip install "torch==2.4.1" --extra-index-url https://download.pytorch.org/whl/cpu
+          fi
+          pip install \
+            "transformers==4.44.2" \
+            "huggingface_hub==0.24.6" \
+            "numpy==1.26.4" \
+            "onnx==1.16.2" \
+            "onnxruntime==1.19.2" \
+            "onnxconverter-common==1.14.0" \
+            "Pillow==10.4.0"
+          python -c "import torch, transformers, onnx, onnxruntime; print('torch', torch.__version__, 'transformers', transformers.__version__, 'onnx', onnx.__version__, 'ort', onnxruntime.__version__)"
+
+      - name: Syntax preflight
+        shell: bash
+        run: python -m py_compile tool/export_decoder_kv.py
+
+      - name: Export decoder with past_key_values and verify equivalence
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(
+            --model-id "$MODEL_ID"
+            --hf-endpoint "$HF_ENDPOINT_INPUT"
+            --opset "$OPSET"
+            --max-steps "$MAX_STEPS"
+            --out-dir dist
+          )
+          if [ "$FP16" = "true" ]; then
+            args+=(--fp16)
+          fi
+          echo "running: python tool/export_decoder_kv.py ${args[*]}"
+          python tool/export_decoder_kv.py "${args[@]}"
+
+      - name: Show checksums
+        if: always()
+        shell: bash
+        run: |
+          echo "=== dist ==="
+          ls -la dist || true
+          echo "=== SHA256SUMS.txt ==="
+          cat dist/SHA256SUMS.txt 2>/dev/null || echo "(missing)"
+          echo "=== meta.json (head) ==="
+          head -c 4000 dist/manga_ocr_decoder_kv.meta.json 2>/dev/null || echo "(missing)"
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: manga-ocr-decoder-kv-diagnostics
+          path: |
+            dist/SUMMARY.md
+            dist/manga_ocr_decoder_kv.meta.json
+            dist/SHA256SUMS.txt
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload ONNX artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: manga-ocr-decoder-kv-onnx
+          path: dist/*.onnx
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 30
