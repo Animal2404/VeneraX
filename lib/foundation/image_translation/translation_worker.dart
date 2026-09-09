@@ -2072,6 +2072,10 @@ class _WorkerState {
     }
 
     final workItems = <_ClusterWork>[];
+    // F13.7 cluster geometry traces, per page, appended to the funnel channel
+    // below. Measured here because this is the only place the cluster's own
+    // line boxes are still in scope.
+    final clusterTraces = <int, List<String>>{};
     for (final entry in pageBoxes.entries) {
       final pageIdx = entry.key;
       final img = pageImages[pageIdx]!;
@@ -2107,6 +2111,10 @@ class _WorkerState {
       }
       for (var i = 0; i < clusters.length; i++) {
         final cluster = clusters[i];
+        final clusterTrace = ocrClusterTrace(pageIdx, i, cluster);
+        if (clusterTrace != null) {
+          clusterTraces.putIfAbsent(pageIdx, () => <String>[]).add(clusterTrace);
+        }
         final detectedBounds = _boundsOf(cluster);
         final eraseBounds = detectedBounds.inflated(2, 2, img.width, img.height);
         final eraseLines = [
@@ -2345,6 +2353,17 @@ class _WorkerState {
       if (pageErrors.containsKey(p.pageIndex)) continue;
       final funnel = funnels[p.pageIndex];
       if (funnel != null) funnelLines.add(funnel.line());
+      // F13.7: the kept-block inventory (`OcrText`) and the per-cluster band
+      // geometry (`OcrCluster`) ride the same returned channel as the funnel,
+      // for the same reason it does — a `Log.*` call inside this isolate never
+      // reaches `logs.txt` (see `_WorkerResponse.funnelLogs`). Both are pure
+      // measurements; neither changes what is recognized or clustered.
+      final digest = ocrTextDigest(
+        p.pageIndex,
+        pageBlocks[p.pageIndex] ?? const [],
+      );
+      if (digest != null) funnelLines.add(digest);
+      funnelLines.addAll(clusterTraces[p.pageIndex] ?? const <String>[]);
     }
 
     totalSw.stop();
@@ -3118,6 +3137,288 @@ int _axisGap(int startA, int endA, int startB, int endB) =>
 /// so this sits close to the line thickness rather than well below it.
 double _sameLineGap(int thicknessA, int thicknessB) =>
     math.max(thicknessA, thicknessB) * 0.8;
+
+/// One OCR cluster's internal geometry, measured for the cross-bubble
+/// investigation (F13.7).
+///
+/// The clustering gate decides a link from *inflated* boxes ([clusterOcrBoxes]):
+/// two members may join when their inflated rectangles intersect, and each box
+/// is grown by `clamp(0.55 * min(width, height), 3, 32)` on every side. A
+/// **direct** link therefore cannot bridge a separation wider than
+/// `inflate(a) + inflate(b)`; a wider separation inside one cluster can only
+/// come from union-find chaining (A~B~C), which is the mechanism that can carry
+/// a single cluster across two physical speech bubbles.
+///
+/// This measures that separation and nothing else. It never rejects a merge:
+/// with no access to the page's ink there is no threshold that separates a
+/// chained span from a legitimately wide-spaced narration block inside one
+/// bubble — the two produce identical box geometry (see the ambiguity test in
+/// `test/translation_observability_test.dart`) — and a guard that guessed would
+/// split sentences. The numbers exist so the next real-device log can be read
+/// instead of argued about.
+class OcrClusterGeometry {
+  const OcrClusterGeometry({
+    required this.direction,
+    required this.members,
+    required this.medianThickness,
+    required this.stackGaps,
+    required this.runGaps,
+    required this.span,
+    required this.maxLinkRatio,
+  });
+
+  /// +1 horizontal lines (bands stack vertically), -1 vertical columns (bands
+  /// stack horizontally), 0 mixed or undirected — [_lineDirection]'s convention.
+  final int direction;
+
+  /// Members in the cluster.
+  final int members;
+
+  /// Median short side of the members — for horizontal text the glyph height,
+  /// i.e. the quantity the inflation is derived from.
+  final int medianThickness;
+
+  /// Separations between consecutive *bands* along the stacking axis, in px.
+  /// A band is one physical line (or column) including the fragments the
+  /// detector split it into.
+  final List<int> stackGaps;
+
+  /// Separations between fragments of the *same* band along the run axis, in
+  /// px. This is the axis on which a detector-split line and two side-by-side
+  /// bubbles are indistinguishable.
+  final List<int> runGaps;
+
+  /// Extent of the cluster along the stacking axis, in px.
+  final int span;
+
+  /// Largest measured gap divided by the largest gap a single accepted link
+  /// could bridge (`inflate(a) + inflate(b)`). Above 1.0 the cluster contains a
+  /// separation no direct link can create, i.e. a chained span. 0 when nothing
+  /// was measurable.
+  final double maxLinkRatio;
+
+  /// Whether the cluster spans a separation wider than any single link.
+  bool get chained => maxLinkRatio > 1.0;
+}
+
+/// Measures one cluster's band structure. Pure; see [OcrClusterGeometry].
+OcrClusterGeometry ocrClusterGeometry(List<IntRect> cluster) {
+  if (cluster.isEmpty) {
+    return const OcrClusterGeometry(
+      direction: 0,
+      members: 0,
+      medianThickness: 0,
+      stackGaps: [],
+      runGaps: [],
+      span: 0,
+      maxLinkRatio: 0,
+    );
+  }
+  var thicknesses = [for (var b in cluster) math.min(b.width, b.height)]..sort();
+  var medianThickness = thicknesses[thicknesses.length ~/ 2];
+  var horizontal = 0;
+  var vertical = 0;
+  for (var b in cluster) {
+    var d = _lineDirection(b);
+    if (d > 0) {
+      horizontal++;
+    } else if (d < 0) {
+      vertical++;
+    }
+  }
+  var direction = horizontal > 0 && vertical > 0
+      ? 0
+      : horizontal > 0
+      ? 1
+      : vertical > 0
+      ? -1
+      : 0;
+  if (direction == 0) {
+    return OcrClusterGeometry(
+      direction: 0,
+      members: cluster.length,
+      medianThickness: medianThickness,
+      stackGaps: const [],
+      runGaps: const [],
+      span: 0,
+      maxLinkRatio: 0,
+    );
+  }
+
+  var sorted = [...cluster]..sort(
+    (a, b) => direction > 0
+        ? a.top.compareTo(b.top)
+        : a.left.compareTo(b.left),
+  );
+  var bands = <List<IntRect>>[];
+  for (var box in sorted) {
+    if (bands.isEmpty || !_sameTextBand(bands.last.last, box, direction)) {
+      bands.add([box]);
+    } else {
+      bands.last.add(box);
+    }
+  }
+
+  var stackGaps = <int>[];
+  var runGaps = <int>[];
+  var maxLinkRatio = 0.0;
+  for (var i = 0; i < bands.length; i++) {
+    var band = bands[i];
+    if (i > 0) {
+      var facing = _facingPair(bands[i - 1], band, direction);
+      stackGaps.add(facing.gap);
+      maxLinkRatio = math.max(maxLinkRatio, _linkRatio(facing));
+    }
+    if (band.length > 1) {
+      var ordered = [...band]..sort(
+        (a, b) => direction > 0
+            ? a.left.compareTo(b.left)
+            : a.top.compareTo(b.top),
+      );
+      for (var j = 1; j < ordered.length; j++) {
+        var previous = ordered[j - 1];
+        var next = ordered[j];
+        var gap = direction > 0
+            ? math.max(0, next.left - previous.right)
+            : math.max(0, next.top - previous.bottom);
+        runGaps.add(gap);
+        maxLinkRatio = math.max(
+          maxLinkRatio,
+          _linkRatio((gap: gap, a: previous, b: next)),
+        );
+      }
+    }
+  }
+  var span = direction > 0
+      ? sorted.last.bottom - sorted.first.top
+      : sorted.last.right - sorted.first.left;
+  return OcrClusterGeometry(
+    direction: direction,
+    members: cluster.length,
+    medianThickness: medianThickness,
+    stackGaps: stackGaps,
+    runGaps: runGaps,
+    span: span,
+    maxLinkRatio: maxLinkRatio,
+  );
+}
+
+/// Whether two boxes belong to the same physical line/column: they overlap by
+/// at least half of the thinner one on the *run* axis.
+bool _sameTextBand(IntRect a, IntRect b, int direction) {
+  if (direction > 0) {
+    return _axisOverlap(a.top, a.bottom, b.top, b.bottom) >=
+        math.min(a.height, b.height) * 0.5;
+  }
+  return _axisOverlap(a.left, a.right, b.left, b.right) >=
+      math.min(a.width, b.width) * 0.5;
+}
+
+/// The closest pair across two bands along the stacking axis, i.e. the pair the
+/// link between them actually had to bridge.
+({int gap, IntRect a, IntRect b}) _facingPair(
+  List<IntRect> bandA,
+  List<IntRect> bandB,
+  int direction,
+) {
+  var best = (gap: 1 << 30, a: bandA.first, b: bandB.first);
+  for (var a in bandA) {
+    for (var b in bandB) {
+      var gap = direction > 0
+          ? _axisGap(a.top, a.bottom, b.top, b.bottom)
+          : _axisGap(a.left, a.right, b.left, b.right);
+      if (gap < best.gap) {
+        best = (gap: gap, a: a, b: b);
+      }
+    }
+  }
+  return best;
+}
+
+/// Gap over the exact ceiling the link gate uses: the two boxes' own inflation
+/// (`clamp(0.55 * min(w, h), 3, 32)`, both sides). > 1.0 means no direct link
+/// could have joined this pair.
+double _linkRatio(({int gap, IntRect a, IntRect b}) facing) {
+  var ceiling = _inflateAmount(facing.a) + _inflateAmount(facing.b);
+  if (ceiling <= 0) return facing.gap > 0 ? double.infinity : 0;
+  return facing.gap / ceiling;
+}
+
+/// The per-side inflation [clusterOcrBoxes] applies — kept in one place so the
+/// audit's ceiling cannot drift from the gate it describes.
+int _inflateAmount(IntRect box) =>
+    (math.min(box.width, box.height) * 0.55).round().clamp(3, 32);
+
+/// One greppable line per multi-member cluster: its band structure and the
+/// widest separation relative to what a direct link could bridge (F13.7).
+///
+/// `null` for a single-member cluster: there is no separation to measure and
+/// one line per detected line would drown the log.
+String? ocrClusterTrace(int pageIndex, int index, List<IntRect> cluster) {
+  if (cluster.length < 2) return null;
+  var geometry = ocrClusterGeometry(cluster);
+  var direction = geometry.direction > 0
+      ? 'h'
+      : geometry.direction < 0
+      ? 'v'
+      : 'x';
+  return 'OcrCluster page=$pageIndex idx=$index n=${geometry.members} '
+      'dir=$direction t=${geometry.medianThickness} span=${geometry.span} '
+      'gaps=[${geometry.stackGaps.join(',')}] '
+      'run=[${geometry.runGaps.join(',')}] '
+      'maxLinkRatio=${geometry.maxLinkRatio.toStringAsFixed(2)}';
+}
+
+/// One greppable line naming every block a page produced, with its detected
+/// language and a bounded preview of the recognized text (F13.7).
+///
+/// This is the line that makes "one line of Japanese was not translated"
+/// attributable from a single log: the reader compares the rendered page
+/// against the inventory. A block whose language equals the target language is
+/// dropped downstream without a word (`translation_pipeline.dart:165-173`), and
+/// a block the model echoed back or omitted is dropped the same way
+/// (`translation_pipeline.dart:213-214`); neither is visible to [OcrPageFunnel],
+/// which counts clusters, not texts. [blocks] is what the worker *kept* — the
+/// inventory, not a claim about what was drawn.
+String? ocrTextDigest(int pageIndex, List<OcrBlock> blocks) {
+  if (blocks.isEmpty) return null;
+  const maxPreviewRunes = 24;
+  const maxLineLength = 1400;
+  var buffer = StringBuffer('OcrText page=$pageIndex n=${blocks.length}');
+  for (var i = 0; i < blocks.length; i++) {
+    var block = blocks[i];
+    var entry = ' $i:${block.language}:${_previewText(block.text, maxPreviewRunes)}';
+    if (buffer.length + entry.length > maxLineLength) {
+      buffer.write(' ...+${blocks.length - i}more');
+      break;
+    }
+    buffer.write(entry);
+  }
+  return buffer.toString();
+}
+
+/// A log-safe one-line preview: control characters and newlines become spaces,
+/// double quotes become single so the `lang:"text"` shape stays parseable by
+/// eye, and the text is cut to [maxRunes] with an ellipsis.
+String _previewText(String text, int maxRunes) {
+  var out = StringBuffer();
+  var count = 0;
+  for (var rune in text.runes) {
+    if (count >= maxRunes) {
+      out.write('…');
+      break;
+    }
+    count++;
+    if (rune < 0x20 || rune == 0x7F) {
+      out.write(' ');
+    } else if (rune == 0x22) {
+      out.write("'");
+    } else {
+      out.writeCharCode(rune);
+    }
+  }
+  return '"$out"';
+}
 
 IntRect _boundsOf(List<IntRect> boxes) {
   var result = IntRect(

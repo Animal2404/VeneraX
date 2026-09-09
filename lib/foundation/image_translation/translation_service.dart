@@ -89,6 +89,10 @@ class GroupPerf {
     required this.totalMs,
     required this.bytesIn,
     required this.bytesOut,
+    this.llmRequests = 0,
+    this.llmBlocks = 0,
+    this.llmWindowStartMs = 0,
+    this.llmWindowEndMs = 0,
   });
 
   /// Pages the group was handed (input size, cache-resolved ones included).
@@ -123,6 +127,30 @@ class GroupPerf {
   final int bytesIn;
   final int bytesOut;
 
+  /// How many `LlmTranslator.translateBatch` calls this group issued: 0 when no
+  /// page had pending bubbles, otherwise 1 — the group path concatenates every
+  /// page's bubbles into one request by construction. Retries *inside* that
+  /// call are the translator's own business and are not visible here, which is
+  /// exactly why the window below exists.
+  final int llmRequests;
+
+  /// Bubbles carried by that request — the payload's `lines` count. This is the
+  /// number that says whether requests are already as merged as they can be.
+  final int llmBlocks;
+
+  /// Epoch-millisecond window of the shared request. Two groups' windows tell
+  /// serial from concurrent *from the log alone*: non-overlapping windows mean
+  /// the chapter's requests were serialized and [llmMs] is pure request time;
+  /// overlapping windows mean groups were in flight together, so [llmMs]
+  /// includes waiting for a concurrency slot.
+  final int llmWindowStartMs;
+  final int llmWindowEndMs;
+
+  /// Monotonic count of `translateBatch` calls issued by this process, printed
+  /// on every group line as `llm_reqs_total` so a chapter's request count is a
+  /// log subtraction rather than a claim.
+  static int llmRequestsIssued = 0;
+
   /// Mean milliseconds the shared request spent per page it carried, or null
   /// when it carried none. Plain arithmetic on already-held fields: the data
   /// fold calls it once, the widget tree computes nothing.
@@ -141,14 +169,60 @@ class GroupPerf {
 
   /// The `GroupPerf ...` telemetry line, formatted from this object. Field
   /// names and order are exactly what they were before the object existed, so
-  /// existing log greps keep working; the new denominator is appended.
+  /// existing log greps keep working; the new denominators are appended.
+  ///
+  /// `llm_reqs` / `llm_blocks` / `llm_window` (F13.7) are the request-shape
+  /// fields: they answer "was this group one request or many, how big was it,
+  /// and did it overlap another group's" without a second measurement path.
   String toLogLine() =>
       'GroupPerf pages=$pages in_kb=${(bytesIn / 1024).round()} '
       'ocr_cached=$ocrCachedPages ocr_run=$ocrRunPages '
       'parts={resolveMs:$resolveMs,ocrMs:$ocrMs,llmMs:$llmMs,renderMs:$renderMs} '
       'llm_ms=$llmMs render_ms=$renderMs render_pages=$renderPages '
       'out_kb=${(bytesOut / 1024).round()} total_ms=$totalMs '
-      'llm_pages=$llmPages';
+      'llm_pages=$llmPages llm_reqs=$llmRequests llm_blocks=$llmBlocks '
+      'llm_window=$llmWindowStartMs..$llmWindowEndMs '
+      'llm_reqs_total=$llmRequestsIssued';
+}
+
+/// One page's block ledger, from recognized blocks to drawn regions (F13.7).
+///
+/// The worker's `OcrFunnel` closes on *clusters*; this closes on *blocks*, and
+/// the two gaps it names are the ones no existing line could name:
+///
+///  * `skippedAsTarget` — blocks whose detected language equals the target and
+///    which `translation_pipeline.dart:165-173` therefore drops without a word.
+///    A kanji-only Japanese line read by the non-Japanese recognizer lands here
+///    (see `_detectLanguage` in the worker), which is one of the two ways a
+///    fully recognized line can end up untranslated on a page whose funnel
+///    looks healthy.
+///  * `modelDropped` — blocks the model answered with an empty string or with
+///    the source text unchanged, dropped by `translation_pipeline.dart:213-214`
+///    (`text.isEmpty || text == pending[i].text`) — the other way.
+///
+/// `null` means "not measurable on this path" and prints `?`, never 0: the
+/// reader's per-page path cannot see the pending split without re-running the
+/// pipeline's own composition, so it reports only `votes` and `regions`.
+String blockFunnelLine({
+  required String page,
+  required int? votes,
+  required int? pending,
+  required int? ready,
+  required int? llmIn,
+  required int? llmOut,
+  required int regions,
+  required int? modelDropped,
+}) {
+  String show(int? value) => value == null ? '?' : '$value';
+  int? skipped;
+  if (votes != null && pending != null && ready != null) {
+    skipped = math.max(0, votes - pending - ready);
+  }
+  return 'BlockFunnel page=$page votes=${show(votes)} '
+      'pending=${show(pending)} ready=${show(ready)} '
+      'skippedAsTarget=${show(skipped)} llm_in=${show(llmIn)} '
+      'llm_out=${show(llmOut)} regions=$regions '
+      'modelDropped=${show(modelDropped)}';
 }
 
 class _TranslationTask {
@@ -685,6 +759,29 @@ class ImageTranslationService with ChangeNotifier {
       _updateLanguageLock(comicKey, analysis.languageVotes, config);
       _mergeGlossary(comicKey, analysis.newGlossary);
       regions = analysis.regions;
+      // F13.7: the reader path can see the language votes and the regions but
+      // not the pending split (that lives inside `analyzePage`), so it reports
+      // the pair it has and prints `?` for the rest rather than a fake 0.
+      // `votes - regions` is the count of recognized blocks that produced no
+      // drawn region on this page — the number that says "text was recognized
+      // and then went nowhere".
+      var votesTotal = analysis.languageVotes.values.fold<int>(
+        0,
+        (a, b) => a + b,
+      );
+      Log.info(
+        'Image Translation',
+        blockFunnelLine(
+          page: cacheKey,
+          votes: votesTotal,
+          pending: null,
+          ready: null,
+          llmIn: null,
+          llmOut: null,
+          regions: regions.length,
+          modelDropped: null,
+        ),
+      );
       TranslationStore().put(cacheKey, regions, chapter: chapter);
       // The durable text now exists (even if empty), so the OCR intermediate
       // is spent — drop it, matching translatePageGroup's stage-3 lifecycle,
@@ -928,9 +1025,21 @@ class ImageTranslationService with ChangeNotifier {
 
     var batchOk = true;
     var translated = const <String>[];
+    // F13.7 request-shape observability: the group path's LLM stage is exactly
+    // one request (or none), and this records that as a number plus the epoch
+    // window that lets the log prove whether another group's request was in
+    // flight at the same time.
+    var llmRequests = 0;
+    var llmBlocks = 0;
+    var llmWindowStartMs = 0;
+    var llmWindowEndMs = 0;
     if (texts.isNotEmpty) {
       if (shouldCancel?.call() ?? false) throw const PipelineCanceled();
       onStage?.call(TranslationStage.translating, completedPages());
+      llmRequests = 1;
+      llmBlocks = texts.length;
+      GroupPerf.llmRequestsIssued++;
+      llmWindowStartMs = DateTime.now().millisecondsSinceEpoch;
       llmSw.start();
       try {
         var result = await LlmTranslator.translateBatch(
@@ -945,6 +1054,7 @@ class ImageTranslationService with ChangeNotifier {
         batchOk = false;
       }
       llmSw.stop();
+      llmWindowEndMs = DateTime.now().millisecondsSinceEpoch;
     }
 
     for (var i = 0; i < pages.length; i++) {
@@ -960,10 +1070,46 @@ class ImageTranslationService with ChangeNotifier {
               sliceAt[i].clamp(0, translated.length),
               (sliceAt[i] + po.pending.length).clamp(0, translated.length),
             );
-      regionsOf[i] = [
+      var regions = [
         ...po.ready,
         ...pipeline.regionsFromTranslation(po.pending, slice),
       ];
+      regionsOf[i] = regions;
+      // F13.7: name the two silent drops of the pipeline stage from the
+      // service's own view of the data. `modelDropped` mirrors
+      // `translation_pipeline.dart:213-214` exactly (`text.isEmpty ||
+      // text == pending[i].text`); `skippedAsTarget` is the target-language
+      // filter at `translation_pipeline.dart:165-173`, recovered as
+      // `votes - pending - ready` because `votes` is counted over the blocks
+      // that survived `_isTranslatable` and `pending`/`ready` over the ones
+      // that survived the language filter. Nothing here is used for control
+      // flow.
+      if (po.pending.isNotEmpty || po.ready.isNotEmpty) {
+        var llmOut = 0;
+        var modelDropped = 0;
+        for (var k = 0; k < po.pending.length; k++) {
+          var out = k < slice.length ? slice[k].trim() : '';
+          if (out.isEmpty || out == po.pending[k].text) {
+            modelDropped++;
+          } else {
+            llmOut++;
+          }
+        }
+        var votesTotal = po.languageVotes.values.fold<int>(0, (a, b) => a + b);
+        Log.info(
+          'Image Translation',
+          blockFunnelLine(
+            page: '$i',
+            votes: votesTotal,
+            pending: po.pending.length,
+            ready: po.ready.length,
+            llmIn: po.pending.length,
+            llmOut: llmOut,
+            regions: regions.length,
+            modelDropped: modelDropped,
+          ),
+        );
+      }
     }
 
     // Stage 3 — render + cache each resolved page with bounded concurrency.
@@ -1040,6 +1186,10 @@ class ImageTranslationService with ChangeNotifier {
       totalMs: groupSw.elapsedMilliseconds,
       bytesIn: bytesIn,
       bytesOut: bytesOut,
+      llmRequests: llmRequests,
+      llmBlocks: llmBlocks,
+      llmWindowStartMs: llmWindowStartMs,
+      llmWindowEndMs: llmWindowEndMs,
     );
     Log.info('Image Translation', groupPerf.toLogLine());
     // The terminal stage report goes first on purpose: the pre-translation
