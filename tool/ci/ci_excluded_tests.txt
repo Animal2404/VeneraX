@@ -1,0 +1,36 @@
+# Explicit, reason-carrying exclusion list for the full unit-test run in
+# .github/workflows/main.yml (Test job).
+#
+# POLICY — read before adding a line.
+#
+#   * An entry does NOT stop the file from running. `flutter test` still runs
+#     every test file on disk; an excluded file's failures are printed in the
+#     step log and counted in the step summary as "tolerated". That is the
+#     whole point: an exclusion is a named, visible environment gap, never a
+#     silent whitelist. Nothing here is invisible.
+#   * Every line needs a reason after `|`. A line without one fails the guard.
+#   * An entry whose file no longer exists fails the guard (stale exclusion).
+#   * An entry whose cases all pass produces a warning telling you to delete it.
+#   * At most 8 entries (maxExclusions in tool/ci/check_test_run.dart). If you
+#     need more, fix the runner or make the test skip itself with a counted
+#     `skip:` — do not grow this list.
+#   * "The test fails" is NOT a reason. A real product failure must turn the
+#     build red; only "this runner cannot possibly provide the dependency" is.
+#
+# Format:  test/<name>_test.dart | <reason>
+#
+# CURRENTLY EMPTY ON PURPOSE.
+#
+# The four files that were suspected of being CI-impossible were all already in
+# the old 33-file whitelist and were observed green on windows-latest
+# (run 34340780569, Test job: 443 passed, 1 skipped):
+#   * test/ort_output_dtype_test.dart     — 8 cases run and pass, 1 self-skips
+#     (the "generator index integrity" case needs the native runtime).
+#   * test/translation_store_schema_test.dart — sqlite3 loads fine under
+#     flutter_tester on this runner.
+#   * test/ocr_cache_reuse_test.dart      — passes.
+#   * test/golden_ocr_corpus_test.dart    — passes; there are no
+#     *.expected.txt fixtures yet, so the non-empty check is vacuous.
+# Adding an exclusion for any of them would be a lie. Keep this file empty
+# until a full run proves a file cannot execute here, and then write the
+# reason with the exact missing dependency.

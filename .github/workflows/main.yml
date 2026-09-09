@@ -4,6 +4,17 @@ on:
   push:
     tags:
       - "v*"
+  # Pull requests run the full unit-test suite (Test job below). The build
+  # jobs stay tag/dispatch-only: they are slow and produce artifacts no PR
+  # consumes.
+  #
+  # No `paths` filter, on purpose. A required check that is skipped for a path
+  # the filter does not know about never reports at all, and a filter that
+  # misses a new source directory silently stops testing the code that matters.
+  # The accepted tradeoff is that a doc-only PR still pays for a windows-latest
+  # suite. If the runner bill ever justifies a filter, use `paths-ignore` for
+  # `doc/**` and `**/*.md` only — never a positive `paths` list.
+  pull_request:
   workflow_dispatch:
     inputs:
       platform:
@@ -13,6 +24,10 @@ on:
         required: false
         options:
           - all
+          # Test job only: the fast path for iterating on CI itself, so a
+          # workflow change can be proven without waiting for six platform
+          # builds.
+          - test
           - ios
           - android
           - windows
@@ -31,28 +46,82 @@ on:
 permissions:
   contents: write
 
-# A newer release tag supersedes any still-running older release build. Manual
-# build-only dispatches use a unique group and never cancel each other.
+# A newer release tag supersedes any still-running older release build. A new
+# push to a pull request supersedes that PR's previous test run, so stale
+# commits stop burning a windows runner. Manual build-only dispatches use a
+# unique group and never cancel each other.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name == 'push' && 'release' || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'push' }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'push' && 'release' || (github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id) }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 jobs:
   Test:
     runs-on: windows-latest
+    # The suite gates every PR. Cap it so one hung test cannot hold a runner
+    # for the 6 h default.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
       - uses: subosito/flutter-action@v2
         with:
           channel: "stable"
           architecture: x64
-      - name: Run unit tests
+      - name: Fetch packages
+        shell: bash
+        run: flutter pub get
+
+      # The guard's own regression test. It proves that the drift, floor,
+      # stale-exclusion and cap paths can still fail; a guard nobody has ever
+      # seen fire is decoration. Runs before the suite so a broken guard is not
+      # discovered after 10 minutes of testing.
+      - name: Guard self-test
+        shell: bash
+        run: dart run tool/ci/check_test_run.dart --self-test
+
+      # FULL suite: no file list, so a newly added test file is picked up with
+      # nothing to remember. The previous version of this step named 33 files
+      # while 138 existed on disk, which is how 105 files / 789 cases went
+      # unrun in every CI run ever performed.
+      #
+      # shell: bash, explicitly. This step was deleted once (commit a5ddd31)
+      # because its bash guard hit a ParserError under the runner's default
+      # PowerShell; naming the shell is what makes the pipeline below portable
+      # and keeps a failing `flutter test` red through `set -e`.
+      - name: Run the full unit-test suite
+        shell: bash
+        env:
+          # Floor for executed (non-skipped) cases: a run in which everything
+          # skips is green to `flutter test` and must not be green here.
+          # Raise it as the suite grows; the step summary prints the margin.
+          MIN_EXECUTED_TESTS: "800"
         run: |
-          flutter pub get
-          flutter test test/ocr_batching_test.dart test/ocr_pages_batch_test.dart test/ort_capabilities_test.dart test/native_api_guard_test.dart test/translation_performance_config_test.dart test/translation_worker_policy_test.dart test/translation_store_schema_test.dart test/pre_translation_activity_test.dart test/pre_translation_chapter_test.dart test/ordered_group_committer_test.dart test/guide_document_test.dart test/golden_ocr_corpus_test.dart test/init_mixin_test.dart test/ocr_fingerprint_test.dart test/page_prefetcher_test.dart test/ocr_pipeline_mode_test.dart test/ocr_oom_shrink_test.dart test/vertical_typesetting_test.dart test/word_wrap_cn_test.dart test/ocr_layout_overflow_test.dart test/headless_golden_flags_test.dart test/local_model_import_test.dart test/ocr_worker_session_test.dart test/ort_output_dtype_test.dart test/ocr_layout_stroke_test.dart test/ocr_layout_autosize_test.dart test/ocr_cache_reuse_test.dart test/ocr_cpu_pinning_test.dart test/pre_translation_progress_ticker_test.dart test/pre_translation_phase_timing_test.dart test/translation_group_perf_reporting_test.dart test/translation_perf_display_source_test.dart test/pre_translation_phase_rates_test.dart
-      # test/golden_ocr_corpus_test.dart enforces the corpus (presence, licence,
-      # size budget). Timing is deliberately NOT asserted: these runners have no
-      # GPU, and a GPU benchmark on a CPU runner measures nothing (plan §3.8).
+          set -euo pipefail
+          mkdir -p ci-out
+          # --machine emits one JSON event per line on stdout; everything the
+          # tool prints goes to stderr, so the report stays parseable.
+          set +e
+          flutter test --machine --no-pub > ci-out/test_report.jsonl 2> ci-out/test_stderr.log
+          flutter_status=$?
+          set -e
+          # Keep the tool's own output in the log: a suite that fails to load
+          # says so here and nowhere else.
+          cat ci-out/test_stderr.log || true
+          dart run tool/ci/check_test_run.dart \
+            --report ci-out/test_report.jsonl \
+            --test-dir test \
+            --exclusions tool/ci/ci_excluded_tests.txt \
+            --min-executed "$MIN_EXECUTED_TESTS" \
+            --flutter-exit "$flutter_status"
+
+      # The raw report is the evidence behind every count in the summary.
+      - name: Upload machine report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-machine-report
+          path: ci-out/
+          retention-days: 5
+          if-no-files-found: ignore
 
   Build_MacOS:
     runs-on: macos-15
