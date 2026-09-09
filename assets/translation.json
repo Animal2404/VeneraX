@@ -1434,7 +1434,9 @@
     "Suggested for this machine: @tier. Your detection model has no batch dimension, so detection stays at 1 tile per call.": "本机建议：@tier。您的检测模型没有批量维度，因此检测保持每次 1 块。",
     "Suggested for this machine: @tier. A graphics card is in use, but its memory size could not be read, so only the settings that are safe on any card are suggested. Tap to check the graphics memory.": "本机建议：@tier。已在使用显卡，但读不到它的显存容量，因此只推荐在任何显卡上都安全的设置。点击可检测显存。",
     "Suggested for this machine: @tier — detection batch @det, recognition batch @rec, @pages pages per recognition call.": "本机建议：@tier —— 检测批 @det，识别批 @rec，每次识别调用处理 @pages 页。",
-    "Suggested for this machine: @tier — @vram MB of graphics memory, detection batch @det, recognition batch @rec, @pages pages per recognition call.": "本机建议：@tier —— 显存 @vram MB，检测批 @det，识别批 @rec，每次识别调用处理 @pages 页。"
+    "Suggested for this machine: @tier — @vram MB of graphics memory, detection batch @det, recognition batch @rec, @pages pages per recognition call.": "本机建议：@tier —— 显存 @vram MB，检测批 @det，识别批 @rec，每次识别调用处理 @pages 页。",
+    "Erased text could not be rebuilt on @n area(s) — the original is kept there": "有 @n 处原文未能重建，已保留原始文字",
+    "Models are still in memory after cancelling this task": "取消本任务后模型仍驻留显存"
   },
   "zh_TW": {
     "Reading Statistics": "閱讀統計",
@@ -2871,6 +2873,8 @@
     "Suggested for this machine: @tier. Your detection model has no batch dimension, so detection stays at 1 tile per call.": "本機建議：@tier。您的偵測模型沒有批量維度，因此偵測保持每次 1 塊。",
     "Suggested for this machine: @tier. A graphics card is in use, but its memory size could not be read, so only the settings that are safe on any card are suggested. Tap to check the graphics memory.": "本機建議：@tier。已在使用顯示卡，但讀不到它的記憶體容量，因此只推薦在任何顯示卡上都安全的設定。點擊可檢測記憶體。",
     "Suggested for this machine: @tier — detection batch @det, recognition batch @rec, @pages pages per recognition call.": "本機建議：@tier —— 偵測批 @det，識別批 @rec，每次識別呼叫處理 @pages 頁。",
-    "Suggested for this machine: @tier — @vram MB of graphics memory, detection batch @det, recognition batch @rec, @pages pages per recognition call.": "本機建議：@tier —— 記憶體 @vram MB，偵測批 @det，識別批 @rec，每次識別呼叫處理 @pages 頁。"
+    "Suggested for this machine: @tier — @vram MB of graphics memory, detection batch @det, recognition batch @rec, @pages pages per recognition call.": "本機建議：@tier —— 記憶體 @vram MB，偵測批 @det，識別批 @rec，每次識別呼叫處理 @pages 頁。",
+    "Erased text could not be rebuilt on @n area(s) — the original is kept there": "有 @n 處原文未能重建，已保留原始文字",
+    "Models are still in memory after cancelling this task": "取消本任務後模型仍駐留顯存"
   }
 }
