@@ -103,6 +103,16 @@ jobs:
           # --machine emits one JSON event per line on stdout; everything the
           # tool prints goes to stderr, so the report stays parseable.
           set +e
+          # The machine report goes to a file, so the log shows nothing until the
+          # suite ends and 'slow' is indistinguishable from 'hung'. One progress line
+          # every 30s makes a stalled run provable instead of arguable.
+          ( while :; do
+              n=$(grep -c '"testDone"' ci-out/test_report.jsonl 2>/dev/null; true)
+              echo "[heartbeat] tests finished: $n"
+              sleep 30
+            done ) & HB=$!
+          trap 'kill $HB 2>/dev/null || true' EXIT
+
           flutter test --machine --no-pub > ci-out/test_report.jsonl 2> ci-out/test_stderr.log
           flutter_status=$?
           set -e
