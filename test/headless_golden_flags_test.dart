@@ -1,10 +1,9 @@
-import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:venera/foundation/image_translation/ort_capabilities.dart';
-import 'package:venera/foundation/image_translation/translation_worker.dart';
-import 'package:venera/headless.dart';
+import 'package:venera/headless_cli.dart';
+
+import '../tool/ocr_run_stats.dart';
 
 /// Guards the measurement harness itself (plan §3.8 / §3.10, D-15 "先修工具").
 ///
@@ -12,6 +11,15 @@ import 'package:venera/headless.dart';
 /// project, so the parts of it that *decide* whether a run passed are tested
 /// here as pure functions: tolerance for a crashed model must never turn into
 /// "looks like a pass", and a baseline row must be able to name its commit.
+///
+/// Two rules keep this file usable by CI, and the last group enforces them:
+///  * it must NOT import the app graph (`headless.dart`, `init.dart`,
+///    `foundation/**`, `pages/**`). Doing so compiles the whole application on
+///    every run and inherits any syntax error another agent has in flight, which
+///    is a minute of build for zero added proof;
+///  * it must NOT spawn a child VM. Proving these rules by running the CLI tool
+///    costs one compile per case — that is how the `Test` job hung for hours
+///    behind this one file, blocking every other test's verdict.
 void main() {
   group('headless flag parsing', () {
     test('defaults: no trace, no offline, command taken from after --headless',
@@ -62,8 +70,9 @@ void main() {
 
     test('--ignore-disheadless-log maps to mutedLog', () {
       expect(
-        parseHeadlessFlags(['--headless', 'ocr-golden', '--ignore-disheadless-log'])
-            .mutedLog,
+        parseHeadlessFlags([
+              '--headless', 'ocr-golden', '--ignore-disheadless-log',
+            ]).mutedLog,
         isTrue,
       );
     });
@@ -118,7 +127,8 @@ void main() {
         context: const {
           'ep': 'directml',
           'pageLang': 'ko',
-          'ortReport': {'active': 'directml', 'sessionCount': 3},
+          'sessions': 3,
+          'degraded': 'rec-shrink',
         },
         stack: '#0 pipeline.ocrPages',
       );
@@ -128,11 +138,10 @@ void main() {
       expect(e['batch'], 16);
       expect(e['group'], 2);
       expect(e['error'], contains('80070057'));
-      // Which EP, which language's recognizer, and the whole session report:
-      // "the exception named no model and no EP" is the reason D-15 cost a run.
       expect(e['ep'], 'directml');
       expect(e['pageLang'], 'ko');
-      expect((e['ortReport'] as Map)['sessionCount'], 3);
+      expect(e['sessions'], 3);
+      expect(e['degraded'], 'rec-shrink');
       expect(e['stack'], isNotNull);
     });
 
@@ -149,24 +158,49 @@ void main() {
       expect(e.containsKey('models'), isFalse);
     });
 
-    test('session evidence names the models that actually got a session', () {
+    test('configured model paths AND their component dirs are reported', () {
+      // Layout on disk is <dataPath>/translation_models/<componentId>/<file>.
+      // The CPU pin list is written in <componentId> tokens, so the record has
+      // to expose that token — from a Windows path, not only a posix one.
+      final m = describeModelPaths(
+        detector: r'C:\data\translation_models\det_ppocr_v4\det.onnx',
+        recModels: const {
+          'en': r'C:\data\translation_models\ocr_en\rec.onnx',
+          'ko': r'C:\data\translation_models\ocr_ko\rec.onnx',
+        },
+        recDicts: const {'en': r'C:\data\translation_models\ocr_en\en.txt'},
+        recHeights: const {'en': 32, 'ko': 32},
+      );
+      expect((m['recModels'] as Map)['en'], endsWith(r'ocr_en\rec.onnx'));
+      final dirs = m['dirs'] as Map;
+      expect(dirs['en'], 'ocr_en', reason: 'backslash paths must normalise');
+      expect(dirs['ko'], 'ocr_ko');
+      expect(dirs['detector'], 'det_ppocr_v4');
+
+      final posix = describeModelPaths(
+        detector: '/data/translation_models/det_ppocr_v4/det.onnx',
+        recModels: const {'ko': '/data/translation_models/ocr_ko/rec.onnx'},
+      );
+      expect((posix['dirs'] as Map)['ko'], 'ocr_ko');
+      expect(posix.containsKey('jaEncoder'), isFalse);
+      expect((posix['dirs'] as Map).containsKey('jaEncoder'), isFalse);
+    });
+  });
+
+  group('session evidence', () {
+    test('modelPaths come from the session report, not from settings', () {
       // The keys of EpReport.modelInputShapes ARE model paths: this is the only
-      // field that can tell "the rec session died" apart from "the detector
-      // died" without re-running anything (D-15 step 0).
-      final report = EpReport(
-        active: OrtEpKind.directml,
-        runtimeVersion: '1.25.0',
-        attempts: const ['directml', 'cpu'],
+      // field that separates "the rec session died" from "the detector died"
+      // without re-running anything (D-15 step 0).
+      final ev = ocrSessionEvidence(
+        ep: 'directml',
+        sessions: 2,
         modelInputShapes: const {
           r'C:\data\translation_models\det_ppocr_v4\det.onnx': [-1, 3, 480, 480],
           r'C:\data\translation_models\ocr_ko\rec.onnx': [32, 3, 48, 320],
         },
-        batchCapable: true,
-        sessionCount: 2,
+        epAttempts: const ['directml', 'cpu'],
         degradedTrail: const ['rec-oom-shrink'],
-      );
-      final ev = ocrSessionEvidence(
-        report: report,
         perf: const {'degraded': 'rec-shrink', 'sessions': 2, 'ep': 'directml'},
       );
       expect(ev['modelPaths'], contains(contains('ocr_ko')));
@@ -176,45 +210,14 @@ void main() {
       expect(ev['degradedTrail'], contains('rec-oom-shrink'));
       expect(ev['degraded'], 'rec-shrink');
       expect(ev['epAttempts'], equals(['directml', 'cpu']));
-      // The shapes themselves: a pinned-to-CPU model would show a cpu session
-      // here, which is what makes the pin question checkable at all.
       expect((ev['modelInputShapes'] as Map).length, 2);
     });
 
-    test('no report yet degrades to nulls, never to a throw', () {
-      final ev = ocrSessionEvidence(report: null);
+    test('no session yet says so instead of inventing an EP', () {
+      final ev = ocrSessionEvidence();
       expect(ev['ep'], isNull);
       expect(ev['sessions'], isNull);
       expect(ev.containsKey('modelPaths'), isFalse);
-    });
-
-    test('model paths AND their component directories are flattened (D-15 step 0)',
-        () {
-      // Layout on disk is <dataPath>/translation_models/<componentId>/<file>.
-      // The CPU pin list is written in <componentId> tokens, so the record has
-      // to expose that token — from a Windows path, not only a posix one.
-      final m = describeModelPaths(WorkerModelPaths(
-        detector: r'C:\data\translation_models\det_ppocr_v4\det.onnx',
-        recModels: const {
-          'en': r'C:\data\translation_models\ocr_en\rec.onnx',
-          'ko': r'C:\data\translation_models\ocr_ko\rec.onnx',
-        },
-        recDicts: const {'en': r'C:\data\translation_models\ocr_en\en.txt'},
-        recHeights: const {'en': 32, 'ko': 32},
-      ));
-      expect((m['recModels'] as Map)['en'], endsWith(r'ocr_en\rec.onnx'));
-      final dirs = m['dirs'] as Map;
-      expect(dirs['en'], 'ocr_en', reason: 'backslash paths must normalise');
-      expect(dirs['ko'], 'ocr_ko');
-      expect(dirs['detector'], 'det_ppocr_v4');
-
-      final posix = describeModelPaths(WorkerModelPaths(
-        detector: '/data/translation_models/det_ppocr_v4/det.onnx',
-        recModels: const {'ko': '/data/translation_models/ocr_ko/rec.onnx'},
-      ));
-      expect((posix['dirs'] as Map)['ko'], 'ocr_ko');
-      expect(posix.containsKey('jaEncoder'), isFalse);
-      expect((posix['dirs'] as Map).containsKey('jaEncoder'), isFalse);
     });
   });
 
@@ -372,93 +375,185 @@ void main() {
     });
   });
 
-  group('tool/ocr_run_stats.dart refuses an unattested run', () {
-    String payload({
-      String gitsha = '2f6464f11111111111111111111111111111111',
-      List<Map<String, dynamic>> errors = const [],
-      bool consistent = true,
-    }) {
-      return '[CLI PRINT] ${jsonEncode({
-            'status': consistent ? 'success' : 'error',
-            'data': {
-              'gitsha': gitsha,
-              'gitshasource': gitsha.isEmpty ? 'none' : 'dart-define',
-              'machine': {'os': 'windows'},
-              'ort': {'active': 'directml', 'runtimeVersion': '1.25.0'},
-              'pages': [
-                {'file': 'p.png', 'tier': 'fast', 'batch': 1, 'totalMsMedian': 10},
-              ],
-              'errors': errors,
-              'consistency': {'baseline': 'first-variant', 'mismatches': []},
-              'resource': {'before': null, 'during': [], 'after': null},
-              'verdict': {
-                'consistent': consistent && errors.isEmpty,
-                'samples': 1,
-                'errors': errors.length,
-                'expectedSamples': 1,
-              },
-            },
-          })}';
-    }
+  group('ocr_run_stats gate (asserted directly, no child process)', () {
+    final goodSha = '2f6464f${'0' * 33}';
 
-    int runTool(String contents, {List<String> extraArgs = const []}) {
-      final dir = Directory.systemTemp.createTempSync('ocr_stats');
-      final file = File('${dir.path}/golden.json')..writeAsStringSync(contents);
-      final result = Process.runSync(Platform.resolvedExecutable, [
-        'run',
-        '${Directory.current.path}/tool/ocr_run_stats.dart',
-        file.path,
-        ...extraArgs,
-      ]);
-      dir.deleteSync(recursive: true);
-      return result.exitCode;
-    }
+    RunAssessment assess({
+      String gitsha = '2f6464f',
+      String gitshaSource = 'dart-define',
+      bool allowUnattested = false,
+      int sampleCount = 1,
+      List<Object?> errors = const [],
+      List<Object?> mismatches = const [],
+      Object? consistent = true,
+      int? expectedSamples = 1,
+      Object? status = 'success',
+    }) =>
+        assessRun(
+          gitsha: gitsha,
+          gitshaSource: gitshaSource,
+          allowUnattested: allowUnattested,
+          sampleCount: sampleCount,
+          errors: errors,
+          mismatches: mismatches,
+          consistent: consistent,
+          expectedSamples: expectedSamples,
+          status: status,
+        );
 
-    String runToolStderr(String contents, {List<String> extraArgs = const []}) {
-      final dir = Directory.systemTemp.createTempSync('ocr_stats');
-      final file = File('${dir.path}/golden.json')..writeAsStringSync(contents);
-      final result = Process.runSync(Platform.resolvedExecutable, [
-        'run',
-        '${Directory.current.path}/tool/ocr_run_stats.dart',
-        file.path,
-        ...extraArgs,
-      ]);
-      dir.deleteSync(recursive: true);
-      return '${result.stdout}\n${result.stderr}';
-    }
-
-    test('empty gitsha exits non-zero and warns', () {
-      final out = runToolStderr(payload(gitsha: ''));
-      expect(runTool(payload(gitsha: '')), isNot(0));
-      expect(out, contains('WARNING'));
-      expect(out, contains('gitsha'));
+    test('a fully attested clean run is publishable (exit 0)', () {
+      final a = assess(gitsha: goodSha);
+      expect(a.publishable, isTrue, reason: a.problems.join('; '));
+      expect(a.exitCode, 0);
+      expect(a.gitsha, goodSha);
     });
 
-    test('a non-hex gitsha is refused too', () {
-      expect(runTool(payload(gitsha: 'unknown')), isNot(0));
-      expect(runTool(payload(gitsha: 'dirty')), isNot(0));
-    });
-
-    test('--allow-unattested still says so instead of hiding it', () {
-      final out =
-          runToolStderr(payload(gitsha: ''), extraArgs: ['--allow-unattested']);
-      expect(out, contains('UNATTESTED'));
-    });
-
-    test('recorded per-page errors keep the run failing', () {
-      // The harness now survives a crashed model; the reporter must still
-      // refuse to publish that sweep as a clean baseline row.
+    test('empty gitsha is refused with a warning and a non-zero exit', () {
+      final a = assess(gitsha: '', gitshaSource: 'none');
+      expect(a.exitCode, isNot(0));
+      expect(a.problems, isNotEmpty);
+      expect(a.problems.first, startsWith('WARNING'));
+      expect(a.problems.first, contains('gitsha'));
+      expect(a.problems.first, contains('empty'));
       expect(
-        runTool(payload(errors: const [
-          {'file': 'p.png', 'error': 'boom'},
-        ])),
-        isNot(0),
+        exitCodeFor(
+          gitsha: '',
+          sampleCount: 1,
+          errors: const [],
+          mismatches: const [],
+          consistent: true,
+        ),
+        1,
       );
     });
 
-    test('a fully attested clean run exits 0', () {
-      expect(runTool(payload()), 0);
-      expect(runTool(payload(), extraArgs: ['--check']), 0);
+    test('a non-hex gitsha is refused too', () {
+      for (final junk in ['unknown', 'dirty', 'HEAD', 'z' * 40]) {
+        expect(assess(gitsha: junk).exitCode, 1, reason: junk);
+      }
+      // 7-40 hex is the accepted shape, short sha included: that is what the
+      // plan's own `2f6464f` row uses.
+      expect(assess(gitsha: '2f6464f').exitCode, 0);
+    });
+
+    test('--allow-unattested is loud, not silent', () {
+      final a = assess(gitsha: '', allowUnattested: true);
+      expect(a.exitCode, 0, reason: 'explicitly allowed');
+      expect(a.gitsha, 'UNATTESTED');
+      expect(a.notices.join(' '), contains('UNATTESTED'));
+    });
+
+    test('github-sha source is annotated, not hidden', () {
+      final a = assess(gitsha: goodSha, gitshaSource: 'github-sha');
+      expect(a.exitCode, 0);
+      expect(a.notices.join(' '), contains('GITHUB_SHA'));
+    });
+
+    test('recorded per-page errors keep the run failing (§3.10)', () {
+      // The harness now survives a crashed model; the reporter must still
+      // refuse to publish that sweep as a clean baseline row.
+      final a = assess(
+        gitsha: goodSha,
+        sampleCount: 0,
+        errors: const [
+          {'file': 'p.png', 'error': 'boom'},
+        ],
+        consistent: false,
+      );
+      expect(a.exitCode, 1);
+      expect(a.problems.join(' '), contains('MEASUREMENT GAPS'));
+    });
+
+    test('row loss is detected even when nothing else complains', () {
+      final a = assess(gitsha: goodSha, sampleCount: 3, expectedSamples: 4);
+      expect(a.exitCode, 1);
+      expect(a.problems.join(' '), contains('row loss'));
+    });
+
+    test('mismatches fail, and a zero-sample run can never pass', () {
+      expect(
+        assess(gitsha: goodSha, mismatches: const [
+          {'file': 'x'},
+        ]).exitCode,
+        1,
+      );
+      expect(assess(gitsha: goodSha, sampleCount: 0).exitCode, 1);
+    });
+
+    test('status/verdict contradiction is refused', () {
+      final a = assess(gitsha: goodSha, status: 'error', consistent: true);
+      expect(a.exitCode, 1);
+      expect(a.problems.join(' '), contains('contradicts itself'));
+    });
+
+    test('every problem is reported at once, not just the first', () {
+      final a = assess(
+        gitsha: '',
+        sampleCount: 0,
+        errors: const [
+          {'file': 'p.png'},
+        ],
+        mismatches: const [
+          {'file': 'p.png'},
+        ],
+        consistent: false,
+        expectedSamples: 2,
+      );
+      expect(a.problems.length, greaterThanOrEqualTo(5));
     });
   });
+
+  group('CI cost invariants of this file', () {
+    test('this test does not import the app graph', () {
+      // Tripwire for the two rules in the header note. Read directly: no shell,
+      // no child process, no isolate.
+      final imports = _importsOf('test/headless_golden_flags_test.dart');
+      expect(imports, contains('package:venera/headless_cli.dart'));
+      for (final banned in _bannedImports) {
+        expect(
+          imports.any((i) => i.startsWith(banned)),
+          isFalse,
+          reason: '$banned drags the whole app graph into this test',
+        );
+      }
+    });
+
+    test('no case may spawn a process', () {
+      final src =
+          File('test/headless_golden_flags_test.dart').readAsStringSync();
+      // Patterns (not string literals) so the check cannot match its own source.
+      for (final forbidden in [
+        RegExp(r'Process\s*\.\s*run'),
+        RegExp(r'Process\s*\.\s*start'),
+        RegExp(r'Isolate\s*\.\s*spawn'),
+      ]) {
+        expect(forbidden.hasMatch(src), isFalse,
+            reason: '$forbidden — one child VM per case is what stalled CI');
+      }
+    });
+
+    test('the pure layer stays free of the app graph', () {
+      expect(
+        _importsOf('lib/headless_cli.dart')
+            .where((i) => i.startsWith('package:venera/')),
+        isEmpty,
+        reason: 'headless_cli.dart is the layer CI can compile cheaply',
+      );
+    });
+  });
+}
+
+const List<String> _bannedImports = [
+  'package:venera/headless.dart',
+  'package:venera/init.dart',
+  'package:venera/foundation/',
+  'package:venera/pages/',
+];
+
+List<String> _importsOf(String path) {
+  final src = File(path).readAsStringSync();
+  return RegExp("^import '(.+?)';", multiLine: true)
+      .allMatches(src)
+      .map((m) => m.group(1)!)
+      .toList();
 }

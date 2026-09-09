@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 import 'package:flutter/widgets.dart';
+import 'package:venera/headless_cli.dart';
 import 'package:venera/utils/data_sync.dart';
 import 'package:venera/foundation/comic_source/comic_source.dart';
 import 'package:venera/foundation/log.dart';
@@ -399,318 +400,51 @@ Map<String, dynamic> _lastPerf() {
 }
 
 // ---------------------------------------------------------------------------
-// Pure argument / verdict helpers.
+// Adapters onto the pure decision layer.
 //
-// Everything that decides "did this measurement pass" lives here rather than
-// inside the IO loops for one reason: this harness is the only evidence behind
-// every performance claim in the project, so its own decision logic has to be
-// unit-testable without a GPU, a model set or a comic source attached.
-// Covered by test/headless_golden_flags_test.dart.
+// Parsing, attestation, record shape and the golden verdict all live in
+// `headless_cli.dart`, deliberately compiled without the app graph so the
+// harness's own pass/fail maths is testable in seconds instead of dragging
+// `init.dart` -> comic source -> js engine into every test run. Only the
+// unpacking of app-owned types stays here.
 // ---------------------------------------------------------------------------
 
-/// Commands that measure local inference and may therefore run with `--offline`.
-const List<String> kOfflineCapableCommands = ['ocr-golden', 'ocr-selfcheck'];
-
-/// What argv asked the headless entry point to do — a pure function of argv,
-/// no IO, no bindings.
-class HeadlessFlags {
-  const HeadlessFlags({
-    required this.command,
-    required this.commandIndex,
-    required this.trace,
-    required this.offline,
-    required this.mutedLog,
-  });
-
-  /// `ocr-golden`, `webdav`, … or null when nothing followed `--headless`.
-  final String? command;
-
-  /// Index of [command] in argv; every sub-command parser slices from here.
-  final int commandIndex;
-
-  /// `--trace`: append every step to the headless trace file.
-  final bool trace;
-
-  /// `--offline`: skip the network-typed startup steps.
-  final bool offline;
-
-  /// `--ignore-disheadless-log`: mute the app logger.
-  final bool mutedLog;
-
-  bool get isOcrCommand => kOfflineCapableCommands.contains(command);
-
-  /// Whether the comic-source / download startup may be skipped. Only ever
-  /// true for an OCR command: skipping it elsewhere would silently break
-  /// webdav / updatescript / updatesubscribe.
-  bool get skipsNetworkInit => offline && isOcrCommand;
-
-  /// A fatal argument problem, or null when the invocation is runnable.
-  String? get error {
-    if (command == null) return 'No command provided for headless mode.';
-    if (offline && !isOcrCommand) {
-      return '--offline is only supported for '
-          '${kOfflineCapableCommands.join(' and ')}; "$command" needs the '
-          'network.';
-    }
-    return null;
-  }
-}
-
-@visibleForTesting
-HeadlessFlags parseHeadlessFlags(List<String> args) {
-  // The first arg is '--headless', so the command is the one right after it.
-  final at = args.indexOf('--headless');
-  final commandIndex = at + 1;
-  final hasCommand = at >= 0 && commandIndex < args.length;
-  return HeadlessFlags(
-    command: hasCommand ? args[commandIndex] : null,
-    commandIndex: hasCommand ? commandIndex : -1,
-    trace: args.contains('--trace'),
-    offline: args.contains('--offline'),
-    mutedLog: args.contains('--ignore-disheadless-log'),
+/// The model set this variant is *configured* to load, flattened for records.
+Map<String, dynamic> _configuredModels() {
+  final p = TranslationModels.workerPaths();
+  return describeModelPaths(
+    detector: p.detector,
+    recModels: p.recModels,
+    recDicts: p.recDicts,
+    recHeights: p.recHeights,
+    jaEncoder: p.jaEncoder,
+    jaDecoder: p.jaDecoder,
+    jaVocab: p.jaVocab,
   );
 }
 
-/// The recorded `gitsha` plus where it came from, so a reader can tell a
-/// build-time attestation from a CI-runtime one. Never guess: an unknown sha is
-/// reported as empty and `tool/ocr_run_stats.dart` refuses it.
-@visibleForTesting
-class GitShaInfo {
-  const GitShaInfo(this.sha, this.source);
-  final String sha;
-
-  /// `'dart-define'` | `'github-sha'` | `'none'`.
-  final String source;
-}
-
-@visibleForTesting
-GitShaInfo resolveGitSha({
-  String? defineValue,
-  Map<String, String>? environment,
-}) {
-  final define = (defineValue ?? const String.fromEnvironment('GIT_SHA')).trim();
-  if (define.isNotEmpty) return GitShaInfo(define, 'dart-define');
-  // `GITHUB_SHA` only exists inside a Actions step, where it is by definition
-  // the commit that produced the artifact, so it cannot mis-attribute a stale
-  // binary. A developer-set `GIT_SHA` *could*, which is why it is deliberately
-  // not read here.
-  final ci = (environment ?? Platform.environment)['GITHUB_SHA']?.trim() ?? '';
-  if (ci.isNotEmpty) return GitShaInfo(ci, 'github-sha');
-  return const GitShaInfo('', 'none');
-}
-
-/// One failed page/variant: what was being measured, and what the evidence
-/// says. `doc/ocr-baseline.md` D-15 step 0 requires the model paths and the
-/// session EP in the record — without them a crash cannot be attributed to a
-/// model at all, which is exactly how D-15 stayed unsolved for a whole run.
-@visibleForTesting
-Map<String, dynamic> ocrErrorRecord({
-  required String file,
-  required String tier,
-  required int batch,
-  required int group,
-  required int variant,
-  required String error,
-  Map<String, dynamic> context = const {},
-  String? stack,
-}) {
-  return {
-    'file': file,
-    'tier': tier,
-    'batch': batch,
-    'group': group,
-    'variant': variant,
-    'error': error,
-    ...context,
-    if (stack != null && stack.isNotEmpty) 'stack': stack,
-  };
-}
-
-/// Flatten [WorkerModelPaths] into JSON-safe fields for an error record.
-///
-/// `dirs` is deliberate: the D-15 CPU containment
-/// (`translation_worker.dart` -> `_cpuOnlyRecDirs`) is matched against the
-/// *model directory name*, so a reader has to be able to compare the two
-/// without re-deriving anything from a path. Reporting the resolved directory
-/// names beside the full paths turns "did the pin apply?" from a guess into a
-/// line-by-line check — and survives both separators, unlike a matcher that
-/// assumes one.
-@visibleForTesting
-Map<String, dynamic> describeModelPaths(WorkerModelPaths paths) {
-  final recDirs = <String, String>{
-    for (final e in paths.recModels.entries) e.key: _dirName(e.value),
-  };
-  return {
-    'detector': paths.detector,
-    'recModels': paths.recModels,
-    'recDicts': paths.recDicts,
-    'recHeights': paths.recHeights,
-    if (paths.jaEncoder != null) 'jaEncoder': paths.jaEncoder,
-    if (paths.jaDecoder != null) 'jaDecoder': paths.jaDecoder,
-    if (paths.jaVocab != null) 'jaVocab': paths.jaVocab,
-    'dirs': {
-      'detector': _dirName(paths.detector),
-      ...recDirs,
-      if (paths.jaEncoder != null) 'jaEncoder': _dirName(paths.jaEncoder!),
-    },
-  };
-}
-
-/// The parent directory name of a model file. The on-disk layout is
-/// `translation_models/<componentId>/<file>`, so this yields the
-/// `componentId` token — which is exactly what the CPU pin list is written in.
-String _dirName(String path) {
-  final parts = path
-      .replaceAll(_backslash, '/')
-      .split('/')
-    ..removeWhere((e) => e.isEmpty);
-  return parts.length < 2 ? '' : parts[parts.length - 2];
-}
-
-/// A single backslash, spelled so it cannot be mistaken for an empty pattern.
-const String _backslash = '\\';
-
-/// The consistency gate (plan §3.8 / §3.10, gate G1).
-///
-/// Tolerance must not become a pass: a page that threw simply produces no row,
-/// so `mismatches` alone would read "perfect" for a run where every model
-/// crashed. Hence the three additional conditions — recorded errors, zero
-/// samples, and a sample count below what the sweep should have produced.
-@visibleForTesting
-bool goldenIsConsistent({
-  required List<Map<String, dynamic>> mismatches,
-  required List<Map<String, dynamic>> errors,
-  required int samples,
-  required int expectedSamples,
-}) {
-  if (mismatches.isNotEmpty) return false;
-  if (errors.isNotEmpty) return false;
-  if (samples <= 0) return false;
-  if (samples != expectedSamples) return false;
-  return true;
-}
-
-/// Assemble the `ocr-golden` JSON payload. Field names are the frozen contract
-/// of plan §3.8; `errors` is additive (a run with no errors emits `[]`).
-@visibleForTesting
-Map<String, dynamic> buildGoldenReport({
-  required List<Map<String, dynamic>> rows,
-  required List<Map<String, dynamic>> mismatches,
-  required List<Map<String, dynamic>> errors,
-  required int expectedSamples,
-  required GitShaInfo gitSha,
-  Map<String, dynamic>? machine,
-  Map<String, dynamic>? ort,
-  Map<String, dynamic>? resource,
-}) {
-  final consistent = goldenIsConsistent(
-    mismatches: mismatches,
-    errors: errors,
-    samples: rows.length,
-    expectedSamples: expectedSamples,
-  );
-  return {
-    'status': consistent ? 'success' : 'error',
-    'data': {
-      'gitsha': gitSha.sha,
-      'gitshasource': gitSha.source,
-      'machine': machine ?? const <String, dynamic>{},
-      'ort': ort,
-      'pages': rows,
-      'errors': errors,
-      'consistency': {
-        'baseline': 'first-variant',
-        'mismatches': mismatches,
-      },
-      'resource': resource ??
-          const <String, dynamic>{
-            'before': null,
-            'during': [],
-            'after': null,
-          },
-      'verdict': {
-        'consistent': consistent,
-        'samples': rows.length,
-        'errors': errors.length,
-        'expectedSamples': expectedSamples,
-      },
-    },
-  };
-}
-
-/// Exit code for a finished golden run: 1 unless *both* the status field and
-/// `verdict.consistent` say clean. Requiring agreement is deliberate — if one
-/// of the two is ever edited the run fails, it never "looks like a pass".
-@visibleForTesting
-int goldenExitCode(Map<String, dynamic> report) {
-  final data = report['data'];
-  final verdict = data is Map ? data['verdict'] : null;
-  final consistent = verdict is Map && verdict['consistent'] == true;
-  return (report['status'] == 'success' && consistent) ? 0 : 1;
-}
-
-/// One-line "was it slow or was it dead" summary, written to stderr: the D-14 /
-/// D-15 runs could not tell a stalled harness from a merely slow one.
-@visibleForTesting
-String goldenSummaryLine({
-  required Duration elapsed,
-  required int pages,
-  required int variants,
-  required int samples,
-  required int expectedSamples,
-  required int mismatches,
-  required int errors,
-}) {
-  final ms = elapsed.inMilliseconds;
-  final perRow = samples == 0 ? 0 : (ms / samples).round();
-  return 'ocr-golden: $ms ms wall | $pages page(s) x $variants variant(s) '
-      '-> $samples/$expectedSamples row(s) | ~$perRow ms/row '
-      '(repeat included) | $mismatches mismatch(es) | $errors error(s)';
-}
-
-/// Evidence that identifies **which model and which EP** a failure happened
-/// under, read from the live [EpReport] — no new dependency, no worker change.
-///
-/// Two path sets are reported, and the difference is the whole point:
-///  * `models`     (see [describeModelPaths]) — what the variant was *configured*
-///    to load, derived from settings and installed files;
-///  * `modelPaths` — the keys of `EpReport.modelInputShapes`, i.e. the models a
-///    session was **actually opened for** in this process, each with its input
-///    shape.
-///
-/// Only the second can separate "the rec session died" from "the detector died",
-/// which is precisely what D-15 could not resolve after a full sweep
-/// (doc/ocr-baseline.md, step 0). `sessions` / `degradedTrail` show whether an
-/// EP fallback or a batch back-off had already happened at that moment.
-@visibleForTesting
-Map<String, dynamic> ocrSessionEvidence({
-  EpReport? report,
+/// Project the worker's live report onto the pure evidence shape.
+Map<String, dynamic> _evidenceFrom(
+  EpReport? report, {
   Map<String, dynamic> perf = const {},
 }) {
-  if (report == null) return const {'ep': null, 'sessions': null};
-  final shapes = report.modelInputShapes;
-  return {
-    'ep': report.active.name,
-    'sessions': report.sessionCount,
-    'modelPaths': shapes.keys.toList(),
-    'modelInputShapes': shapes,
-    if (report.attempts.isNotEmpty) 'epAttempts': report.attempts,
-    if (report.degradedTrail.isNotEmpty) 'degradedTrail': report.degradedTrail,
-    // The worker's own last perf line: `degraded` / `sessions` as the isolate
-    // reported them, alongside the structured report above.
-    if (perf['degraded'] != null) 'degraded': perf['degraded'],
-    if (perf['sessions'] != null) 'perfSessions': perf['sessions'],
-    if (perf['ep'] != null) 'perfEp': perf['ep'],
-  };
+  return ocrSessionEvidence(
+    ep: report?.active.name,
+    sessions: report?.sessionCount,
+    modelInputShapes: report?.modelInputShapes ?? const {},
+    epAttempts: report?.attempts ?? const [],
+    degradedTrail: report?.degradedTrail ?? const [],
+    perf: perf,
+  );
 }
 
-/// [ocrSessionEvidence] must never be the reason a failure goes unreported, so
-/// every read is guarded: this runs inside a `catch`, where a second throw
-/// would reproduce the exact defect it is meant to document.
+/// Reading evidence must never be the reason a failure goes unreported, so every
+/// access is guarded: this runs inside a `catch`, where a second throw would
+/// reproduce the exact defect it exists to document.
 Map<String, dynamic> _sessionEvidence() {
   try {
-    return ocrSessionEvidence(
-      report: TranslationWorker.instance.lastReport,
+    return _evidenceFrom(
+      TranslationWorker.instance.lastReport,
       perf: _lastPerf(),
     );
   } catch (e) {
@@ -888,10 +622,10 @@ Future<void> _ocrGolden(List<String> rest) async {
         final report = TranslationWorker.instance.lastReport;
         context = <String, dynamic>{
           // configured: what this variant is set up to load
-          'models': describeModelPaths(TranslationModels.workerPaths()),
-          // actual: which sessions the isolate really opened, and on what EP
-          ...ocrSessionEvidence(report: report, perf: const {}),
-          'ep': report?.active.name,
+          'models': _configuredModels(),
+          // actual: which sessions the isolate really opened, on what EP, with
+          // what input shapes — the fields that can name the crashing model.
+          ..._evidenceFrom(report),
           if (report != null) 'ortReport': report.toJson(),
         };
       } catch (e) {

@@ -7,9 +7,13 @@
 // Exit code 1 means "do not merge": the plan forbids shipping a claim that the
 // data does not support (V6-1, §3.10).
 //
-// Every check here collects a problem instead of exiting on the first one, so a
-// single run tells the operator everything that is wrong with the artifact —
-// partial diagnostics are how a broken measurement gets rationalised.
+// The *decision* itself is [assessRun] below: a pure function over the report's
+// fields. It used to be proved by `dart run`-ing this script from a test, which
+// costs one full compile per case and stalled CI's `Test` job for hours; rules
+// this important are asserted directly instead. Every check collects a problem
+// rather than exiting on the first one, so a single run tells the operator
+// everything that is wrong with the artifact — partial diagnostics are how a
+// broken measurement gets rationalised.
 import 'dart:convert';
 import 'dart:io';
 
@@ -42,8 +46,9 @@ void main(List<String> args) {
   // real run looked like "no pages sampled" — unwrap it, and accept a flat
   // payload too so a hand-trimmed JSON still works.
   final status = decoded['status'];
-  final payload =
-      decoded['data'] is Map<String, dynamic> ? decoded['data'] as Map<String, dynamic> : decoded;
+  final payload = decoded['data'] is Map
+      ? Map<String, dynamic>.from(decoded['data'] as Map)
+      : decoded;
 
   final verdict = payload['verdict'] as Map<String, dynamic>? ?? const {};
   final consistency = payload['consistency'] as Map<String, dynamic>? ?? const {};
@@ -54,62 +59,36 @@ void main(List<String> args) {
   final ort = payload['ort'] as Map<String, dynamic>?;
   final resource = payload['resource'] as Map<String, dynamic>?;
 
-  final problems = <String>[];
-
-  // --- attestation -----------------------------------------------------------
-  // A baseline row that cannot name its commit is not reproducible, so it is
-  // not evidence (plan V6-9: "gitsha=2f6464f, 不是空着，也不是估算"). An empty
-  // field must never be swallowed by printing "?" either.
-  final gitsha = checkGitSha(
-    (payload['gitsha'] ?? '').toString().trim(),
-    source: (payload['gitshasource'] ?? '').toString().trim(),
+  final assessment = assessRun(
+    gitsha: (payload['gitsha'] ?? '').toString().trim(),
+    gitshaSource: (payload['gitshasource'] ?? '').toString().trim(),
     allowUnattested: allowUnattested,
-    problems: problems,
+    sampleCount: pages.length,
+    errors: errors,
+    mismatches: mismatches,
+    consistent: verdict['consistent'],
+    expectedSamples: (verdict['expectedSamples'] as num?)?.toInt(),
+    status: status,
   );
 
-  // --- sample integrity ------------------------------------------------------
-  if (pages.isEmpty) {
-    problems.add('no pages sampled — the corpus or the model set is unusable');
+  for (final notice in assessment.notices) {
+    stderr.writeln(notice);
   }
-  if (errors.isNotEmpty) {
-    // §3.10: "不许用『跳过失败页』来提高一致率". The harness now survives a
-    // per-page crash and lists what it lost; losing rows is still not a pass.
-    problems.add('MEASUREMENT GAPS: ${errors.length} page/variant(s) failed and '
-        'produced no row — failures must be attributed, not skipped');
-    for (final e in errors.take(10)) {
-      stderr.writeln('  error: ${jsonEncode(e)}');
-    }
-    if (errors.length > 10) {
-      stderr.writeln('  … ${errors.length - 10} more error record(s) in the JSON');
-    }
+  // Itemised evidence for the two lists that can silently empty themselves.
+  for (final e in errors.take(10)) {
+    stderr.writeln('  error: ${jsonEncode(e)}');
   }
-  final expected = (verdict['expectedSamples'] as num?)?.toInt();
-  if (expected != null && pages.length != expected) {
-    problems.add('row loss: verdict.expectedSamples=$expected but '
-        'pages=${pages.length} — the sweep did not finish');
+  if (errors.length > 10) {
+    stderr.writeln('  … ${errors.length - 10} more error record(s) in the JSON');
   }
-  if (mismatches.isNotEmpty) {
-    problems.add('CONSISTENCY FAILURE (G1): ${mismatches.length} mismatch(es)');
-    for (final m in mismatches) {
-      stderr.writeln('  ${jsonEncode(m)}');
-    }
+  for (final m in mismatches) {
+    stderr.writeln('  ${jsonEncode(m)}');
   }
-  if (verdict['consistent'] != true) {
-    problems.add('verdict.consistent is not true — refusing to report a win');
-  }
-  // The harness gates on status *and* verdict (lib/headless.dart goldenExitCode).
-  // A payload where only one of them says "clean" contradicts itself, and a
-  // self-contradicting report is not evidence.
-  if (status == 'error' && verdict['consistent'] == true) {
-    problems.add('status="error" while verdict.consistent=true — the report '
-        'contradicts itself; neither field can be trusted');
-  }
-
-  if (problems.isNotEmpty) {
-    for (final p in problems) {
+  if (!assessment.publishable) {
+    for (final p in assessment.problems) {
       stderr.writeln(p.startsWith('WARNING') ? p : 'ERROR: $p');
     }
-    exit(1);
+    exit(assessment.exitCode);
   }
 
   if (checkOnly) {
@@ -134,7 +113,7 @@ void main(List<String> args) {
   final row = [
     '', // row number, filled by hand
     DateTime.now().toIso8601String().substring(0, 10),
-    gitsha,
+    assessment.gitsha,
     '${(payload['machine'] as Map?)?['os']}/${ort?['active'] ?? '?'}',
     ort?['runtimeVersion'] ?? '?',
     ort?['active'] ?? '?',
@@ -157,22 +136,130 @@ void main(List<String> args) {
       'NOTE: no GPU reading — record N/A in the table, never 0 (plan §3.6).',
     );
   }
-  if (gitsha == 'UNATTESTED') {
+  if (assessment.gitsha == 'UNATTESTED') {
     stdout.writeln('NOTE: this row is UNATTESTED (--allow-unattested): it cannot '
         'be used as a before/after anchor without a commit sha.');
   }
 }
 
-/// Validate the recorded commit sha, appending to [problems] instead of
-/// throwing so the caller reports every defect of this artifact at once.
+/// What a golden run licenses. Pure: no IO, no `exit`, no clock.
+class RunAssessment {
+  RunAssessment({
+    required this.gitsha,
+    required this.problems,
+    required this.notices,
+  });
+
+  /// The value to put in the table's `gitsha` column (possibly `UNATTESTED`).
+  final String gitsha;
+
+  /// Reasons this artifact must not become a baseline row.
+  final List<String> problems;
+
+  /// Things worth saying that do not block publishing.
+  final List<String> notices;
+
+  bool get publishable => problems.isEmpty;
+
+  int get exitCode => problems.isEmpty ? 0 : 1;
+}
+
+/// The gate, as data. See `test/headless_golden_flags_test.dart` for the cases.
+RunAssessment assessRun({
+  required String gitsha,
+  String gitshaSource = '',
+  bool allowUnattested = false,
+  required int sampleCount,
+  required List<Object?> errors,
+  required List<Object?> mismatches,
+  required Object? consistent,
+  int? expectedSamples,
+  Object? status,
+}) {
+  final problems = <String>[];
+  final notices = <String>[];
+  final sha = evaluateGitSha(
+    gitsha,
+    source: gitshaSource,
+    allowUnattested: allowUnattested,
+    problems: problems,
+    notices: notices,
+  );
+
+  // --- sample integrity ------------------------------------------------------
+  if (sampleCount == 0) {
+    problems.add(
+        'no pages sampled — the corpus or the model set is unusable');
+  }
+  if (errors.isNotEmpty) {
+    // §3.10: "不许用『跳过失败页』来提高一致率". The harness now survives a
+    // per-page crash and lists what it lost; losing rows is still not a pass.
+    problems.add('MEASUREMENT GAPS: ${errors.length} page/variant(s) failed and '
+        'produced no row — failures must be attributed, not skipped');
+  }
+  if (expectedSamples != null && sampleCount != expectedSamples) {
+    problems.add('row loss: verdict.expectedSamples=$expectedSamples but '
+        'pages=$sampleCount — the sweep did not finish');
+  }
+  if (mismatches.isNotEmpty) {
+    problems.add(
+        'CONSISTENCY FAILURE (G1): ${mismatches.length} mismatch(es)');
+  }
+  if (consistent != true) {
+    problems.add('verdict.consistent is not true — refusing to report a win');
+  }
+  // The harness gates on status *and* verdict (lib/headless_cli.dart
+  // goldenExitCode). A payload where only one of them says "clean" contradicts
+  // itself, and a self-contradicting report is not evidence.
+  if (status == 'error' && consistent == true) {
+    problems.add('status="error" while verdict.consistent=true — the report '
+        'contradicts itself; neither field can be trusted');
+  }
+  return RunAssessment(
+    gitsha: sha,
+    problems: problems,
+    notices: notices,
+  );
+}
+
+/// Convenience wrapper named after what CI cares about.
+int exitCodeFor({
+  required String gitsha,
+  String gitshaSource = '',
+  bool allowUnattested = false,
+  required int sampleCount,
+  required List<Object?> errors,
+  required List<Object?> mismatches,
+  required Object? consistent,
+  int? expectedSamples,
+  Object? status,
+}) =>
+    assessRun(
+      gitsha: gitsha,
+      gitshaSource: gitshaSource,
+      allowUnattested: allowUnattested,
+      sampleCount: sampleCount,
+      errors: errors,
+      mismatches: mismatches,
+      consistent: consistent,
+      expectedSamples: expectedSamples,
+      status: status,
+    ).exitCode;
+
+/// Validate the recorded commit sha, appending to [problems] (blocking) or
+/// [notices] (informational) instead of writing to stderr, so the caller reports
+/// every defect of an artifact at once and the rule stays assertable.
 ///
-/// Returns the value to print in the table. Only ever returns `UNATTESTED`
-/// when the caller passed `--allow-unattested`; the default is to refuse.
-String checkGitSha(
+/// Returns the value to print in the table. Only ever returns `UNATTESTED` when
+/// the caller passed `--allow-unattested`; the default is to refuse — an empty
+/// sha must never be swallowed by printing "?", which is what this column used
+/// to do (plan V6-9: "不是空着，也不是估算").
+String evaluateGitSha(
   String raw, {
   required bool allowUnattested,
   String source = '',
   required List<String> problems,
+  required List<String> notices,
 }) {
   if (raw.isEmpty) {
     final origin = source.isEmpty ? '' : ' (gitshasource="$source")';
@@ -182,13 +269,11 @@ String checkGitSha(
         '.github/workflows/main.yml and windows/build.py). An unattributable '
         'number cannot be compared with a later one (plan V6-9, §3.9 rule 1).';
     if (!allowUnattested) {
-      // Default: refuse. Exit code 1 is the whole point — an empty sha must
-      // never be swallowed by printing "?" as the table used to do.
       problems.add(message);
       return '';
     }
     // Explicitly allowed, and still loud: the emitted row says UNATTESTED.
-    stderr.writeln('$message -- emitting an UNATTESTED row because '
+    notices.add('$message -- emitting an UNATTESTED row because '
         '--allow-unattested was passed.');
     return 'UNATTESTED';
   }
@@ -201,14 +286,14 @@ String checkGitSha(
       problems.add(message);
       return raw;
     }
-    stderr.writeln('$message -- recorded as UNATTESTED because '
+    notices.add('$message -- recorded as UNATTESTED because '
         '--allow-unattested was passed.');
     return 'UNATTESTED';
   }
   if (source == 'github-sha') {
-    // True inside Actions, where the variable is the checkout of the build
-    // that ran; recorded so a reader knows it is a runtime attestation.
-    stderr.writeln('NOTE: gitsha came from GITHUB_SHA at runtime, not from the '
+    // True inside Actions, where the variable is the checkout of the build that
+    // ran; a reader must know this is a runtime attestation, not a baked one.
+    notices.add('NOTE: gitsha came from GITHUB_SHA at runtime, not from the '
         'build-time define.');
   }
   return raw.toLowerCase();
