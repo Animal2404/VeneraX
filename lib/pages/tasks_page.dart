@@ -662,6 +662,37 @@ class _TasksPageState extends State<TasksPage> with SingleTickerProviderStateMix
     ].join(' · ');
   }
 
+  /// One "phase — done/total" line for the pre-translation card. The active
+  /// phase gets the accent color and a heavier weight; the rest recede to
+  /// outline grey so the eye lands on what the job is doing right now.
+  Widget _phaseLine({
+    required String labelKey,
+    required int done,
+    required int total,
+    required bool active,
+  }) {
+    return Text(
+      labelKey.tlParams({'done': done, 'total': total}),
+      style: active
+          ? ts.s14.copyWith(
+              color: context.colorScheme.primary,
+              fontWeight: FontWeight.w600,
+            )
+          : ts.s14.withColor(context.colorScheme.outline),
+    );
+  }
+
+  /// Clock format for elapsed/ETA readouts: `m:ss`, or `h:mm:ss` past an
+  /// hour. Null prints `—` — an unreadable figure is N/A, never a fake 0.
+  static String _fmtDuration(Duration? d) {
+    if (d == null) return '—';
+    var h = d.inHours;
+    var m = d.inMinutes % 60;
+    var s = d.inSeconds % 60;
+    if (h <= 0) return '$m:${s.toString().padLeft(2, '0')}';
+    return '$h:${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}';
+  }
+
   Widget buildPreTranslateTaskCard(
     PreTranslationTask task, {
     required bool expanded,
@@ -679,6 +710,15 @@ class _TasksPageState extends State<TasksPage> with SingleTickerProviderStateMix
     // still while the bar advances and the card reads as stuck.
     var processedPages =
         activity?.liveProcessed(task) ?? (task.done + task.failed);
+    // Folded from pre-computed data-layer figures — the card rebuilds with
+    // every coalesced notify and must not parse or do IO while building;
+    // PreTranslationProgress holds only numbers, formatting stays here.
+    final progressView = PreTranslationProgress.of(task, activity: activity);
+    final dash = '—';
+    final throughputRate = progressView.sweepActive
+        ? progressView.recognitionRatePerMinute
+        : progressView.commitRatePerMinute;
+    final batch = progressView.batch;
     var progressText = task.total == 0
         ? "0%"
         : "${(progress * 100).clamp(0, 100).toStringAsFixed(0)}%";
@@ -771,6 +811,93 @@ class _TasksPageState extends State<TasksPage> with SingleTickerProviderStateMix
                 }),
                 style: ts.s14,
               ),
+              // Phased progress: one row per pipeline phase, aligned with the
+              // TranslationStage coarse phases (recognize / translate /
+              // render). The phase the job is actually in gets highlighted;
+              // three equally-bold rows would highlight nothing.
+              if (activity != null) ...[
+                const SizedBox(height: 4),
+                _phaseLine(
+                  labelKey: "Recognized: @done/@total",
+                  done: progressView.recognized,
+                  total: task.total,
+                  active: progressView.focusRecognizing,
+                ),
+                const SizedBox(height: 2),
+                _phaseLine(
+                  labelKey: "Translated: @done/@total",
+                  done: progressView.translated,
+                  total: task.total,
+                  active: progressView.focusTranslating,
+                ),
+                const SizedBox(height: 2),
+                _phaseLine(
+                  labelKey: "Rendered: @done/@total",
+                  done: progressView.rendered,
+                  total: task.total,
+                  active: progressView.focusRendering,
+                ),
+                // Without this note a live "Recognized 8/82" beside a static
+                // "Pages 0/82" reads as a contradiction; the sweep number is
+                // OCR credit, not translation completeness — say so.
+                if (progressView.sweepActive) ...[
+                  const SizedBox(height: 2),
+                  Text(
+                    "Recognized counts the OCR pre-scan only — those pages are not translated yet"
+                        .tl,
+                    style: ts.s12.withColor(context.colorScheme.outline),
+                  ),
+                ],
+              ],
+              // Live throughput / engine telemetry, small-print. Null figures
+              // print — (unreadable is N/A, never a fake 0).
+              if (task.isRunning) ...[
+                const SizedBox(height: 4),
+                Text(
+                  "Throughput: @rate pages/min · @ms ms/page".tlParams({
+                    'rate': throughputRate == null
+                        ? dash
+                        : throughputRate.toStringAsFixed(1),
+                    'ms': progressView.msPerPage == null
+                        ? dash
+                        : progressView.msPerPage!.round().toString(),
+                  }),
+                  style: ts.s12.withColor(context.colorScheme.outline),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  "Elapsed @elapsed · ETA @eta (current rate)".tlParams({
+                    'elapsed': _fmtDuration(progressView.elapsed),
+                    'eta': _fmtDuration(progressView.eta),
+                  }),
+                  style: ts.s12.withColor(context.colorScheme.outline),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  "Batch: @pages pages · det @det · rec @rec · crops @crops · lines @lines"
+                      .tlParams({
+                    'pages': batch?.pages.toString() ?? dash,
+                    'det': batch?.detBatchCap.toString() ?? dash,
+                    'rec': batch?.recBatchCap.toString() ?? dash,
+                    'crops': batch?.recCrops.toString() ?? dash,
+                    'lines': batch?.decRows.toString() ?? dash,
+                  }),
+                  style: ts.s12.withColor(context.colorScheme.outline),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  "Engine: @ep · sessions @sessions · arena @arena MB · degraded @degraded"
+                      .tlParams({
+                    'ep': progressView.epName?.toUpperCase() ?? dash,
+                    'sessions': progressView.sessions?.toString() ?? dash,
+                    'arena': progressView.arenaMb == null
+                        ? dash
+                        : progressView.arenaMb!.toStringAsFixed(1),
+                    'degraded': progressView.degradedLabel ?? dash,
+                  }),
+                  style: ts.s12.withColor(context.colorScheme.outline),
+                ),
+              ],
               if (failedPages > 0) ...[
                 const SizedBox(height: 2),
                 Text(

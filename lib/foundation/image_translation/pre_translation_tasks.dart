@@ -212,6 +212,13 @@ class PreTranslationGroupActivity {
   /// the phase each page has reached — so a group that is minutes from
   /// committing still reads as partial progress rather than as nothing.
   double completedPages = 0;
+
+  /// Raw page count settled by the stage-1 recognition sweep. Only the
+  /// [PreTranslationActivity.ocrSweepIndex] slot ever sets it; everywhere else
+  /// it stays null. Purely additive display data: unlike [completedPages] it
+  /// is not phase-weighted (8 recognized pages read as 8, not as 8×0.55), and
+  /// like [completedPages] it never feeds the resume cursor.
+  int? recognizedPages;
 }
 
 /// What a running job is doing right now, beyond its committed counters.
@@ -238,6 +245,30 @@ class PreTranslationActivity {
   int bufferedFailed = 0;
 
   int get bufferedPages => bufferedDone + bufferedFailed;
+
+  /// Key of the pseudo-group that carries the stage-1 recognition sweep
+  /// (created in `_runChapterOcrPass`). It is not a commit group — no counts
+  /// ever flow through it — but it lives in [groups] so the head stage and the
+  /// stage breakdown already see the sweep as "what the job is doing".
+  static const int ocrSweepIndex = -1;
+
+  /// The live stage-1 sweep slot, or null when no sweep is running.
+  PreTranslationGroupActivity? get ocrSweep => groups[ocrSweepIndex];
+
+  bool get sweepActive => ocrSweep != null;
+
+  /// Raw pages the running sweep has recognized so far (0 when none runs).
+  /// This is the number that was invisible to the page line whenever a real
+  /// 82-page chapter showed "页数: 0/82" while the log already said
+  /// `pages=[0..7]`: the sweep's credit sat in [completedPages] with the 0.55
+  /// phase weight and only ever reached the bar, never a page figure.
+  int get ocrRecognizedPages => ocrSweep?.recognizedPages ?? 0;
+
+  /// Pages the sweep was handed at its start (cached pages are already
+  /// excluded, so this can be smaller than the chapter total).
+  int get ocrSweepTotal => ocrSweep?.pageCount ?? 0;
+
+  int get ocrSweepPendingPages => math.max(0, ocrSweepTotal - ocrRecognizedPages);
 
   /// Pages settled for display: committed plus buffered. Never write this back
   /// into [PreTranslationChapter.done] — that would break the resume cursor.
@@ -272,6 +303,111 @@ class PreTranslationActivity {
     return counts;
   }
 
+  // ---------------------------------------------------------------------
+  // Per-phase overall numerators (display only).
+  //
+  // Each returns an "X / task.total pages" figure for one phase, in one
+  // number: committed + buffered pages plus the in-flight credit that phase
+  // has earned. They read [groups] and the chapter counters but never write
+  // anything — [liveProcessed] and [completedPages] keep the exact meaning
+  // the tests pin down, and the resume cursor is untouched.
+  // ---------------------------------------------------------------------
+
+  /// The chapter the activity currently points at, by identity of its eid,
+  /// or null when it names nothing (between chapters / before the first).
+  PreTranslationChapter? _chapterOf(PreTranslationTask task) {
+    if (chapterEid.isEmpty) return null;
+    return task.chapters.where((c) => c.eid == chapterEid).firstOrNull;
+  }
+
+  /// Pages whose text is recognized.
+  ///
+  /// During the sweep this is the committed/buffered base plus the sweep's
+  /// raw count — the live value that was previously only visible as a
+  /// fractional bar credit, the number the user never saw move. After the
+  /// sweep, every *remaining* page of that chapter has passed recognition
+  /// (stage 2 only launches once it finished, and a fully-cached chapter
+  /// never needed it), so the whole chapter counts. Buffered pages are
+  /// subtracted from that credit because the base already includes them —
+  /// counting them twice would overshoot the chapter.
+  int recognizedThrough(PreTranslationTask task) {
+    var processed = liveProcessed(task);
+    var extra = 0;
+    if (sweepActive) {
+      extra = ocrRecognizedPages;
+    } else {
+      var chapter = _chapterOf(task);
+      if (chapter != null && chapter.total > 0) {
+        extra = math.max(
+          0,
+          chapter.total - (chapter.done + chapter.failed) - bufferedPages,
+        );
+      }
+    }
+    var v = processed + extra;
+    var total = task.total;
+    return total > 0 ? math.min(v, total) : v;
+  }
+
+  /// Pages whose translation request has come back: committed/buffered pages
+  /// plus in-flight groups that moved past `translating` into rendering. A
+  /// group enters `rendering` only when its batch response landed, so its
+  /// whole count is honest credit; pages that later failed were still
+  /// translated, which is why the base is `liveProcessed`, not `liveDone`.
+  int translatedThrough(PreTranslationTask task) {
+    var v = liveProcessed(task);
+    for (var g in groups.values) {
+      if (g.index >= 0 &&
+          g.stage.index > TranslationStage.translating.index) {
+        v += g.pageCount;
+      }
+    }
+    var total = task.total;
+    return total > 0 ? math.min(v, total) : v;
+  }
+
+  /// Pages fully drawn and counted — committed plus buffered. In-flight
+  /// rendering groups are deliberately *not* added: their images land page by
+  /// page but the unit of settlement is the group, and crediting the whole
+  /// group the moment its first page draws would overshoot on multi-page
+  /// groups.
+  int renderedThrough(PreTranslationTask task) => liveProcessed(task);
+
+  // ---------------------------------------------------------------------
+  // Throughput (display only, window-based).
+  //
+  // Two separate streams because they measure different things and the
+  // phases alternate: recognition pages/min during a sweep, end-to-end
+  // committed pages/min during stage 2. Sharing one window would print a
+  // "translation throughput" computed from OCR chunks — the exact class of
+  // wrong-but-plausible number this card is here to remove.
+  // ---------------------------------------------------------------------
+
+  final _sweepRate = _ThroughputTracker();
+  final _pipelineRate = _ThroughputTracker();
+
+  /// Rolling pages/min of the recognition sweep, or null when it has not run
+  /// long enough to say (never 0 — see [_ThroughputTracker]).
+  double? get sweepPagesPerMinute => _sweepRate.pagesPerMinute;
+
+  /// When the sweep last credited a page; lets readers notice the stream went
+  /// quiet instead of quoting the last known rate forever.
+  DateTime? get lastOcrSampleAt => _sweepRate.lastSampleAt;
+
+  /// Rolling pages/min of committed (fully translated + rendered) pages.
+  double? get pagesPerMinute => _pipelineRate.pagesPerMinute;
+
+  /// Called by the sweep once per OCR chunk (and per fetch failure). Cheap:
+  /// one append plus an occasional window trim, on the producer side, so the
+  /// UI's build path only reads a pre-computed double.
+  void recordOcrPages(int pages, {DateTime? at}) => _sweepRate.add(pages, at: at);
+
+  /// Called once per *committed* group — deliberately coarse: this number
+  /// means "pages fully done", and crediting in-flight fractions would just
+  /// re-derive the weighted bar with extra steps.
+  void recordSettledPages(int pages, {DateTime? at}) =>
+      _pipelineRate.add(pages, at: at);
+
   /// Pages finished inside groups that have not committed yet, weighted by how
   /// far each in-flight page has got, plus whole groups already waiting on the
   /// committer.
@@ -293,6 +429,258 @@ class PreTranslationActivity {
     var extra = (uncommittedPages / chapter.total).clamp(0.0, 1.0);
     return (base + extra / task.chapters.length).clamp(0.0, 1.0);
   }
+}
+
+/// Sliding-window pages/min for one progress stream (the recognition sweep,
+/// or stage-2 commits). Two deliberate choices:
+///
+///  * window, not EMA: "how many pages landed in the last [_window]" answers
+///    what the job is doing *now* and self-heals after a pause with no reset
+///    hook;
+///  * recomputed on add(), never on read: the task card rebuilds on every
+///    coalesced notify and must not scan a list or read the clock while
+///    building. Reading a pre-computed double is free.
+///
+/// A rate with fewer than two samples, or samples spanning less than
+/// [_minSpan], is null: "unreadable" is N/A, not a 0 that would read as "the
+/// job is doing zero pages per minute".
+class _ThroughputTracker {
+  final _samples = <({DateTime at, int pages})>[];
+  DateTime? _lastAt;
+  double? _rate;
+
+  static const _window = Duration(seconds: 120);
+  static const _minSpan = Duration(seconds: 3);
+
+  DateTime? get lastSampleAt => _lastAt;
+
+  double? get pagesPerMinute => _rate;
+
+  void add(int pages, {DateTime? at}) {
+    if (pages <= 0) return;
+    var now = at ?? DateTime.now();
+    _samples.add((at: now, pages: pages));
+    while (now.difference(_samples.first.at) > _window) {
+      _samples.removeAt(0);
+    }
+    _lastAt = now;
+    var span = now.difference(_samples.first.at);
+    if (_samples.length >= 2 && span >= _minSpan) {
+      var total = 0;
+      for (var s in _samples) {
+        total += s.pages;
+      }
+      _rate = total * 60000 / span.inMilliseconds;
+    }
+  }
+}
+
+/// Everything the pre-translation card shows about a running job, folded into
+/// one immutable snapshot so `build()` only formats numbers it is handed.
+///
+/// All derivation lives here, in the data layer: no text parsing (the worker's
+/// batch stats arrive structured through [TranslationWorker.lastPerf]), no IO,
+/// and one clock read per construction — construction rides the coalesced
+/// activity notifies, not the frame rate. Unreadable figures are null and the
+/// card prints `—`; they are never a fabricated 0.
+class PreTranslationProgress {
+  PreTranslationProgress({
+    required this.running,
+    required this.processed,
+    required this.total,
+    required this.recognized,
+    required this.translated,
+    required this.rendered,
+    required this.sweepActive,
+    required this.focusRecognizing,
+    required this.focusTranslating,
+    required this.focusRendering,
+    required this.recognitionRatePerMinute,
+    required this.commitRatePerMinute,
+    required this.batch,
+    required this.msPerPage,
+    required this.elapsed,
+    required this.eta,
+    required this.epName,
+    required this.sessions,
+    required this.arenaMb,
+    required this.degradedLabel,
+  });
+
+  /// Folds [task] + its live [activity] into display figures. Thin wrapper
+  /// around the pure [PreTranslationProgress.snapshot] that reads the worker
+  /// singletons' *plain fields* (lastReport/lastPerf are set by responses the
+  /// pool already sent; reading them never starts an isolate). Everything a
+  /// test needs is injectable through [snapshot], which touches no singletons.
+  factory PreTranslationProgress.of(
+    PreTranslationTask task, {
+    PreTranslationActivity? activity,
+  }) =>
+      PreTranslationProgress.snapshot(
+        task,
+        activity: activity,
+        workerReport: TranslationWorker.instance.lastReport,
+        batchPerf: TranslationWorker.instance.lastPerf,
+        batchPerfAt: TranslationWorker.instance.lastPerfAt,
+      );
+
+  /// Pure fold: no singleton reads, no IO, no parsing — pass the worker data
+  /// in explicitly (nulls = "no data yet" and surface as `—`, never as 0).
+  factory PreTranslationProgress.snapshot(
+    PreTranslationTask task, {
+    PreTranslationActivity? activity,
+    EpReport? workerReport,
+    OcrBatchPerf? batchPerf,
+    DateTime? batchPerfAt,
+    DateTime? now,
+  }) {
+    var at = now ?? DateTime.now();
+    // A batch older than this says nothing about the job's *current* speed
+    // (the sweep may have ended, the pool may have been released for VRAM),
+    // so it is treated as no data at all rather than as live numbers.
+    var freshBatch = batchPerf != null &&
+            batchPerfAt != null &&
+            at.difference(batchPerfAt) <= const Duration(seconds: 30)
+        ? batchPerf
+        : null;
+
+    var processed =
+        activity?.liveProcessed(task) ?? (task.done + task.failed);
+    var total = task.total;
+    var recognized =
+        activity != null ? activity.recognizedThrough(task) : processed;
+    var translated =
+        activity != null ? activity.translatedThrough(task) : processed;
+    var rendered =
+        activity != null ? activity.renderedThrough(task) : processed;
+
+    var sweepActive = activity?.sweepActive ?? false;
+    var stage = activity?.headStage;
+    // What the eye should land on. The sweep slot is always the head while it
+    // runs, so a sweep highlights recognition; during stage 2 a loading /
+    // recognizing head is the same phase in spirit, and `fetching` is the
+    // translation pipeline's own first step.
+    var focusRecognizing = sweepActive ||
+        stage == TranslationStage.recognizing ||
+        stage == TranslationStage.loadingModel;
+    var focusTranslating = !sweepActive &&
+        (stage == TranslationStage.translating ||
+            stage == TranslationStage.fetching);
+    var focusRendering =
+        !sweepActive && stage == TranslationStage.rendering;
+
+    var recRate = activity?.sweepPagesPerMinute;
+    var commitRate = activity?.pagesPerMinute;
+    Duration? eta;
+    if (activity != null && task.isRunning) {
+      if (sweepActive) {
+        var pending = activity.ocrSweepPendingPages;
+        if (recRate != null && recRate > 0 && pending > 0) {
+          eta = Duration(seconds: (pending * 60 / recRate).round());
+        }
+      } else {
+        var remaining = math.max(0, total - processed);
+        if (commitRate != null && commitRate > 0 && remaining > 0) {
+          eta = Duration(seconds: (remaining * 60 / commitRate).round());
+        }
+      }
+    }
+
+    var arenaBytes = workerReport != null
+        ? workerReport.arenaCapacityBytes + workerReport.hiddenArenaCapacityBytes
+        : freshBatch?.arenaBytes;
+    List<String>? trail;
+    if (workerReport != null) {
+      trail = workerReport.degradedTrail;
+    } else if (freshBatch != null) {
+      trail = freshBatch.degradedTrail;
+    }
+
+    return PreTranslationProgress(
+      running: task.isRunning,
+      processed: processed,
+      total: total,
+      recognized: recognized,
+      translated: translated,
+      rendered: rendered,
+      sweepActive: sweepActive,
+      focusRecognizing: focusRecognizing,
+      focusTranslating: focusTranslating,
+      focusRendering: focusRendering,
+      recognitionRatePerMinute: sweepActive ? recRate : null,
+      commitRatePerMinute: commitRate,
+      batch: freshBatch,
+      msPerPage: freshBatch != null && freshBatch.pages > 0
+          ? freshBatch.totalMs / freshBatch.pages
+          : null,
+      elapsed: task.isRunning ? at.difference(task.createdAt) : null,
+      eta: eta,
+      epName: workerReport?.active.name ?? batchPerf?.epName,
+      sessions: workerReport?.sessionCount ?? batchPerf?.sessionCount,
+      arenaMb: arenaBytes == null
+          ? null
+          : arenaBytes / (1024 * 1024),
+      // "none" is a real observation (the report exists and says no fallback
+      // happened); null is the absence of a report, printed as `—`.
+      degradedLabel: trail == null ? null : (trail.isEmpty ? "none" : trail.join(",")),
+    );
+  }
+
+  final bool running;
+
+  /// Committed + buffered pages — the same set the percentage bar counts
+  /// ([PreTranslationActivity.liveProcessed]). Its meaning is unchanged; the
+  /// phase numerators below add the in-flight credit on top.
+  final int processed;
+  final int total;
+
+  /// Per-phase readouts, each an overall "X / total pages" figure: pages that
+  /// reached that phase, counting committed pages in all earlier phases (a
+  /// committed page has by definition been recognized and translated).
+  final int recognized;
+  final int translated;
+  final int rendered;
+
+  /// A stage-1 recognition sweep is running: the recognized line is live OCR
+  /// scan progress, explicitly *not* translation completeness.
+  final bool sweepActive;
+
+  /// Which phase line to highlight. At most one of these is true.
+  final bool focusRecognizing;
+  final bool focusTranslating;
+  final bool focusRendering;
+
+  /// Pages/min for the recognition sweep (null = not enough data yet). Only
+  /// non-null while a sweep is active — a stale recognition rate next to a
+  /// translating job would read as the wrong stream's speed.
+  final double? recognitionRatePerMinute;
+
+  /// Pages/min of fully settled (committed) pages; null until at least two
+  /// commits span a few seconds.
+  final double? commitRatePerMinute;
+
+  /// The freshest OCR batch's structured stats, or null when there is no
+  /// batch or the last one is too old to quote.
+  final OcrBatchPerf? batch;
+
+  /// Mean milliseconds one page took inside the freshest OCR batch.
+  final double? msPerPage;
+
+  /// Wall-clock time since the job was created (pauses included — honest
+  /// enough for an estimate row, and cheaper than tracking pause segments).
+  final Duration? elapsed;
+
+  /// Remaining-time estimate for the *current* phase (sweep pages at sweep
+  /// rate, otherwise unprocessed pages at commit rate); null when the rate or
+  /// the remainder is unknown.
+  final Duration? eta;
+
+  /// Engine row — the arena figure is host staging memory, not VRAM (plan
+  /// §3.6), which is why the label says "暂存池", never 显存.
+  final String? epName;
+  final int? sessions;
+  final double? arenaMb;
+  final String? degradedLabel;
 }
 
 /// Manages background pre-translation jobs. Mirrors the structure of the
@@ -319,12 +707,16 @@ class PreTranslationTaskManager with ChangeNotifier {
   Timer? _activityNotifyTimer;
   DateTime _lastActivityNotify = DateTime.fromMillisecondsSinceEpoch(0);
 
-  /// Stage changes land per page across up to four concurrent groups, and each
-  /// one rebuilds the whole task list. Coalesce them to a few frames a second;
-  /// the trailing timer makes sure the final change is not swallowed.
+  /// Stage changes and sweep samples land per page across up to four
+  /// concurrent groups, and each one would rebuild the whole task list.
+  /// Coalesce to ≤2 rebuilds/second: the card's job is to prove the job is
+  /// alive and roughly how fast it is, and a 500 ms floor on those numbers
+  /// costs nothing a human can perceive, while per-page setState storms do
+  /// (the list rebuild is the expensive half, not the data read). The
+  /// trailing timer makes sure the final change is not swallowed.
   void _notifyActivity() {
     var now = DateTime.now();
-    const window = Duration(milliseconds: 400);
+    const window = Duration(milliseconds: 500);
     if (now.difference(_lastActivityNotify) >= window) {
       _lastActivityNotify = now;
       _activityNotifyTimer?.cancel();
@@ -728,6 +1120,11 @@ class PreTranslationTaskManager with ChangeNotifier {
 
     void commit(int groupIndex, GroupResult result) {
       applyGroupResult(committer, chapter, activity, groupIndex, result);
+      // One throughput sample per *committed group* — the commit is the only
+      // moment a page is genuinely finished, and sampling here (not per
+      // in-flight page) keeps the pages/min figure meaning "pages done",
+      // matching the phase lines next to it.
+      activity?.recordSettledPages(result.done + result.failed);
       _refreshKeepAlive(task);
       _saveActiveThrottled();
       notifyListeners();
@@ -846,7 +1243,7 @@ class PreTranslationTaskManager with ChangeNotifier {
       index: -1,
       pageCount: ocrNeeded.length,
     )..stage = TranslationStage.recognizing;
-    activity?.groups[-1] = ocrSlot;
+    activity?.groups[PreTranslationActivity.ocrSweepIndex] = ocrSlot;
     _notifyActivity();
 
     try {
@@ -887,13 +1284,67 @@ class PreTranslationTaskManager with ChangeNotifier {
         }
         processed += chunkData.length;
         ocrSlot.completedPages = processed * 0.55;
+        // Raw count for the "recognized X / total" line: the 0.55 weight
+        // above is for the bar's page-equivalents and must not leak into a
+        // figure that is printed next to a page total.
+        ocrSlot.recognizedPages = processed;
+        activity?.recordOcrPages(chunkData.length);
         _notifyActivity();
       }
 
+      // The single sweep optimisation: keep the OCR pool's declared capacity
+      // actually fed. As written above, `runChunk` was awaited inline — so at
+      // most ONE `ocrPages` call was ever in flight, `_pickWorker` always
+      // found worker[0] idle and returned it, the pool never grew past a
+      // single isolate no matter what `imageTranslationOcrWorkers` said (the
+      // slider was a dead knob for pre-translation), and that isolate
+      // strictly alternated CPU pre/post-processing with GPU inference — the
+      // mechanism behind the ~20% GPU occupancy. A bounded window of
+      // concurrent chunk calls lets one worker's CPU work overlap another's
+      // GPU submissions. `poolCapacity` already applies the GPU (≤2) and
+      // mobile clamps; the window stays ≤2 on top, so the sweep never peaks
+      // beyond the concurrency the interactive reader already reaches with
+      // its two in-flight pages.
+      final ocrWindow = ocrSweepWindowFor(
+        TranslationWorker.instance.poolCapacity(
+          sourceLang: sourceLang,
+          paths: TranslationModels.workerPaths(),
+        ),
+      );
+      var chunksStarted = 0;
+      var maxInflight = 0;
+      var stoppedEarly = false;
+      final sweepSw = Stopwatch()..start();
+      final inFlight = <Future<void>>{};
+
+      Future<void> launch(
+        List<({int index, String cacheKey, Uint8List bytes})> batch,
+      ) async {
+        late Future<void> f;
+        f = runChunk(batch).whenComplete(() => inFlight.remove(f));
+        inFlight.add(f);
+        chunksStarted++;
+        if (inFlight.length > maxInflight) maxInflight = inFlight.length;
+        if (inFlight.length >= ocrWindow) {
+          // Sliding-window backpressure: admit no more until one finishes.
+          // Each future removes itself in `whenComplete`, and self-removal
+          // registered at add-time fires first, so the set has already
+          // shrunk by the time `Future.any` resumes (same pattern as the
+          // stage-2 group window in [_runChapter]).
+          await Future.any(inFlight);
+        }
+      }
+
       await for (final page in prefetcher.run(ocrNeeded)) {
-        if (_canceledIds.contains(task.id) || chapter.canceled) return;
+        if (_canceledIds.contains(task.id) || chapter.canceled) {
+          stoppedEarly = true;
+          break;
+        }
         await _waitWhilePaused(task);
-        if (_canceledIds.contains(task.id) || chapter.canceled) return;
+        if (_canceledIds.contains(task.id) || chapter.canceled) {
+          stoppedEarly = true;
+          break;
+        }
         final fetchError = page.error;
         if (fetchError != null) {
           // Stage 2 still visits this page (it has no OCR row), so nothing is
@@ -904,6 +1355,8 @@ class PreTranslationTaskManager with ChangeNotifier {
           );
           processed++;
           ocrSlot.completedPages = processed * 0.55;
+          ocrSlot.recognizedPages = processed;
+          activity?.recordOcrPages(1);
           _notifyActivity();
           continue;
         }
@@ -919,18 +1372,34 @@ class PreTranslationTaskManager with ChangeNotifier {
           bytes: page.bytes!,
         ));
         if (pending.length >= chunkSize) {
-          await runChunk(List.of(pending));
+          await launch(List.of(pending));
           pending.clear();
         }
       }
       // The tail is a real chunk. Dropping it would silently skip the last
       // pages of every chapter whose length is not a multiple of chunkSize.
-      if (pending.isNotEmpty) {
-        await runChunk(List.of(pending));
+      if (!stoppedEarly && pending.isNotEmpty) {
+        await launch(List.of(pending));
         pending.clear();
       }
+      // In-flight chunks run to completion: their `putOcr` writes are per
+      // page and idempotent, so a canceled sweep still caches what it
+      // started — but the sweep must not RETURN with them dangling, because
+      // the freeVram handshake in `finally` releases exactly the workers
+      // these futures are using.
+      await Future.wait(inFlight);
+      Log.info(
+        'Pre-translation',
+        'OcrSweep pages=${ocrNeeded.length} chunks=$chunksStarted '
+        'window=$ocrWindow maxInflight=$maxInflight '
+        'wall_ms=${sweepSw.elapsedMilliseconds} '
+        'ms_per_page='
+        '${(sweepSw.elapsedMilliseconds / math.max(1, ocrNeeded.length)).toStringAsFixed(1)}'
+        '${stoppedEarly ? ' canceled=true' : ''}',
+      );
+      if (stoppedEarly) return;
     } finally {
-      activity?.groups.remove(-1);
+      activity?.groups.remove(PreTranslationActivity.ocrSweepIndex);
       _notifyActivity();
       // freeVram (the factory default): hand the GPU memory back through the
       // release handshake — awaiting here means the sessions are provably
@@ -981,6 +1450,18 @@ class PreTranslationTaskManager with ChangeNotifier {
       }
     }
   }
+
+  /// How many OCR chunks the stage-1 sweep keeps in flight, given the worker
+  /// pool's real dispatch capacity. Floor 1 (work must still flow when the
+  /// pool resolves to a single isolate — mobile/ja), ceiling 2: that is the
+  /// pool's own desktop-GPU cap and the concurrency the interactive reader
+  /// already reaches with its two in-flight pages, so the sweep overlaps CPU
+  /// pre/post-processing with GPU inference across isolates without ever
+  /// asking for a VRAM peak the app is not already designed around
+  /// (freeVram stays the memory-first factory default; G2 unproven).
+  @visibleForTesting
+  static int ocrSweepWindowFor(int poolCapacity) =>
+      math.min(2, math.max(1, poolCapacity));
 
   /// How many pre-translation groups may be in flight at once. Bounded by the
   /// LLM concurrency setting (the pipeline's scarcest shared resource); the
@@ -1069,6 +1550,9 @@ class PreTranslationTaskManager with ChangeNotifier {
           (g + groupSize).clamp(0, targets.length),
         );
         await _retryGroup(task, chapter, pageKeys, slice);
+        // The retry pass settles its slice whole; count it as committed
+        // throughput so a long retry sweep also shows live pages/min.
+        _activities[task.id]?.recordSettledPages(slice.length);
         _refreshKeepAlive(task);
         _saveActiveThrottled();
         notifyListeners();

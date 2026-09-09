@@ -134,13 +134,122 @@ class _ReleaseAck {
 }
 
 class _WorkerResponse {
-  _WorkerResponse(this.id, this.result, this.error, [this.report, this.perfLog]);
+  _WorkerResponse(
+    this.id,
+    this.result,
+    this.error, [
+    this.report,
+    this.perfLog,
+    this.perf,
+  ]);
 
   final int id;
   final Object? result;
   final String? error;
   final EpReport? report;
   final String? perfLog;
+
+  /// Structured twin of [perfLog], built at the same site from the same local
+  /// values so the two cannot drift. Sent so the UI can show batch throughput
+  /// without parsing the log line — parsing display strings is exactly the
+  /// coupling that breaks when someone rewords a label.
+  final OcrBatchPerf? perf;
+}
+
+/// Machine-readable form of one OCR batch's perf log: the counts and timings
+/// behind `batch={det,rec} det={...} rec={...} dec={...} total_ms sessions`.
+/// Immutable and built only from plain values so it survives the
+/// isolate→main message copy untouched.
+class OcrBatchPerf {
+  const OcrBatchPerf({
+    required this.pages,
+    required this.epName,
+    required this.detBatchCap,
+    required this.recBatchCap,
+    required this.detTiles,
+    required this.detBuckets,
+    required this.detMs,
+    required this.recGroups,
+    required this.recBatches,
+    required this.recCrops,
+    required this.recMs,
+    required this.decRows,
+    required this.decSteps,
+    required this.decMs,
+    required this.totalMs,
+    required this.sessionCount,
+    required this.arenaBytes,
+    required this.degradedTrail,
+    this.recGpuMs = 0,
+    this.restMs = 0,
+  });
+
+  /// Images in this batch (`pages=[...]`).
+  final int pages;
+  /// Execution provider the batch ran on (`ep=`).
+  final String epName;
+  /// Requested detection / recognition batch caps (`batch={det,rec}`).
+  final int detBatchCap;
+  final int recBatchCap;
+  /// Detection: tiles scanned, batches run, milliseconds (`det={...}`).
+  final int detTiles;
+  final int detBuckets;
+  final int detMs;
+  /// Recognition: groups, sub-batches, crops, milliseconds (`rec={...}`).
+  final int recGroups;
+  final int recBatches;
+  final int recCrops;
+  final int recMs;
+  /// Decoder: text lines, steps, milliseconds (`dec={...}`).
+  ///
+  /// IMPORTANT: [decMs] is a *nested* interval of [recMs] (the decode loop
+  /// runs inside the recognition pass), never a sibling segment. The additive
+  /// triple is `detMs + recMs + restMs == totalMs`; do not sum det, rec and
+  /// dec — that double-counts the decoder (`parts={...}` in the log string
+  /// spells the disjoint version out).
+  final int decRows;
+  final int decSteps;
+  final int decMs;
+  final int totalMs;
+  final int sessionCount;
+  /// Host staging arenas in bytes — never a VRAM figure (plan §3.6).
+  final int arenaBytes;
+  /// Shrink/fallback events so far (`degraded=`; empty = none).
+  final List<String> degradedTrail;
+  /// Recognition time excluding the nested decoder loop (`parts.recGpuMs`):
+  /// `recGpuMs + decMs == recMs`. This is what the recognizer spends on
+  /// crop preprocessing plus encoder/inference work.
+  final int recGpuMs;
+  /// Wall time inside `ocrPagesAll` that neither the det nor the rec
+  /// stopwatch covers — buffer materialise, box clustering, result assembly
+  /// (`parts.restMs`). Closes the identity
+  /// `detMs + recGpuMs + decMs + restMs == totalMs`.
+  final int restMs;
+}
+
+/// The disjoint, additive partition of one OCR batch's wall time.
+///
+/// `detSw` and `recSw` are sequential top-level segments of `ocrPagesAll`;
+/// `decSw` is NOT a third segment — the decode loop starts and stops inside
+/// `_mangaOcrBatchMulti`, which runs wholly inside the recognition interval,
+/// so `decMs ⊆ recMs`. Summing det+rec+dec double-counts the decoder and can
+/// exceed `total_ms` (a real log once read det 5760 + rec 29817 + dec 21255
+/// = 56832 > total 35647 for exactly this reason). This function turns the
+/// four nested stopwatches into a sum that closes:
+/// `detMs + recGpuMs + decMs + restMs == totalMs` (given sane non-negative,
+/// non-overlapping-behaviour inputs; clamped so a weird clock can never
+/// produce negative parts). Pure, so the closing identity is unit-testable
+/// without spawning a worker isolate.
+({int detMs, int recGpuMs, int decMs, int restMs}) ocrPerfParts({
+  required int detMs,
+  required int recMs,
+  required int decMs,
+  required int totalMs,
+}) {
+  final dec = math.min(math.max(0, decMs), math.max(0, recMs));
+  final recGpu = recMs - dec;
+  final rest = math.max(0, totalMs - detMs - recMs);
+  return (detMs: detMs, recGpuMs: recGpu, decMs: dec, restMs: rest);
 }
 
 /// Resolves the OCR worker count without touching platform or settings state.
@@ -300,10 +409,37 @@ class TranslationWorker {
     );
   }
 
+  /// The number of worker isolates the pool is willing to grow to for a
+  /// given workload — i.e. what [_poolSize] would cap dispatch at, including
+  /// the GPU/mobile clamps that make the raw `imageTranslationOcrWorkers`
+  /// setting smaller in practice. Callers that want to feed the pool at its
+  /// real parallel capacity (the pre-translation OCR sweep) size their
+  /// in-flight window with this instead of the setting, so the knob is
+  /// measured by actual dispatch capacity rather than by the slider label.
+  int poolCapacity({
+    required String sourceLang,
+    required WorkerModelPaths paths,
+  }) =>
+      _poolSize(sourceLang, paths);
+
   final _recentPerfLogs = <String>[];
 
   /// The 20 most recent structured OCR performance timing logs.
   List<String> get recentPerfLogs => List.unmodifiable(_recentPerfLogs);
+
+  /// Structured twin of [recentPerfLogs]' last entry, for display code that
+  /// must not parse log text. Null before the first batch has returned —
+  /// readers show `—` (never a fake 0) while it is null.
+  OcrBatchPerf? _lastPerf;
+  OcrBatchPerf? get lastPerf => _lastPerf;
+
+  /// When [_lastPerf] was captured on the main isolate (message arrival, not
+  /// batch end — the batch's own wall clock never leaves the isolate). The
+  /// reader uses it to decide whether the numbers are still live; a stale
+  /// batch of an idle/paused job would otherwise keep printing throughput
+  /// the job is no longer achieving.
+  DateTime? _lastPerfAt;
+  DateTime? get lastPerfAt => _lastPerfAt;
 
   void addPerfLog(String log) {
     _recentPerfLogs.add(log);
@@ -501,6 +637,10 @@ class _IsolateWorker {
           Log.info('OCR Perf', message.perfLog!);
           TranslationWorker.instance.addPerfLog(message.perfLog!);
         }
+        if (message.perf != null) {
+          TranslationWorker.instance._lastPerf = message.perf;
+          TranslationWorker.instance._lastPerfAt = DateTime.now();
+        }
         var pending = _pending.remove(message.id);
         if (pending == null) return;
         if (message.error != null) {
@@ -533,11 +673,26 @@ class _IsolateWorker {
   }
 
   Future<T> _request<T>(Object Function(int id) build) async {
-    await _ensureStarted();
+    // Register the pending slot synchronously, *before* awaiting isolate
+    // startup. `_pickWorker` reads `pendingCount` to decide whether a worker
+    // is idle, and while `_ensureStarted` is spawning (or a first request is
+    // in flight), a lazily-registered slot would keep the worker reading as
+    // idle — so concurrent callers would all stack onto it and the pool would
+    // never actually spread. The id reservation and map insert are synchronous
+    // here precisely so the next dispatch already sees this one.
     var id = _nextId++;
     var completer = Completer<Object?>();
     _pending[id] = completer;
-    _sendPort!.send(build(id));
+    try {
+      await _ensureStarted();
+      _sendPort!.send(build(id));
+    } catch (e) {
+      // Nobody is awaiting `completer.future` at this point (the caller gets
+      // the error via rethrow), so completing it with an error would surface
+      // as an *unhandled* async error. Just drop the slot.
+      _pending.remove(id);
+      rethrow;
+    }
     return await completer.future as T;
   }
 
@@ -688,8 +843,10 @@ void _workerMain(SendPort mainPort) {
     if (message is _OcrPagesRequest) {
       try {
         state.currentPref = message.epPref;
-        var (results, perfLog) = state.ocrPagesAll(message);
-        mainPort.send(_WorkerResponse(message.id, results, null, state.report, perfLog));
+        var (results, perfLog, perf) = state.ocrPagesAll(message);
+        mainPort.send(
+          _WorkerResponse(message.id, results, null, state.report, perfLog, perf),
+        );
       } catch (e, s) {
         mainPort.send(_WorkerResponse(message.id, null, '$e\n$s', state.report));
       }
@@ -1156,7 +1313,7 @@ class _WorkerState {
   // -------------------------------------------------------------------------
 
   List<OcrBlock> ocrPage(_OcrPageRequest req) {
-    final (results, _) = ocrPagesAll(_OcrPagesRequest(
+    final (results, _, _) = ocrPagesAll(_OcrPagesRequest(
       req.id,
       [
         _PageInput(
@@ -1180,7 +1337,7 @@ class _WorkerState {
     return results.first.blocks ?? const [];
   }
 
-  (List<OcrPageResult>, String) ocrPagesAll(_OcrPagesRequest req) {
+  (List<OcrPageResult>, String, OcrBatchPerf) ocrPagesAll(_OcrPagesRequest req) {
     final totalSw = Stopwatch()..start();
     final detSw = Stopwatch();
     final recSw = Stopwatch();
@@ -1602,17 +1759,55 @@ class _WorkerState {
 
     final pagesStr = req.pages.map((p) => p.pageIndex).join(',');
     final totalArenaBytes = _arena.capacityBytes + _hiddenArena.capacityBytes;
+    // Additive partition of total_ms — see [ocrPerfParts]: `decMs` is a
+    // nested interval of `recMs`, never a sibling segment, and
+    // `parts={...}` below is the disjoint sum that closes on `total_ms`.
+    final detMs = detSw.elapsedMilliseconds;
+    final recMs = recSw.elapsedMilliseconds;
+    final batchTotalMs = totalSw.elapsedMilliseconds;
+    final parts = ocrPerfParts(
+      detMs: detMs,
+      recMs: recMs,
+      decMs: decSw.elapsedMilliseconds,
+      totalMs: batchTotalMs,
+    );
     final perfLog = 'pages=[$pagesStr] ep=${_ep.name} '
         'batch={det:${req.detBatch},rec:${req.recBatch}} '
-        'det={tiles:$detTilesCount buckets:$detBatchesCount ms:${detSw.elapsedMilliseconds}} '
-        'rec={groups:$recGroupsCount batches:$recBatchesCount crops:$recCropsCount ms:${recSw.elapsedMilliseconds}} '
-        'dec={rows:$decRowsCount steps:$decStepsCount ms:${decSw.elapsedMilliseconds}} '
-        'total_ms=${totalSw.elapsedMilliseconds} '
+        'det={tiles:$detTilesCount buckets:$detBatchesCount ms:$detMs} '
+        'rec={groups:$recGroupsCount batches:$recBatchesCount crops:$recCropsCount ms:$recMs} '
+        'dec={rows:$decRowsCount steps:$decStepsCount ms:${parts.decMs}} '
+        'total_ms=$batchTotalMs '
         'bytes_in_arena=${(totalArenaBytes / (1024 * 1024)).toStringAsFixed(1)}MB '
         'sessions=${_sessions.sessionCount} '
-        'degraded=${_degradedTrail.isEmpty ? "none" : _degradedTrail.join(",")}';
+        'degraded=${_degradedTrail.isEmpty ? "none" : _degradedTrail.join(",")} '
+        'parts={detMs:${parts.detMs},recGpuMs:${parts.recGpuMs},decMsInRec:${parts.decMs},restMs:${parts.restMs}}';
 
-    return (results, perfLog);
+    // Same numbers, structured shape: built right here so the perf log and
+    // the display data can never disagree about what a field means.
+    final perf = OcrBatchPerf(
+      pages: req.pages.length,
+      epName: _ep.name,
+      detBatchCap: req.detBatch,
+      recBatchCap: req.recBatch,
+      detTiles: detTilesCount,
+      detBuckets: detBatchesCount,
+      detMs: detSw.elapsedMilliseconds,
+      recGroups: recGroupsCount,
+      recBatches: recBatchesCount,
+      recCrops: recCropsCount,
+      recMs: recSw.elapsedMilliseconds,
+      decRows: decRowsCount,
+      decSteps: decStepsCount,
+      decMs: decSw.elapsedMilliseconds,
+      totalMs: totalSw.elapsedMilliseconds,
+      sessionCount: _sessions.sessionCount,
+      arenaBytes: totalArenaBytes,
+      degradedTrail: List.of(_degradedTrail),
+      recGpuMs: parts.recGpuMs,
+      restMs: parts.restMs,
+    );
+
+    return (results, perfLog, perf);
   }
 
   /// Median height of a cluster's line boxes — an estimate of the original
