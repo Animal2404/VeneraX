@@ -135,6 +135,29 @@ ec.onnx`、`ocr_ja\{encoder,decoder}.onnx` 无此名；两个检测模型完全�
 | `nvidia-smi --query-gpu=memory.used` | 可用（整卡粒度） | 实测 1781/6144 MB；**不是本进程**，故采样需关闭其它 GPU 程序 |
 | `nvidia-smi --query-compute-apps` | 本机不可用 | 本进程走图形引擎而非 compute 引擎，故不在列表中 → 记 `N/A`，不记 0 |
 | `IDXGIAdapter3::QueryVideoMemoryInfo` | **未采用** | 本 SDK（10.0.26100.0）的 `IDXGIFactory1Vtbl` 头文件缺少 `GetSharedResourceAdapterLuid`（声明在未随包发布的 `dxgi1_1.h`），按头文件数出的槽位与真实 vtable 差一位：实测 slot12 返回 S_OK 却不写输出（它把 LUID 写进了我当作 riid 的缓冲区），slot13 返回 1（`IsCurrent()`）。**未经验证的 COM 槽位不得进产品代码** —— 误调不是降级而是访问违例（已实测崩溃）。详见 `process_diagnostics.dart` 的 P-2 注释 |
+### 已知缺陷 D-16：`_parsePerfLog` 把**批大小当毫秒**报（未修，已回退尝试）
+
+`lib/headless.dart` 的 `_parsePerfLog` 用 `RegExp('key[:{](\d+)')` 抓字段，它会先命中
+`batch={det:2,rec:8}` ⇒ 返回的 `detMs`/`recMs` 实际是**批大小上限**，而 `total_ms=` 用的是
+`=`，该模式根本不匹配 ⇒ `totalMs` 恒缺失、`decMs` 恒缺失。
+
+**影响范围（要说准）**：只影响经由 `_lastPerf()` 输出的 `detMs/recMs/decMs` 字段。
+本文件 B0 表里的 `totalMsMedian` 是 harness 自己用 `Stopwatch` 计的量，**不经过这个解析器**，
+所以那张表仍然有效；我此前贴出的 `det=1/2/4`、`rec=1/4/16/32` 那些"毫秒"其实是批大小，
+`decMs=null` 也不是"没上报"而是没匹配上。
+
+**我试过修但回退了**：把模式改成 `key=\{[^}]*?ms:(\d+)` + 兜底 `key=(\d+)`。
+裸正则经 `dart` 实测**能正确匹配**（`det={tiles:16 buckets:8 ms:5760}` → 5760、
+`total_ms=35647` → 35647），但**同一条模式经字符串插值（`'${RegExp.escape(key)}=...'`）
+构造出的 RegExp 实测四个字段全 null**，原因未查明。在没搞清之前，把一个未验证的改动
+塞进测量函数比留着这个 bug 更危险，故 `git checkout` 回退。
+
+**下一步（按序）**：① 查明插值版本为何不匹配（怀疑与 `RegExp.escape` 的返回或转义层级有关，
+用 `print(r.pattern)` 直接对比两个 RegExp 的源码）；② 修好后**必须**用真实 perf 行做断言测试
+（`test/ocr_perf_parts_test.dart` 里已有同款行）；③ 修好前，任何引用 `detMs/recMs/decMs` 的
+结论一律视为无效。
+
+
 ### B0 —— 首次真实基线（2026-09-09，RTX 3060 Laptop 6144 MiB，DirectML，tier=fast）
 
 产物：云端 run `34292265463` / sha `53487bb`（含 D-15 修复 + 测量工具容错），下载自 `windows_build` 后本机运行。
