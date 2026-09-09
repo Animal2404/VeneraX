@@ -241,6 +241,18 @@ class PageTranslationPipeline {
         image,
         eraseFootprintRects(regions, image.width, image.height),
       );
+      // Phase 13-F13.3: the ledger is printed on **every** page, whatever it
+      // says. It used to live inside the `rolledBack > 0` branch alone, and
+      // silence is not a result — with no line to read, "the eraser never ran
+      // on this page" (`erased=0 skipped=N`), "the eraser ran and the page is
+      // clean" (`erased=N skipped=0`) and the one that the black-block reports
+      // kept dying on, "the eraser shipped a black window and counted it a
+      // success" (`erased=N`), were three names for the same nothing. The first
+      // two are separable only by these counts; the third is separable from the
+      // second only because the count of what it *declined* to do is on the
+      // same line. The alarm keeps its own wording below so grepping an old
+      // page still works.
+      Log.info('Inpaint', 'erasure ledger: ${ledger.describeLedger()}');
       if (ledger.rolledBack > 0) {
         Log.warning(
           'Inpaint',

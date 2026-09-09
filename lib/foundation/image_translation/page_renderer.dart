@@ -782,6 +782,20 @@ double _patchPlateCoverage(ui.Rect rect) {
 /// `clipRect` in [_placeText] both still hold), nothing is pushed off the page,
 /// and no block is moved onto another's ink.
 ///
+/// **Phase 13-F13.2: the restore is an obstacle too.** Until this pass only
+/// compared blocks that *paint*, and [Placement.keptOriginal] blocks paint
+/// nothing — so they were invisible here. But a kept-original block is not
+/// "nothing happened there": in the erase modes the renderer stamps the
+/// untouched source artwork back into its box *first* (see
+/// [renderTranslatedPageWithReport]) and lays the neighbours' lettering over
+/// the page *after*. Two boxes that merely neighbour each other on the page are
+/// therefore enough for the reader's complaint — the restored source text and
+/// a translation that overlaps it land on the same pixels. A restore is asked
+/// to give up nothing (it is immovable and uncutable: that stamp *is* the
+/// S1 decision), so on such a pair only the painting block may act, and if it
+/// cannot get clear of the restore it keeps its own original too — never a
+/// translation printed on top of the text it was told to leave alone.
+///
 /// Returns a new list when anything changed; otherwise the same list object,
 /// so a collision-free page is provably untouched by this pass.
 @visibleForTesting
@@ -798,12 +812,35 @@ List<Placement> resolvePlacementOverlaps({
   final sizes = [for (final p in placements) p.size];
   final decisions = [for (final p in placements) p.decision];
   final touched = <int>{};
-  var cuts = 0, pushes = 0, shares = 0, drops = 0;
+  var cuts = 0, pushes = 0, shares = 0, drops = 0, yields = 0;
 
   bool paints(int i) =>
       !placements[i].skips &&
       decisions[i] != OverflowDecision.keepOriginal &&
       !boxes[i].isEmpty;
+
+  /// A block whose *restored source artwork* covers page area: exactly what
+  /// the paint pass stamps back from the pristine image (`!paints(i) &&
+  /// keptOriginal`, plus a non-empty box, which is what makes the stamp do
+  /// anything at all). This is an obstacle the pass may never move.
+  ///
+  /// Gated on [outlined] because that is the same condition the paint pass
+  /// uses to decide whether it restores anything at all: in patch mode the base
+  /// image *is* the pristine original, so a kept-original block is an absence
+  /// of plate rather than a stamp of artwork, and the pixel-level "original and
+  /// translation on one area" this pass exists to prevent cannot occur there.
+  /// Leaving this empty in patch mode is therefore not an exception — it makes
+  /// `blocks(i)` answer exactly what it used to, and the whole pass degenerates
+  /// to its previous, tested behaviour.
+  bool restores(int i) =>
+      outlined &&
+      !placements[i].skips &&
+      decisions[i] == OverflowDecision.keepOriginal &&
+      !boxes[i].isEmpty;
+
+  /// Anything that can put pixels on the page: fresh lettering, or the source
+  /// artwork going back under it. No painting box may end up on top of either.
+  bool blocks(int i) => paints(i) || restores(i);
 
   TranslatedRegion regionOf(int i) => regions[placements[i].index];
 
@@ -832,13 +869,147 @@ List<Placement> resolvePlacementOverlaps({
         : box.intersect(ui.Rect.fromLTRB(cutAt, 0, page.width, page.height));
   }
 
+  /// F13.2: settle **one painting box against one restore area**. [paint] is
+  /// the block that may move; [ground] is the restore, which may not — that
+  /// stamp of the source artwork *is* S1's decision, so this helper's whole
+  /// design is "the translation gives, never the original".
+  ///
+  /// The ladder is the one painting pairs use, minus every move that would
+  /// touch the restore:
+  ///
+  /// 1. **give the borrowed gutter back** — retreat to the restore's edge, but
+  ///    never past this block's own detected floor;
+  /// 2. **step aside** — only when the move carries the block *away* from the
+  ///    restore (a leading block can only be pushed deeper into it), inside the
+  ///    envelope the layout already trusts, landing clear of every block *and*
+  ///    every restore;
+  /// 3. **hand over the shared band** — cut the painting box at the restore's
+  ///    edge, which is allowed to reach inside the block's own floor.
+  ///
+  /// Steps 1 and 3 are measured *before* they are taken: cutting a box is
+  /// cheap, but a box the lettering no longer fits turns into a `keepOriginal`
+  /// whose restore would be **smaller than the text it is giving back** — the
+  /// eraser already removed those strokes from the base image, and only the box
+  /// puts them back. A block that cannot pay for a move therefore takes none of
+  /// it, and stands down with the box it came in with: the reader loses the
+  /// translation, never the original. A move that pays for itself is taken
+  /// immediately and the pair is settled.
+  ///
+  /// Returns whether the two areas are clear of each other afterwards.
+  bool yieldToRestore(int paint, int ground) {
+    final inter = boxes[paint].intersect(boxes[ground]);
+    if (inter.isEmpty) return true;
+    // Cut along the shallower intrusion, as between two painting blocks: it is
+    // the move that disturbs the fewest pixels of lettering.
+    final alongX = inter.width <= inter.height;
+    final paintLeads = alongX
+        ? boxes[paint].left <= boxes[ground].left
+        : boxes[paint].top <= boxes[ground].top;
+
+    /// Take a box for [paint] if its own text fits it; report whether it was
+    /// taken. A box that cannot be paid for is refused here rather than handed
+    /// to the re-measure, because the re-measure's fallback — keep the original
+    /// — is only safe on a box that still covers the source text.
+    bool tryBox(ui.Rect next) {
+      if (next == boxes[paint] || next.isEmpty) return false;
+      final fit = _fitRegion(
+        regionOf(paint),
+        next,
+        placements[paint].vertical,
+        outlined: outlined,
+        sourceStrokeRatio: placements[paint].sourceStrokeRatio,
+      );
+      if (!fit.fits) return false;
+      boxes[paint] = next;
+      sizes[paint] = fit.size;
+      touched.add(paint);
+      cuts++;
+      return true;
+    }
+
+    ui.Rect toward(double edge) => cutTo(
+      boxes[paint],
+      edge,
+      alongX: alongX,
+      fromLeft: paintLeads,
+    );
+
+    // 1. Give the gutter back, stopping at this block's own floor.
+    final floor = floorOf(paint);
+    final floorEdge = (alongX
+            ? (paintLeads ? floor.right : floor.left)
+            : (paintLeads ? floor.bottom : floor.top))
+        .toDouble();
+    final restoreEdge = (alongX
+            ? (paintLeads ? boxes[ground].left : boxes[ground].right)
+            : (paintLeads ? boxes[ground].top : boxes[ground].bottom))
+        .toDouble();
+    final backTo = paintLeads
+        ? math.max(restoreEdge, floorEdge)
+        : math.min(restoreEdge, floorEdge);
+    if (tryBox(toward(backTo))) {
+      return boxes[paint].intersect(boxes[ground]).isEmpty;
+    }
+
+    // 2. Step aside inside the envelope — the trailing side only, so the move
+    //    is away from the restored text and the reading order holds. A slide
+    //    costs no area, so the block's own measurement still stands.
+    if (!paintLeads) {
+      final need = alongX
+          ? boxes[ground].right - boxes[paint].left
+          : boxes[ground].bottom - boxes[paint].top;
+      if (need > 0 &&
+          _pushClears(
+            region: regionOf(paint),
+            from: boxes[paint],
+            need: need,
+            alongX: alongX,
+            page: page,
+            boxes: boxes,
+            blocked: blocks,
+            skip: paint,
+            ignore: ground,
+          )) {
+        boxes[paint] = boxes[paint].translate(
+          alongX ? need : 0,
+          alongX ? 0 : need,
+        );
+        touched.add(paint);
+        pushes++;
+        return true;
+      }
+    }
+
+    // 3. Hand over the whole shared band, past the floor if that is what it
+    //    takes — and only if the lettering still fits what is left.
+    if (tryBox(toward(restoreEdge))) {
+      return boxes[paint].intersect(boxes[ground]).isEmpty;
+    }
+
+    // 4. Nothing it can afford clears the restored artwork, so this block keeps
+    //    its own original too and paints nothing. It is a restore from here on,
+    //    which is also why the pair can never be offered again: two restores
+    //    cannot collide, they are the same source pixels.
+    if (decisions[paint] != OverflowDecision.keepOriginal) {
+      decisions[paint] = OverflowDecision.keepOriginal;
+      sizes[paint] = 0;
+      yields++;
+    }
+    return true;
+  }
+
   for (var sweep = 0; sweep < 8 * n; sweep++) {
     int? first, second;
     var worst = 0.0;
     for (var i = 0; i < n; i++) {
-      if (!paints(i)) continue;
+      // F13.2: a block that restores the source artwork is a thing the reader
+      // sees, so it takes part in the pairwise check — it is only ever the
+      // immovable side of a pair.
+      if (!blocks(i)) continue;
       for (var j = i + 1; j < n; j++) {
-        if (!paints(j)) continue;
+        if (!blocks(j)) continue;
+        // Two restores cannot collide: both are the same source pixels.
+        if (!paints(i) && !paints(j)) continue;
         final inter = boxes[i].intersect(boxes[j]);
         if (inter.isEmpty) continue;
         final area = inter.width * inter.height;
@@ -914,6 +1085,21 @@ List<Placement> resolvePlacementOverlaps({
         ? leading
         : trailing;
     final giveSecond = giveFirst == leading ? trailing : leading;
+
+    // F13.2: exactly one of the two is a restore — the source artwork going
+    // back onto the page under (part of) the other one's box. That pair is not
+    // settled by the three moves below (the third one would cut the restore,
+    // and cutting a restore is not a thing this pass may do to a `keepOriginal`
+    // decision); it goes to [yieldToRestore], which asks only the painting
+    // block and ends in "draw nothing".
+    if (!paints(leading) || !paints(trailing)) {
+      yieldToRestore(
+        paints(leading) ? leading : trailing,
+        paints(leading) ? trailing : leading,
+      );
+      continue;
+    }
+
     pull(giveFirst, pullTarget(giveFirst));
     if (!boxes[leading].intersect(boxes[trailing]).isEmpty) {
       pull(giveSecond, pullTarget(giveSecond));
@@ -939,7 +1125,7 @@ List<Placement> resolvePlacementOverlaps({
           alongX: alongX,
           page: page,
           boxes: boxes,
-          paints: paints,
+          blocked: blocks,
           skip: trailing,
           // The neighbour is the thing being stepped away from: counting it as
           // an obstacle would zero the very slack the move needs (its edge is
@@ -985,12 +1171,15 @@ List<Placement> resolvePlacementOverlaps({
     }
   }
 
-  if (touched.isEmpty) return placements;
-
   // Re-measure what moved: the box is the budget, and a box that was cut is a
   // smaller budget. Nothing is painted that has not fitted its own box.
   for (final i in touched) {
     if (placements[i].skips) continue;
+    // F13.2: a block that already stood down for a restore has *chosen* its
+    // size-zero state; re-fitting it would hand a font size back to a block
+    // that paints nothing, and `keepOriginal` is not a decision this pass
+    // reverses.
+    if (decisions[i] == OverflowDecision.keepOriginal) continue;
     final fit = _fitRegion(
       regionOf(i),
       boxes[i],
@@ -1009,11 +1198,44 @@ List<Placement> resolvePlacementOverlaps({
     }
   }
 
+  // F13.2: closing the loop. The sweep above compared every pair, but a box
+  // only became a *restore* when the re-measure — or the ladder's last rung —
+  // took its lettering away, and that happens after the comparison. So walk the
+  // finished plan once more and settle any painting box now sitting on a
+  // freshly restored area. Each step of this loop settles one pair by moving
+  // lettering or by taking it away, and never the reverse, so the number of
+  // unresolved pairs strictly falls: the bound below is belt-and-braces, not
+  // the thing that stops it.
+  for (var settle = 0; settle < n * n + n; settle++) {
+    int? paint, ground;
+    for (var i = 0; i < n && paint == null; i++) {
+      if (!paints(i)) continue;
+      for (var r = 0; r < n; r++) {
+        if (r == i || !restores(r)) continue;
+        if (!boxes[i].intersect(boxes[r]).isEmpty) {
+          paint = i;
+          ground = r;
+          break;
+        }
+      }
+    }
+    if (paint == null || ground == null) break;
+    yieldToRestore(paint, ground);
+  }
+
+  // Nothing moved, nothing stood down: the page is provably untouched by this
+  // pass, and it comes back as the very list that went in.
+  if (touched.isEmpty && yields == 0) return placements;
+
   Log.info(
     'OCR Layout',
     'collision pass: $cuts side(s) gave back grown gutter, $pushes stepped '
     'aside, $shares band(s) split — ${touched.length} box(es) re-measured, '
-    '$drops of them now keep the original (nothing is drawn twice)',
+    '$drops of them now keep the original (nothing is drawn twice)'
+    // F13.2: counted apart, because it is a different sentence: these blocks
+    // were not dropped for want of room, they stood down so the *source*
+    // lettering under them stays readable.
+    '${yields > 0 ? ', $yields stood down over restored artwork' : ''}',
   );
   return [
     for (var i = 0; i < n; i++)
@@ -1030,6 +1252,13 @@ List<Placement> resolvePlacementOverlaps({
 /// would have been allowed to, can never leave the artwork, and is refused
 /// outright if the destination touches a third block's ink.
 ///
+/// [blocked] says which *other* blocks are in the way. It is a predicate rather
+/// than "the other placements" because of Phase 13-F13.2: a slide has to land
+/// clear of the areas that get the source artwork stamped back into them just
+/// as much as clear of the areas that get lettering — ink put there by the
+/// restore pass is ink the reader sees, and a step aside that lands on it
+/// reproduces the very overlap this pass exists to remove.
+///
 /// [ignore] is the neighbour this block is stepping away from. It is left out of
 /// the *envelope* on purpose: its edge currently lies inside this box, so the
 /// clear gap on the side of the move is negative and [safeGrowRect] would hand
@@ -1043,7 +1272,7 @@ bool _pushClears({
   required bool alongX,
   required ui.Size page,
   required List<ui.Rect> boxes,
-  required bool Function(int) paints,
+  required bool Function(int) blocked,
   required int skip,
   required int ignore,
 }) {
@@ -1054,14 +1283,14 @@ bool _pushClears({
     eraseBounds: _eraseBoundsOf(region),
     obstacles: [
       for (var k = 0; k < boxes.length; k++)
-        if (k != skip && k != ignore && paints(k)) boxes[k],
+        if (k != skip && k != ignore && blocked(k)) boxes[k],
     ],
     pageWidth: page.width,
     pageHeight: page.height,
   );
   if (!_envelopes(envelope, shifted)) return false;
   for (var k = 0; k < boxes.length; k++) {
-    if (k == skip || !paints(k)) continue;
+    if (k == skip || !blocked(k)) continue;
     if (!shifted.intersect(boxes[k]).isEmpty) return false;
   }
   return true;

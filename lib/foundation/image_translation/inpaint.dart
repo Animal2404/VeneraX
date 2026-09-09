@@ -90,6 +90,10 @@ class EraseReport {
   /// One grep-able line. Only the first few rollback reasons are spelled out:
   /// a page carries dozens of rectangles, and a log that repeats one failure
   /// forty times hides every other line in it.
+  ///
+  /// Note what this line is *not*: it says nothing when nothing was rolled
+  /// back. That is deliberate here — but the caller must never use it as "the
+  /// ledger", which is why [describeLedger] exists.
   String describe({int detailLimit = 4}) {
     final parts = <String>['erased=$erased', 'skipped=$skipped'];
     if (rolledBack > 0) {
@@ -107,6 +111,23 @@ class EraseReport {
     }
     return parts.join(' ');
   }
+
+  /// The full ledger, always: **every** one of the three numbers, whatever the
+  /// page did. Phase 13-F13.3.
+  ///
+  /// [describe] hides `rolled_back` when it is zero, which is right for a
+  /// reasons line and wrong for a count. Until now the pipeline printed an
+  /// erasure line *only* when something was rolled back, so the two states that
+  /// mean opposite things to whoever is reading a screenshot — "the eraser
+  /// never ran on this page" (`erased=0 skipped=N`) and "the eraser ran and did
+  /// its job" (`erased=N skipped=0`) — were indistinguishable by being
+  /// indistinguishable from printing nothing at all. A black block left behind
+  /// by a window that was judged `erased` is exactly the case that reads as
+  /// "the guard failed" and is in fact "the guard never fired". So count it out
+  /// loud every time, on every page.
+  String describeLedger() =>
+      'erased=$erased skipped=$skipped rolled_back=$rolledBack '
+      'rectangles=${results.length}';
 }
 
 /// A window whose luminance distribution went from "mostly not black" to
@@ -121,13 +142,48 @@ const double kDarkMassRise = 0.35;
 /// believed. Above this share the neighbourhood is itself black — a dark speech
 /// bubble, a night panel — and a window that ends up black there is the eraser
 /// doing its job, so the guard stands down.
+///
+/// Phase 13-F13.3: this share is **no longer sufficient on its own**. A dense
+/// screentone is a ring of separated black dots on paper, and at high coverage
+/// the near-black *share* of that ring clears 0.35 as a matter of arithmetic —
+/// which hands the guard its own disarming wire in exactly the scene the black
+/// blocks come from. A tonal ring is therefore believed only when it is also
+/// black *to the eye* — see [kRingDarkLumMean].
 const double kDarkMassRingLimit = 0.35;
+
+/// Mean luminance under which the neighbourhood counts as genuinely black
+/// rather than merely dotted. Phase 13-F13.3's other half.
+///
+/// The number is deliberately nowhere near a halftone's operating range: a
+/// screentone dark enough to sit at a 60/255 *average* is a screen the page
+/// reads as shadow, and a window going black inside it is the eraser following
+/// the artwork. A black speech bubble is at 0–20; a night panel's fill is under
+/// 50; a 50%-coverage tone on paper averages ~127 and a heavy 70% one still
+/// sits over 75. Mean rather than median on purpose: the median of a dense dot
+/// lattice *is* the dot, so a median would let the very texture that defeats
+/// the [kDarkMassRingLimit] share disarm this guard too.
+const int kRingDarkLumMean = 60;
 
 /// Luminance below which a pixel counts as black enough to be a block. Set
 /// well under any screentone: a grey bubble (lum ≈ 60) that legitimately
 /// receives dark lettering must not read as a black block, and a *real* one of
 /// these is what the roll back exists for.
 const int kNearBlackLum = 24;
+
+/// Radius of the probe used to tell a *mass* of near-black from a *pattern* of
+/// it, and the share of that probe that has to be near-black for the pixel to
+/// count as part of a mass. Phase 13-F13.3.
+///
+/// A screentone is high frequency: black islands a pixel or two across on
+/// paper, so a dot's own neighbourhood is mostly paper. Solid ink is low
+/// frequency: any pixel inside it, pushed a couple of px in any direction, is
+/// still inside it. That is the whole difference, and it is the difference the
+/// old `darkBefore` could not see — on a toned window the near-black share
+/// starts at 0.4–0.7 *because of the dots*, so the "did this window go from
+/// bright to black" rise became arithmetically unreachable and the guard
+/// against painting a black block over a tonal background simply never ran.
+const int kSolidDarkProbe = 2;
+const double kSolidDarkShare = 0.8;
 
 /// Pure-Dart text removal: erases the original lettering inside each text region
 /// and reconstructs the pixels underneath from the surrounding artwork, so the
@@ -214,6 +270,20 @@ abstract final class TextInpainter {
 
     final before = _snapshotWindow(pixels, w, m.left, m.top, m.rw, m.rh);
     final darkBefore = _darkShare(pixels, w, m.left, m.top, m.rw, m.rh);
+    // Phase 13-F13.3: the same window, measured for *mass* instead of for
+    // ink-anywhere. A tonal window is already half near-black before a single
+    // pixel is touched, and that is precisely how it defeats the rise test
+    // below — so the rise is also measured on the low-frequency number, the one
+    // a dot lattice cannot fake.
+    final solidBefore = _solidDarkShare(
+        pixels,
+        w,
+        image.height,
+        m.left,
+        m.top,
+        m.rw,
+        m.rh,
+      );
 
     final unfilled = _fillNearest(pixels, w, m.left, m.top, m.rw, m.rh, m.mask);
     if (unfilled > 0) {
@@ -226,7 +296,7 @@ abstract final class TextInpainter {
     _relax(pixels, w, m.left, m.top, m.rw, m.rh, m.mask, 2);
 
     final darkAfter = _darkShare(pixels, w, m.left, m.top, m.rw, m.rh);
-    final ringDark = _ringDarkShare(
+    final solidAfter = _solidDarkShare(
         pixels,
         w,
         image.height,
@@ -235,28 +305,62 @@ abstract final class TextInpainter {
         m.rw,
         m.rh,
       );
+    final (ringDark, ringLum) = _ringProfile(
+      pixels,
+      w,
+      image.height,
+      m.left,
+      m.top,
+      m.rw,
+      m.rh,
+    );
+    // "A black area inside bright surroundings" is the whole definition of the
+    // defect, so the surroundings test is what decides whether the guard fires
+    // at all — but Phase 13-F13.3 is the reason it now asks *two* questions of
+    // the ring. Near-black share alone reads a dense screentone as a black
+    // neighbourhood and stands down on exactly the pages that produce the
+    // blocks, so a ring only counts as black when it is also black to the eye:
+    // mean luminance under [kRingDarkLumMean]. A light lettering lift out of a
+    // real black bubble keeps both (share 1.0, mean ≈ 8), which is the case this
+    // guard must never touch.
+    final ringIsBlack =
+        ringDark >= kDarkMassRingLimit && ringLum < kRingDarkLumMean;
+    final massRise = darkAfter - darkBefore > kDarkMassRise;
+    final solidRise = solidAfter - solidBefore > kDarkMassRise;
     if (darkAfter > kDarkMassAfterShare &&
-        darkAfter - darkBefore > kDarkMassRise &&
-        ringDark < kDarkMassRingLimit) {
+        (massRise || solidRise) &&
+        !ringIsBlack) {
       _restoreWindow(pixels, w, m.left, m.top, m.rw, m.rh, before);
+      final which = [
+        if (massRise) 'ink',
+        if (solidRise) 'solid',
+      ].join('+');
       return (
         EraseOutcome.keptDarkMass,
         'black=${(darkBefore * 100).round()}%->${(darkAfter * 100).round()}% '
-        'around=${(ringDark * 100).round()}%'
-        ' original pixels restored',
+        'solid=${(solidBefore * 100).round()}%->${(solidAfter * 100).round()}% '
+        'around=${(ringDark * 100).round()}%/${ringLum.round()}lum '
+        '($which rose) original pixels restored',
       );
     }
     return (EraseOutcome.erased, null);
   }
 
-  /// Share of the frame just outside the window that is near-black.
+  /// The frame just outside the window, read two ways: the share of it that is
+  /// near-black, and its **mean luminance**.
   ///
   /// This is what turns the mass test from a guess into a *contrast* judgement:
   /// a black block is a black area inside bright surroundings. Take away that
   /// precondition and the guard would roll back every legitimate erase of light
   /// lettering out of a **black** speech bubble — there, the window going fully
   /// black is the eraser working correctly, and the ring says so.
-  static double _ringDarkShare(
+  ///
+  /// Phase 13-F13.3 is why one number is not enough. A screentone ring is
+  /// black *dots* on paper: its near-black share is the dot coverage and walks
+  /// past 0.35 on any heavy screen, while what the reader sees is a grey band.
+  /// The share answers "is there black here", the mean answers "is this area
+  /// black", and only the second one is a reason to stand down.
+  static (double darkShare, double lumMean) _ringProfile(
     Uint8List pixels,
     int imgW,
     int imgH,
@@ -266,15 +370,19 @@ abstract final class TextInpainter {
     int rh,
   ) {
     const band = 4;
-    final x0 = math.max(0, left - band), x1 = math.min(imgW - 1, left + rw + band);
-    final y0 = math.max(0, top - band), y1 = math.max(0, math.min(imgH - 1, top + rh + band));
+    final x0 = math.max(0, left - band),
+        x1 = math.min(imgW - 1, left + rw + band);
+    final y0 = math.max(0, top - band),
+        y1 = math.max(0, math.min(imgH - 1, top + rh + band));
     var dark = 0, count = 0;
+    var sum = 0.0;
     void sample(int x, int y) {
       final i = (y * imgW + x) * 4;
       if (i + 2 >= pixels.length) return;
       final lum =
           0.299 * pixels[i] + 0.587 * pixels[i + 1] + 0.114 * pixels[i + 2];
       if (lum < kNearBlackLum) dark++;
+      sum += lum;
       count++;
     }
 
@@ -284,12 +392,68 @@ abstract final class TextInpainter {
         if (outside) sample(x, y);
       }
     }
-    return count == 0 ? 1 : dark / count;
+    // "No ring at all" means the window is the whole page: there is nothing to
+    // contrast against, so nothing may be believed about a black result —
+    // share 1 ("as dark as it gets") with a mean of 0 would stand the guard
+    // down, and a full-page mask is exactly the case that needs it. Both
+    // readings say "unknown", so the pair is the conservative one: the share
+    // says *not* black (0) and the mean says 255, and the guard stays armed.
+    if (count == 0) return (0, 255);
+    return (dark / count, sum / count);
+  }
+
+  /// Share of a window's pixels that are near-black **and stay near-black when
+  /// the probe walks away from them** — the low-frequency half of the same
+  /// question [_darkShare] asks. See [kSolidDarkProbe] for why the two are not
+  /// interchangeable.
+  static double _solidDarkShare(
+    Uint8List pixels,
+    int imgW,
+    int imgH,
+    int left,
+    int top,
+    int rw,
+    int rh,
+  ) {
+    final step = math.max(1, math.min(rw, rh) ~/ 20);
+    var solid = 0, count = 0;
+    bool nearBlack(int x, int y) {
+      // Off-page is not "bright": a mass that runs to the edge is still a mass.
+      if (x < 0 || y < 0 || x >= imgW || y >= imgH) return true;
+      final i = (y * imgW + x) * 4;
+      if (i + 2 >= pixels.length) return true;
+      return 0.299 * pixels[i] +
+              0.587 * pixels[i + 1] +
+              0.114 * pixels[i + 2] <
+          kNearBlackLum;
+    }
+
+    for (var y = 0; y < rh; y += step) {
+      for (var x = 0; x < rw; x += step) {
+        count++;
+        if (!nearBlack(left + x, top + y)) continue;
+        var dark = 0, probe = 0;
+        for (var dy = -kSolidDarkProbe; dy <= kSolidDarkProbe; dy++) {
+          for (var dx = -kSolidDarkProbe; dx <= kSolidDarkProbe; dx++) {
+            probe++;
+            if (nearBlack(left + x + dx, top + y + dy)) dark++;
+          }
+        }
+        if (probe > 0 && dark / probe >= kSolidDarkShare) solid++;
+      }
+    }
+    return count == 0 ? 0 : solid / count;
   }
 
   /// Share of a window's pixels whose luminance is under [kNearBlackLum].
   /// Sampled on a stride grid: the number decides "was this window turned into
   /// a black block", and a few hundred samples say that without doubt.
+  ///
+  /// Note what this cannot tell apart, which is why [_solidDarkShare] exists
+  /// alongside it rather than after it: 60% of a window being near-black is
+  /// equally true of a solid ink mass and of a paper covered in a heavy dot
+  /// screen. Only the *transition* between the two states is the defect, and a
+  /// share that already counts the dots cannot see a transition.
   static double _darkShare(
     Uint8List pixels,
     int imgW,
