@@ -1445,7 +1445,9 @@
     "@seconds s": "@seconds 秒",
     "@rate pages/min · @samples samples": "@rate 页/分钟 · @samples 样本",
     "@s s/page throughput": "吞吐 @s 秒/页",
-    "@ms ms/page in group": "组内延迟 @ms 毫秒/页"
+    "@ms ms/page in group": "组内延迟 @ms 毫秒/页",
+    "Split bubbles at ink boundary (experimental)": "按墨迹边界拆分气泡（实验）",
+    "Off by default. When on, two facing text lines whose gap band contains a bubble outline are kept in separate blocks instead of being merged. The worker logs the same verdict either way.": "默认关闭。开启后，若两条相对的文字行之间的缝隙带里存在气泡描边，则不再合并为一个块。无论开关状态如何，worker 都会记录同样的判定结果。"
   },
   "zh_TW": {
     "Reading Statistics": "閱讀統計",
@@ -2893,6 +2895,8 @@
     "@seconds s": "@seconds 秒",
     "@rate pages/min · @samples samples": "@rate 頁/分鐘 · @samples 樣本",
     "@s s/page throughput": "吞吐 @s 秒/頁",
-    "@ms ms/page in group": "組內延遲 @ms 毫秒/頁"
+    "@ms ms/page in group": "組內延遲 @ms 毫秒/頁",
+    "Split bubbles at ink boundary (experimental)": "按墨跡邊界拆分氣泡（實驗）",
+    "Off by default. When on, two facing text lines whose gap band contains a bubble outline are kept in separate blocks instead of being merged. The worker logs the same verdict either way.": "預設關閉。開啟後，若兩條相對的文字行之間的縫隙帶裡存在氣泡描邊，則不再合併為一個區塊。無論開關狀態如何，worker 都會記錄同樣的判定結果。"
   }
 }

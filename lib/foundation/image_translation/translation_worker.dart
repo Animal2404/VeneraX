@@ -1847,6 +1847,10 @@ class _WorkerState {
 
     _intraThreads = req.intraThreads;
 
+    // A page index can be requested again later; the ink trace of the previous
+    // sweep must not survive to be printed as this one's.
+    clearOcrInkTraces();
+
     final pageImages = <int, RgbaImage>{};
     final pageErrors = <int, String>{};
 
@@ -2090,7 +2094,17 @@ class _WorkerState {
       // crushed this page", which is the opposite of the truth.
       funnel.cropLimit = ocrPageCropLimit(effectiveProfile.recBatch);
       if (boxes.isEmpty) continue;
-      var clusters = clusterOcrBoxes(boxes, img.width, img.height);
+      // The ink-boundary experiment (default off) audits this page's facing
+      // box pairs against the page's own pixels; `img` is the decoded RGBA
+      // page, so the strip is read here and nowhere else. With the switch off
+      // this changes nothing — see [OcrInkTrace].
+      var clusters = clusterOcrBoxes(
+        boxes,
+        img.width,
+        img.height,
+        pageIndex: pageIdx,
+        image: img,
+      );
       clusters.sort((a, b) => _boundsOf(a).top.compareTo(_boundsOf(b).top));
       // F13.5 / F13.6: the crop budget used to cut this list and say nothing.
       // `cutAtPct` is the page fraction the cut started at, so the claim
@@ -2364,6 +2378,12 @@ class _WorkerState {
       );
       if (digest != null) funnelLines.add(digest);
       funnelLines.addAll(clusterTraces[p.pageIndex] ?? const <String>[]);
+      // The ink-boundary verdict for this page, printed whether or not the
+      // experiment is enabled: with it off the line still states what the rule
+      // would have refused, which is what makes the next real-device run
+      // decisive instead of another round of guessing.
+      final inkTrace = takeOcrInkTrace(p.pageIndex);
+      if (inkTrace != null) funnelLines.add(inkTrace.line());
     }
 
     totalSw.stop();
@@ -2959,11 +2979,22 @@ Uint8List _resizeRegion(RgbaImage src, IntRect region, int outW, int outH) {
 
 /// Groups detector line boxes into OCR blocks without joining incompatible
 /// neighbouring captions or speech bubbles.
+///
+/// [pageIndex] and [image] are the optional ink-boundary experiment
+/// ([TranslationPerformanceConfig.inkBoundarySplit], default **off**). When
+/// [image] is null — every existing caller, and every test written before the
+/// experiment — the gate does not run and the result is exactly what this
+/// function produced before it existed. When [image] is supplied the audit
+/// still runs, but it only *changes* the grouping while the switch is on; with
+/// the switch off it merely records what the rule would have refused
+/// ([takeOcrInkTrace]).
 List<List<IntRect>> clusterOcrBoxes(
   List<IntRect> boxes,
   int width,
-  int height,
-) {
+  int height, {
+  int? pageIndex,
+  RgbaImage? image,
+}) {
   var parents = List<int>.generate(boxes.length, (i) => i);
   var minThickness = [for (var box in boxes) math.min(box.width, box.height)];
   var maxThickness = [...minThickness];
@@ -2972,6 +3003,11 @@ List<List<IntRect>> clusterOcrBoxes(
   var members = [
     for (var i = 0; i < boxes.length; i++) <int>[i],
   ];
+  // Ink-boundary audit (experiment, default off). Counted here so the log line
+  // can state what the rule would have done even while it changes nothing.
+  var inkCandidates = 0;
+  var inkRejected = 0;
+  final inkDetails = <OcrInkGap>[];
   int find(int i) {
     while (parents[i] != i) {
       parents[i] = parents[parents[i]];
@@ -2998,6 +3034,35 @@ List<List<IntRect>> clusterOcrBoxes(
     for (var j = i + 1; j < boxes.length; j++) {
       if (inflated[i].intersects(inflated[j]) &&
           _compatibleTextLines(boxes[i], boxes[j])) {
+        // Ink audit, in its own scope so it can neither touch the union-find
+        // below nor be skipped by one of its `continue`s. It runs on the pair
+        // the geometric gates already accepted, i.e. exactly the merges the
+        // experiment can veto. `a` is the upper box; a pair with no vertical
+        // facing order has no gap band and is not a candidate.
+        var inkAllow = true;
+        if (image != null) {
+          final first = boxes[i];
+          final second = boxes[j];
+          final above = first.bottom <= second.top
+              ? first
+              : (second.bottom <= first.top ? second : null);
+          if (above != null) {
+            final below = identical(above, first) ? second : first;
+            inkCandidates++;
+            final verdict = ocrInkGap(image, above, below);
+            final measured = verdict.gap;
+            if (measured != null && !verdict.allow) {
+              inkRejected++;
+              if (inkDetails.length < OcrInkTrace.maxDetails) {
+                inkDetails.add(measured);
+              }
+            }
+            inkAllow = verdict.allow;
+          }
+        }
+        if (!inkAllow && TranslationPerformanceConfig.inkBoundarySplit) {
+          continue;
+        }
         var rootI = find(i);
         var rootJ = find(j);
         if (rootI == rootJ) continue;
@@ -3030,6 +3095,18 @@ List<List<IntRect>> clusterOcrBoxes(
         hasVertical[rootI] = mergedVertical;
       }
     }
+  }
+  if (pageIndex != null && image != null) {
+    _ocrInkTraceByPage[pageIndex] = OcrInkTrace(
+      pageIndex: pageIndex,
+      candidates: inkCandidates,
+      rejected: inkRejected,
+      details: inkDetails,
+    );
+  } else if (pageIndex != null) {
+    // No pixels to audit: drop any stale entry so a reused page index cannot
+    // print an earlier page's numbers.
+    _ocrInkTraceByPage.remove(pageIndex);
   }
   var groups = <int, List<IntRect>>{};
   for (var i = 0; i < boxes.length; i++) {
@@ -3131,6 +3208,226 @@ int _axisOverlap(int startA, int endA, int startB, int endB) =>
 
 int _axisGap(int startA, int endA, int startB, int endB) =>
     math.max(0, math.max(startA, startB) - math.min(endA, endB));
+
+// ===========================================================================
+// Ink-boundary experiment (default off) — see [OcrInkTrace] for the log shape
+// ===========================================================================
+
+/// One measured gap band between two facing boxes, as [ocrInkGap] found it.
+///
+/// Fields, in the order [OcrInkTrace.line] prints them:
+/// * [gapWidth] / [gapHeight] — the strip `x ∈ [max(a.left, b.left),
+///   min(a.right, b.right)]`, `y ∈ (a.bottom, b.top)` in px. `WxH`.
+/// * [inkRatio] — share of the strip's columns that carried a qualifying
+///   "dark stroke with bright pixels above and below" run. 0.00…1.00.
+/// * [runPx] — the shortest qualifying run height seen, i.e. the thinnest
+///   stroke the strip offered. A bubble outline is thin; a picture panel or a
+///   hair mass is not.
+/// * [backgroundLuma] — mean luma of the strip, 0…255, i.e. the local
+///   background the dark threshold is relative to.
+class OcrInkGap {
+  const OcrInkGap({
+    required this.gapWidth,
+    required this.gapHeight,
+    required this.inkRatio,
+    required this.runPx,
+    required this.backgroundLuma,
+  });
+
+  final int gapWidth;
+  final int gapHeight;
+  final double inkRatio;
+  final int runPx;
+  final double backgroundLuma;
+
+  @override
+  String toString() => 'gap=${gapWidth}x$gapHeight '
+      'ink=${inkRatio.toStringAsFixed(2)} run=${runPx}px '
+      'bg=${backgroundLuma.round()}';
+}
+
+/// The verdict of one ink audit: whether the strip is a bubble boundary (and
+/// therefore a merge the experiment refuses), plus the measurement behind it.
+/// [gap] is null when there was nothing to measure — a strip with no pixels.
+class OcrInkVerdict {
+  const OcrInkVerdict(this.allow, this.gap);
+
+  final bool allow;
+  final OcrInkGap? gap;
+}
+
+/// The ink audit of one page, carried out of the isolate on the funnel channel.
+///
+/// The switch is **off** in every shipped build, so this line exists to make
+/// the *next* real-device run decisive instead of another round of guessing:
+/// with the switch off it still prints what the rule *would* have refused.
+///
+/// `OcrInk page=N candidates=K rejected=R details=[…]`, fields:
+/// * `candidates` — facing box pairs whose gap band was measured (both boxes
+///   horizontal, one strictly above the other). Pairs that already overlap, or
+///   sit side by side, are not candidates: there is no band between them.
+/// * `rejected` — candidates the ink rule calls a bubble boundary, i.e. the
+///   merges the switch *would* refuse. It counts verdicts, not merges: a pair
+///   whose link is rejected by an existing gate anyway is still counted, so
+///   `rejected` can exceed the number of merges the switch actually changes.
+/// * `details` — up to [maxDetails] measurements of those rejections, so the
+///   numbers (`ink` ratio, thinnest `run`, local `bg`) can be read off the log
+///   and compared with a screenshot of the same page.
+///
+/// **Identity contract:** with the switch off, the gate may only *measure*.
+/// `clusterOcrBoxes` must produce the same grouping with the switch off as it
+/// did before the gate existed — pixels may never change a merge while the
+/// switch is off, and that is pinned by
+/// `test/translation_ink_boundary_test.dart`.
+class OcrInkTrace {
+  const OcrInkTrace({
+    required this.pageIndex,
+    required this.candidates,
+    required this.rejected,
+    required this.details,
+  });
+
+  static const maxDetails = 3;
+
+  final int pageIndex;
+  final int candidates;
+  final int rejected;
+  final List<OcrInkGap> details;
+
+  String line() {
+    final buffer = StringBuffer(
+      'OcrInk page=$pageIndex candidates=$candidates rejected=$rejected '
+      'details=[',
+    );
+    for (var i = 0; i < details.length; i++) {
+      if (i > 0) buffer.write(' ');
+      buffer.write(details[i]);
+    }
+    if (rejected > details.length) {
+      buffer.write(' …+${rejected - details.length}more');
+    }
+    buffer.write(']');
+    return buffer.toString();
+  }
+}
+
+/// Per-page ink traces of the last [clusterOcrBoxes] call, keyed by page index.
+///
+/// Same reason as `funnelLogs` / `OcrCluster` lines: a `Log.*` call inside the
+/// worker isolate never reaches `logs.txt`, so the trace is handed back to the
+/// main isolate instead. Keyed by page, so it cannot grow with box count; each
+/// page's entry is removed once read ([takeOcrInkTrace]) and the map is cleared
+/// at the start of every recognition sweep.
+final Map<int, OcrInkTrace> _ocrInkTraceByPage = <int, OcrInkTrace>{};
+
+/// Read and drop the trace of one page. Null when the page produced no boxes
+/// (or was never clustered), which is exactly when there is no line to print.
+OcrInkTrace? takeOcrInkTrace(int pageIndex) =>
+    _ocrInkTraceByPage.remove(pageIndex);
+
+/// Forget every stored trace. Called once per sweep so a page index reused by
+/// a later request can never inherit an earlier page's numbers.
+void clearOcrInkTraces() => _ocrInkTraceByPage.clear();
+
+/// Mean luma of an RGBA pixel, 0…255. Integer Rec.601 weights: this is a
+/// presence test for dark ink, not a colour pipeline, and integer math keeps it
+/// identical on every platform the worker runs on.
+int _luma(int r, int g, int b) => (299 * r + 587 * g + 114 * b) ~/ 1000;
+
+/// The bubble-outline discriminator, measured on the page's own pixels.
+///
+/// For two *facing* horizontal boxes `a` (above) and `b` (below) the strip is
+/// `x ∈ [max(a.left, b.left), min(a.right, b.right)]`, `y ∈ (a.bottom, b.top)`.
+/// The strip is called a bubble boundary when at least
+/// [inkColumnShare] of its columns carry a run of dark pixels
+/// (`luma < 0.45 × the strip's mean luma`) that is
+///
+/// * **thin** — at most [inkRunHeightFactor] × `min(t_a, t_b)`, where `t` is a
+///   box's short side (the line thickness), and
+/// * **surrounded** — with at least one brighter pixel above *and* below it
+///   inside the strip.
+///
+/// Both extra conditions are load-bearing: they are what keeps a solid ink mass
+/// (artwork, hair, a panel edge) from being read as a bubble outline. A mass is
+/// either too tall to be a thin run or fills the strip top to bottom so there is
+/// no bright pixel on one side. Only an outline — a stroke drawn across the gap
+/// between two bubbles — satisfies both.
+///
+/// Returns `allow: true` (merge as before) whenever there is nothing to judge:
+/// boxes that do not face each other, an empty or single-column strip, or a
+/// strip that falls outside the image. The experiment may refuse a merge; it
+/// may never throw or guess.
+OcrInkVerdict ocrInkGap(RgbaImage image, IntRect a, IntRect b) {
+  const inkColumnShare = 0.8;
+  const inkRunHeightFactor = 0.6;
+  const inkLumaFactor = 0.45;
+
+  final gapTop = a.bottom;
+  final gapBottom = b.top;
+  if (gapBottom <= gapTop) return const OcrInkVerdict(true, null);
+  final left = math.max(a.left, b.left);
+  final right = math.min(a.right, b.right);
+  if (right <= left) return const OcrInkVerdict(true, null);
+  final stripLeft = math.max(0, left);
+  final stripRight = math.min(image.width, right);
+  final stripTop = math.max(0, gapTop);
+  final stripBottom = math.min(image.height, gapBottom);
+  final columns = stripRight - stripLeft;
+  final rows = stripBottom - stripTop;
+  if (columns <= 0 || rows <= 0) return const OcrInkVerdict(true, null);
+  final maxRun = math.max(
+    1,
+    (inkRunHeightFactor * math.min(a.height, b.height)).round(),
+  );
+
+  final pixels = image.pixels;
+  final stride = image.width * 4;
+  var sum = 0;
+  for (var y = stripTop; y < stripBottom; y++) {
+    final rowBase = y * stride;
+    for (var x = stripLeft; x < stripRight; x++) {
+      final base = rowBase + x * 4;
+      sum += _luma(pixels[base], pixels[base + 1], pixels[base + 2]);
+    }
+  }
+  final meanLuma = sum / (columns * rows);
+  final darkLimit = meanLuma * inkLumaFactor;
+
+  var inked = 0;
+  var shortestRun = 0;
+  for (var x = stripLeft; x < stripRight; x++) {
+    var best = 0;
+    var run = 0;
+    var brightAbove = false;
+    for (var y = stripTop; y < stripBottom; y++) {
+      final base = y * stride + x * 4;
+      final luma = _luma(pixels[base], pixels[base + 1], pixels[base + 2]);
+      if (luma < darkLimit) {
+        if (run == 0) brightAbove = false;
+        run++;
+      } else {
+        if (run > 0 && brightAbove && run <= maxRun) {
+          best = best == 0 ? run : math.min(best, run);
+        }
+        brightAbove = true;
+        run = 0;
+      }
+    }
+    if (best > 0) {
+      inked++;
+      if (shortestRun == 0 || best < shortestRun) shortestRun = best;
+    }
+  }
+  final inkRatio = inked / columns;
+  final gap = OcrInkGap(
+    gapWidth: columns,
+    gapHeight: rows,
+    inkRatio: inkRatio,
+    runPx: shortestRun,
+    backgroundLuma: meanLuma,
+  );
+  return OcrInkVerdict(inkRatio < inkColumnShare, gap);
+}
 
 /// Largest run-direction gap two fragments of one line may have. Word spacing
 /// and detector splits routinely leave most of a glyph height between pieces,

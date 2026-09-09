@@ -1226,6 +1226,31 @@ class _ReaderSettingsState extends State<ReaderSettings> {
                 );
               },
             ),
+            // Ink-boundary experiment, default OFF. The cross-bubble merge
+            // cannot be told from a legitimately wide-spaced narration block by
+            // any geometric threshold (the narration gap that must survive is
+            // 1.00× line thickness, the cross-bubble gap that must split is
+            // 0.57×), so this one uses the page's own ink: a thin dark stroke
+            // with bright pixels above and below inside the gap band is a
+            // bubble outline. Off by default because the rule is unproven on
+            // real pages; the worker logs what it *would* refuse even while
+            // this switch is off, so one real-device run can settle it. Like
+            // "Pipeline mode" above it is not part of the preset value table,
+            // so toggling it must not flip the preset to custom.
+            _SwitchSetting(
+              title: "Split bubbles at ink boundary (experimental)".tl,
+              subtitle:
+                  "Off by default. When on, two facing text lines whose gap band contains a bubble outline are kept in separate blocks instead of being merged. The worker logs the same verdict either way."
+                      .tl,
+              settingKey:
+                  TranslationPerformanceConfig.inkBoundarySplitSettingKey,
+              onChanged: () {
+                setState(() {});
+                widget.onChanged?.call(
+                  TranslationPerformanceConfig.inkBoundarySplitSettingKey,
+                );
+              },
+            ),
             // Refresh cadence of the pre-translation progress card. This is
             // a display-only knob, deliberately stored in appdata's implicit
             // data (the per-device channel the pre-translation task records

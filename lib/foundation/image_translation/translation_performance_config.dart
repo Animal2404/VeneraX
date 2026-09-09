@@ -193,6 +193,33 @@ abstract final class TranslationPerformanceConfig {
   static PipelineMode get pipelineMode =>
       pipelineModeFromSetting(appdata.settings[pipelineModeSettingKey]);
 
+  /// Frozen setting-key name for the ink-boundary experiment. Value domain:
+  /// `true` | `false` (absent means false).
+  static const inkBoundarySplitSettingKey = 'imageTranslationInkBoundarySplit';
+
+  /// Whether the OCR clustering pass is allowed to *refuse* a candidate merge
+  /// because the page's own ink says two facing boxes sit in different speech
+  /// bubbles.
+  ///
+  /// Factory default **false**, and deliberately so. The discriminator is the
+  /// bubble outline (a thin dark run in the gap band with bright pixels on both
+  /// sides), and the geometry-only discriminator was proven unusable: the
+  /// narration gap that must survive is 1.00× line thickness while the
+  /// cross-bubble gap that must be split is 0.57×, so every geometric
+  /// threshold cuts the legitimate one first. Until a real-device log says the
+  /// ink rule fires only on real outlines, the shipped behaviour is the
+  /// measured one: merge everything the existing gates accept. The switch
+  /// exists so that verdict costs one run instead of another refactor, and
+  /// [inkBoundarySplitFromSetting] keeps it a pure read.
+  static bool get inkBoundarySplit =>
+      inkBoundarySplitFromSetting(appdata.settings[inkBoundarySplitSettingKey]);
+
+  /// Pure parse, same shape as [_epSetting] / [pipelineModeFromSetting]: only a
+  /// real `true` enables the experiment. Null, a string, a number or any value
+  /// written by a future build leaves the shipped clustering path untouched —
+  /// an experiment must never be turned on by a typo.
+  static bool inkBoundarySplitFromSetting(Object? value) => value == true;
+
   /// Pure parse, same shape as [_epSetting]: unknown values keep the safe
   /// (memory-first) mode.
   static PipelineMode pipelineModeFromSetting(Object? value) =>
