@@ -103,7 +103,17 @@ jobs:
           # --machine emits one JSON event per line on stdout; everything the
           # tool prints goes to stderr, so the report stays parseable.
           set +e
-          flutter test --machine --no-pub > ci-out/test_report.jsonl 2> ci-out/test_stderr.log
+          # The machine report goes to a file, so Actions shows nothing until the suite
+        # ends: "slow" and "hung" look identical from the log. Emit a progress line every
+        # 30s so a stalled run is provable instead of arguable.
+        ( while :; do
+            n=$(grep -c '"testDone"' ci-out/test_report.jsonl 2>/dev/null; true)
+            echo "[heartbeat] tests finished: $n"
+            sleep 30
+          done ) & HB=$!
+        trap 'kill $HB 2>/dev/null || true' EXIT
+
+        flutter test --machine --no-pub > ci-out/test_report.jsonl 2> ci-out/test_stderr.log
           flutter_status=$?
           set -e
           # Keep the tool's own output in the log: a suite that fails to load
