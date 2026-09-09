@@ -185,6 +185,11 @@
     "Invalid": "校验不通过",
     "Files present, not validated yet": "文件已就位，尚未校验",
     "Unpublished · not available": "未发布 · 暂不可用",
+    "Model files need attention": "模型文件需要处理",
+    "Check all model files": "一次检测全部模型文件",
+    "Structure checks passed": "结构检测通过",
+    "All model files passed the check": "全部模型文件均通过检测",
+    "@n of @m model components failed the full check": "@m 个模型组件中 @n 个未通过完整检测",
     "Could not open the folder; the path has been copied to the clipboard": "无法打开文件夹，路径已复制到剪贴板",
     "Resources": "\"资源\"",
     "Live OCR sessions": "\"活动 OCR 会话\"",
@@ -1358,7 +1363,8 @@
     "Model Input Shapes": "模型输入形状",
     "Recent OCR Performance Logs": "最近 OCR 性能日志",
     "No OCR performance logs yet": "暂无 OCR 性能日志",
-    "Copy diagnostics": "复制诊断信息"
+    "Copy diagnostics": "复制诊断信息",
+    "Hardware acceleration backend used for OCR models. DirectML covers modern NVIDIA, AMD and Intel GPUs on Windows, including half-precision weights, so a separate CUDA build is not shipped.": "OCR 模型使用的硬件加速后端。DirectML 在 Windows 上覆盖 NVIDIA、AMD、Intel 的现代显卡，并支持半精度权重，因此不再单独发布 CUDA 版本。"
   },
   "zh_TW": {
     "Reading Statistics": "閱讀統計",
@@ -1546,6 +1552,11 @@
     "Invalid": "校驗不通過",
     "Files present, not validated yet": "檔案已就位，尚未校驗",
     "Unpublished · not available": "未發布 · 暫不可用",
+    "Model files need attention": "模型檔案需要處理",
+    "Check all model files": "一次偵測全部模型檔案",
+    "Structure checks passed": "結構偵測通過",
+    "All model files passed the check": "全部模型檔案均通過偵測",
+    "@n of @m model components failed the full check": "@m 個模型組件中 @n 個未通過完整偵測",
     "Could not open the folder; the path has been copied to the clipboard": "無法開啟資料夾，路徑已複製到剪貼簿",
     "Resources": "\"資源\"",
     "Live OCR sessions": "\"活動 OCR 工作階段\"",
@@ -2719,6 +2730,7 @@
     "Model Input Shapes": "模型輸入形狀",
     "Recent OCR Performance Logs": "最近 OCR 效能日誌",
     "No OCR performance logs yet": "暫無 OCR 效能日誌",
-    "Copy diagnostics": "複製診斷資訊"
+    "Copy diagnostics": "複製診斷資訊",
+    "Hardware acceleration backend used for OCR models. DirectML covers modern NVIDIA, AMD and Intel GPUs on Windows, including half-precision weights, so a separate CUDA build is not shipped.": "OCR 模型使用的硬體加速後端。DirectML 在 Windows 上涵蓋 NVIDIA、AMD、Intel 的現代顯示卡，並支援半精度權重，因此不再單獨發布 CUDA 版本。"
   }
 }
