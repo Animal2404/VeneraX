@@ -89,9 +89,25 @@ const _settingsCategoryIcons = <IconData>[
 ];
 
 class SettingsPage extends StatefulWidget {
-  const SettingsPage({this.initialPage = -1, super.key});
+  const SettingsPage({
+    this.initialPage = -1,
+    this.autoExpandGroupKey,
+    super.key,
+  });
 
   final int initialPage;
+
+  /// Index of the "Reading settings" category in [_settingsCategories].
+  /// Public so a deep link (the AI Translation sidebar entry) does not have
+  /// to hard-code the position.
+  static const readingSettingsIndex = 1;
+
+  /// PageStorage id of a `_SettingsExpansionTile` inside the [initialPage]
+  /// category. When set, that group is expanded and scrolled into view once,
+  /// shortly after the page opens — the same "open at an anchor" behavior
+  /// [GuidePage] gives its document sections, applied to a settings group.
+  /// A null value (every other current caller) changes nothing.
+  final String? autoExpandGroupKey;
 
   @override
   State<SettingsPage> createState() => _SettingsPageState();
@@ -117,6 +133,17 @@ class _SettingsPageState extends State<SettingsPage> {
   @override
   void initState() {
     currentPage = widget.initialPage;
+    if (widget.autoExpandGroupKey != null && widget.initialPage >= 0) {
+      // Single-view (narrow) layouts show the category list first; a deep
+      // link opens its category exactly the way tapping the row would, and
+      // the detail page then runs the group reveal. Two-view layouts already
+      // show the category on the right, where buildRight reveals it.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && !enableTwoViews) {
+          _openSettingsCategory(widget.initialPage);
+        }
+      });
+    }
     super.initState();
   }
 
@@ -234,7 +261,15 @@ class _SettingsPageState extends State<SettingsPage> {
     if (enableTwoViews) {
       setState(() => currentPage = id);
     } else {
-      context.to(() => _SettingsDetailPage(pageIndex: id));
+      context.to(
+        () => _SettingsDetailPage(
+          pageIndex: id,
+          // Only the deep-linked category carries the reveal request; a row
+          // the user tapped normally behaves exactly as before.
+          revealGroupKey:
+              id == widget.initialPage ? widget.autoExpandGroupKey : null,
+        ),
+      );
     }
   }
 
@@ -296,7 +331,14 @@ class _SettingsPageState extends State<SettingsPage> {
       onGenerateRoute: (settings) {
         return PageRouteBuilder(
           pageBuilder: (context, animation, secondaryAnimation) {
-            return _buildSettingsContent(currentPage);
+            Widget content = _buildSettingsContent(currentPage);
+            final groupKey = widget.autoExpandGroupKey;
+            // Only the deep-linked category can hold the group; reveal it on
+            // landing. Any other category renders untouched.
+            if (groupKey != null && currentPage == widget.initialPage) {
+              content = _RevealExpansionGroup(groupKey: groupKey, child: content);
+            }
+            return content;
           },
           transitionDuration: Duration.zero,
         );
@@ -320,13 +362,25 @@ class _SettingsPageState extends State<SettingsPage> {
 }
 
 class _SettingsDetailPage extends StatelessWidget {
-  const _SettingsDetailPage({required this.pageIndex});
+  const _SettingsDetailPage({
+    required this.pageIndex,
+    this.revealGroupKey,
+  });
 
   final int pageIndex;
 
+  /// PageStorage id of a collapsible group to expand on open; see
+  /// [SettingsPage.autoExpandGroupKey].
+  final String? revealGroupKey;
+
   @override
   Widget build(BuildContext context) {
-    return Material(child: _buildPage());
+    Widget content = Material(child: _buildPage());
+    final groupKey = revealGroupKey;
+    if (groupKey != null) {
+      content = _RevealExpansionGroup(groupKey: groupKey, child: content);
+    }
+    return content;
   }
 
   Widget _buildPage() {
@@ -342,4 +396,102 @@ class _SettingsDetailPage extends StatelessWidget {
       _ => throw UnimplementedError(),
     };
   }
+}
+
+/// One-shot "open at an anchor" for a collapsible settings group, mirroring
+/// the pattern [GuidePage] uses for document anchors: after this subtree has
+/// produced a frame, the `_SettingsExpansionTile` whose `PageStorageKey`
+/// matches [groupKey] is expanded through its public `ExpansibleController`
+/// and scrolled into view.
+///
+/// It exists because the groups are declared inside `part 'reader.dart'` and
+/// own their expansion state — the page hosting them can only reach them
+/// through the widget tree. If nothing matches (a renamed group, a different
+/// category) this widget gives up after a few frames and leaves the page
+/// exactly as it was: a reveal request is a convenience, never a crash.
+class _RevealExpansionGroup extends StatefulWidget {
+  const _RevealExpansionGroup({required this.groupKey, required this.child});
+
+  final String groupKey;
+
+  final Widget child;
+
+  @override
+  State<_RevealExpansionGroup> createState() => _RevealExpansionGroupState();
+}
+
+class _RevealExpansionGroupState extends State<_RevealExpansionGroup> {
+  /// Frames to keep searching before giving up. The deep-linked category may
+  /// be mounted a frame or two after this widget itself (the narrow layout
+  /// pushes its detail page from a post-frame callback).
+  static const _maxFrames = 10;
+
+  bool _revealed = false;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _reveal(_maxFrames));
+  }
+
+  void _reveal(int framesLeft) {
+    if (!mounted || _revealed) return;
+    // A State's context *is* its Element; the walk needs Element.visitChildren.
+    final tile = _findByKey(
+      context as Element,
+      PageStorageKey<String>(widget.groupKey),
+    );
+    if (tile == null) {
+      if (framesLeft > 0) {
+        WidgetsBinding.instance.addPostFrameCallback(
+          (_) => _reveal(framesLeft - 1),
+        );
+      }
+      return;
+    }
+    _revealed = true;
+    // Expanding first means ensureVisible aims at the header while the body
+    // unfolds under it, so the header stays where it was placed.
+    _controllerOfTile(tile)?.expand();
+    Scrollable.ensureVisible(
+      tile,
+      alignment: 0.05,
+      duration: const Duration(milliseconds: 300),
+    );
+  }
+
+  static Element? _findByKey(Element root, Key key) {
+    Element? found;
+    void visit(Element element) {
+      if (found != null) return;
+      if (element.widget.key == key) {
+        found = element;
+        return;
+      }
+      element.visitChildren(visit);
+    }
+
+    root.visitChildren(visit);
+    return found;
+  }
+
+  /// An `ExpansionTile` builds an `Expansible` below itself and hands it its
+  /// controller; `ExpansibleController.maybeOf` only resolves from a context
+  /// the Expansible encloses, so the search starts one step under the tile.
+  static ExpansibleController? _controllerOfTile(Element tile) {
+    ExpansibleController? controller;
+    void visit(Element element) {
+      if (controller != null) return;
+      controller = ExpansibleController.maybeOf(element);
+      if (controller == null) {
+        element.visitChildren(visit);
+      }
+    }
+
+    tile.visitChildren(visit);
+    return controller;
+  }
+
+  @override
+  Widget build(BuildContext context) => widget.child;
 }

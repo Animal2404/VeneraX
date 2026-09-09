@@ -51,18 +51,31 @@ class _MainPageState extends State<MainPage> {
   /// use it instead of positions, which shift when entries are inserted.
   static const aiTranslationEntryId = 'ai-translation';
 
-  /// Pushes the AI-translation management screen without taking a page slot:
-  /// the sidebar entry below keeps the current page in place, the pushed
-  /// screen sits on top, and the highlight moves to the entry itself (see
-  /// [NaviPaneState.handleItemTap]).
-  void _openTranslationModels() {
-    _navigatorKey!.currentContext!
-        .to(() => const TranslationModelsPage())
-        .whenComplete(() {
-      if (mounted) {
-        NaviPane.of(context).restoreSelection();
-      }
-    });
+  /// PageStorage id of the "AI Translation (experimental)" expansion group
+  /// inside the Reading settings category (`part 'reader.dart'` declares it
+  /// as a `_SettingsExpansionTile`). The sidebar entry asks [SettingsPage] to
+  /// scroll to and expand exactly this group.
+  static const _aiTranslationGroupKey = 'readerTranslationGroup';
+
+  /// Opens the AI translation *parameters* — performance mode, pipeline mode,
+  /// batch sizes, concurrency, inference backend — which live in the
+  /// "AI Translation (experimental)" group of the Reading settings category.
+  ///
+  /// Landing directly on [TranslationModelsPage] (what this entry did first)
+  /// only showed model download/validation, which is why the report read
+  /// "nothing can be configured here": the model manager stays reachable as
+  /// the group's own secondary entry ("Translation models" → "Manage").
+  ///
+  /// No page slot is taken; the routing dedup (a re-tap returns to the layer
+  /// already open instead of pushing another copy) and the highlight
+  /// lifecycle live in [NaviPaneState.handleItemTap].
+  void _openTranslationSettings() {
+    _navigatorKey!.currentContext!.to(
+      () => SettingsPage(
+        initialPage: SettingsPage.readingSettingsIndex,
+        autoExpandGroupKey: _aiTranslationGroupKey,
+      ),
+    );
   }
 
   final _pages = [
@@ -70,6 +83,40 @@ class _MainPageState extends State<MainPage> {
     const FavoritesPage(key: PageStorageKey('favorites')),
     const ExplorePage(key: PageStorageKey('explore')),
     const CategoriesPage(key: PageStorageKey('categories')),
+  ];
+
+  /// Built once (a `late` field initializer may tear off the instance
+  /// methods) rather than per build: the AI Translation highlight is tracked
+  /// by entry identity, and a per-build list handed every MainPage rebuild a
+  /// fresh `PaneItemEntry` would silently orphan that selection.
+  late final List<PaneItemEntry> _paneItems = [
+    PaneItemEntry(
+      label: 'Home'.tl,
+      icon: Icons.home_outlined,
+      activeIcon: Icons.home,
+    ),
+    PaneItemEntry(
+      label: 'Favorites'.tl,
+      icon: Icons.local_activity_outlined,
+      activeIcon: Icons.local_activity,
+    ),
+    PaneItemEntry(
+      label: 'Explore'.tl,
+      icon: Icons.explore_outlined,
+      activeIcon: Icons.explore,
+    ),
+    PaneItemEntry(
+      label: 'Categories'.tl,
+      icon: Icons.category_outlined,
+      activeIcon: Icons.category,
+    ),
+    PaneItemEntry(
+      id: aiTranslationEntryId,
+      label: 'AI Translation (experimental)'.tl,
+      icon: Icons.translate,
+      activeIcon: Icons.translate,
+      onTap: _openTranslationSettings,
+    ),
   ];
 
   var index = 0;
@@ -80,35 +127,7 @@ class _MainPageState extends State<MainPage> {
       initialPage: index,
       observer: _observer,
       navigatorKey: _navigatorKey!,
-      paneItems: [
-        PaneItemEntry(
-          label: 'Home'.tl,
-          icon: Icons.home_outlined,
-          activeIcon: Icons.home,
-        ),
-        PaneItemEntry(
-          label: 'Favorites'.tl,
-          icon: Icons.local_activity_outlined,
-          activeIcon: Icons.local_activity,
-        ),
-        PaneItemEntry(
-          label: 'Explore'.tl,
-          icon: Icons.explore_outlined,
-          activeIcon: Icons.explore,
-        ),
-        PaneItemEntry(
-          label: 'Categories'.tl,
-          icon: Icons.category_outlined,
-          activeIcon: Icons.category,
-        ),
-        PaneItemEntry(
-          id: aiTranslationEntryId,
-          label: 'AI Translation (experimental)'.tl,
-          icon: Icons.translate,
-          activeIcon: Icons.translate,
-          onTap: _openTranslationModels,
-        ),
-      ],
+      paneItems: _paneItems,
       onPageChanged: (i) {
         setState(() {
           index = i;

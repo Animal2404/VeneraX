@@ -88,13 +88,22 @@ class NaviPaneState extends State<NaviPane>
   /// screen it pushed is on top, with the page slot staying put underneath.
   PaneItemEntry? _selectedEntry;
 
+  /// The route the selected custom-tap entry pushed. It serves two purposes:
+  /// a re-tap returns to this layer instead of pushing a second copy (the
+  /// page-stacking defect), and the highlight falls back to the page slot as
+  /// soon as the route leaves the observed stack, whoever popped it.
+  Route<dynamic>? _selectedEntryRoute;
+
   /// Whether [entry] (rendered at [renderedIndex] on the calling surface) is
-  /// highlighted: custom-tap entries compare by identity (they never own a
-  /// page slot), regular entries by their position, which matches the slot
-  /// index on every surface that renders them.
+  /// highlighted. At most one item ever matches: while a custom-tap entry
+  /// owns the highlight it owns it *exclusively* — the page slot underneath
+  /// must not light up too (the double-highlight defect). Otherwise the
+  /// regular entry whose rendered position owns the current slot is
+  /// selected, which is the original index-based rule.
   bool isEntrySelected(PaneItemEntry entry, int renderedIndex) {
-    if (entry.onTap != null) {
-      return identical(_selectedEntry, entry);
+    final selected = _selectedEntry;
+    if (selected != null) {
+      return identical(selected, entry);
     }
     return renderedIndex == _currentPage;
   }
@@ -102,24 +111,76 @@ class NaviPaneState extends State<NaviPane>
   /// Item tap from any navigation surface (compact sidebar, bottom bar,
   /// expanded side bar). Entries with a custom [PaneItemEntry.onTap] take
   /// over routing: the highlight moves to them and they push their own
-  /// screen; everything else switches the page slot at [index].
+  /// screen onto the observed navigator; everything else switches the page
+  /// slot at [index].
+  ///
+  /// Re-tapping an already-selected custom entry never runs its action a
+  /// second time — that unconditional re-push was the page-stacking defect.
+  /// Instead the stack pops back to the route the entry first pushed, so the
+  /// user returns to the layer that is already open, and rapid taps cannot
+  /// stack copies (the first tap's push is synchronous, so the second tap
+  /// already sees the route in place).
   void handleItemTap(int index, PaneItemEntry entry) {
     final action = entry.onTap;
     if (action == null) {
       updatePage(index);
       return;
     }
+    final opened = _selectedEntryRoute;
+    if (identical(_selectedEntry, entry) &&
+        opened != null &&
+        widget.observer.routes.contains(opened)) {
+      widget.navigatorKey.currentState?.popUntil((route) => route == opened);
+      return;
+    }
     if (!identical(_selectedEntry, entry)) {
       setState(() => _selectedEntry = entry);
     }
+    _selectedEntryRoute = null;
     action();
+    // The action pushes its screen synchronously (Navigator.push notifies
+    // didPush from within the same call), so the top of the observed stack
+    // is the route this entry just opened. An action that pushes nothing
+    // leaves the highlight on the entry with no route to return to; the
+    // custom entries this bar ships with always push exactly one screen.
+    final routes = widget.observer.routes;
+    _selectedEntryRoute = routes.isEmpty ? null : routes.last;
   }
 
   /// Hands the selection highlight back to the current page slot after a
   /// custom-tap entry's pushed screen was popped (or replaced).
   void restoreSelection() {
-    if (_selectedEntry == null) return;
+    if (_selectedEntry == null && _selectedEntryRoute == null) return;
+    _selectedEntryRoute = null;
+    if (!mounted) return;
     setState(() => _selectedEntry = null);
+    // The compact surfaces (bottom bar) live in the main view subtree, which
+    // NaviPane's own setState does not rebuild.
+    mainViewUpdateHandler?.call();
+  }
+
+  /// Schedules the highlight fallback when the observed stack changes: once
+  /// the custom entry's route is gone (back button, gesture, popUntil), the
+  /// page slot owns the highlight again without the entry's owner having to
+  /// remember to call [restoreSelection]. Deferred to after the frame
+  /// because observer notifications can arrive mid-history-flush, when a
+  /// setState would be illegal.
+  void _maybeRestoreSelectionAfterRouteChange() {
+    final opened = _selectedEntryRoute;
+    if (_selectedEntry == null ||
+        opened == null ||
+        widget.observer.routes.contains(opened)) {
+      return;
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final route = _selectedEntryRoute;
+      if (_selectedEntry != null &&
+          route != null &&
+          !widget.observer.routes.contains(route)) {
+        restoreSelection();
+      }
+    });
   }
 
   int get currentPage => _currentPage;
@@ -157,6 +218,7 @@ class NaviPaneState extends State<NaviPane>
       _kBottomBarHeight + MediaQuery.paddingOf(context).bottom;
 
   void onNavigatorStateChange() {
+    _maybeRestoreSelectionAfterRouteChange();
     onRebuild(context);
   }
 
@@ -177,6 +239,7 @@ class NaviPaneState extends State<NaviPane>
       currentPage = index;
       if (wasCustom) {
         _selectedEntry = null;
+        _selectedEntryRoute = null;
       }
     });
     mainViewUpdateHandler?.call();
