@@ -3398,18 +3398,26 @@ OcrInkVerdict ocrInkGap(RgbaImage image, IntRect a, IntRect b) {
   for (var x = stripLeft; x < stripRight; x++) {
     var best = 0;
     var run = 0;
-    var brightAbove = false;
+    // "Bright above" has to mean *before the run started*, not merely seen
+    // earlier in the column: the first dark pixel of a run used to reset this
+    // flag, so by the time the closing bright pixel arrived the flag was always
+    // false and no run ever qualified. That is why the probe refused nothing on
+    // its own positive fixture — see `test/translation_ink_boundary_test.dart`.
+    var brightBefore = false;
+    var seenBright = false;
     for (var y = stripTop; y < stripBottom; y++) {
       final base = y * stride + x * 4;
       final luma = _luma(pixels[base], pixels[base + 1], pixels[base + 2]);
       if (luma < darkLimit) {
-        if (run == 0) brightAbove = false;
+        // A run starts here: carry over the bright pixel that closed the
+        // previous one, if any, and drop it otherwise.
+        if (run == 0) brightBefore = seenBright;
         run++;
       } else {
-        if (run > 0 && brightAbove && run <= maxRun) {
+        if (run > 0 && brightBefore && run <= maxRun) {
           best = best == 0 ? run : math.min(best, run);
         }
-        brightAbove = true;
+        seenBright = true;
         run = 0;
       }
     }
