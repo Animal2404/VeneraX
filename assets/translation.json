@@ -1386,7 +1386,7 @@
     "modelCheck.noGraph": "@file 是一个 ONNX 容器，但里面没有模型图。",
     "modelCheck.noOutput": "@file 没有声明任何输出（graph output）。",
     "modelCheck.badImageInputShape": "输入形状不符：@role需要 @need 形式的 float32 图像输入，但 @file 没有这样的输入。它的输入是 @inputs。请确认放入的是同一种模型。",
-    "modelCheck.badImageInputAxis": "输入形状不符：@role需要 @need 形式的 float32 图像输入，但 @file 的@axis，无法按这个形状喂数据。它的输入是 @inputs。请更换与@role配套的模型。",
+    "modelCheck.badImageInputAxis": "输入形状不符：@role需要 @need 形式的 float32 图像输入，但 @file 的@axis，无法按这个形状喂数据。它的输入是 @inputs。请确认放入的是正确的@role。",
     "modelCheck.axisPinned": "第 @i 维（@name）固定为 @got，这里需要 @want",
     "modelCheck.axisBatch": "批量",
     "modelCheck.axisChannel": "通道数",

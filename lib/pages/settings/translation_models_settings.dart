@@ -1,3 +1,16 @@
+// ===========================================================================
+// OWNERSHIP — see the matching notice at the top of
+// `lib/foundation/image_translation/translation_models.dart`.
+//
+// This page and that file are owned EXCLUSIVELY by the local-model validation
+// task, and they are one change, not two: the list filter that keeps
+// unpublished assets out of the rows, the detection pass that runs as soon as
+// the page opens, and the one-click "check every component" notice all read
+// `TranslationModels.listedComponents` / `runDetectionPass` /
+// `isUnpublishedAsset`. Restoring either file from git deletes half of a fixed
+// defect — which already happened once.
+// ===========================================================================
+
 part of 'settings_page.dart';
 
 /// Management page for offline translation model files: download (with
@@ -18,10 +31,48 @@ class _TranslationModelsPageState extends State<TranslationModelsPage> {
   /// Ids of components whose "Validate files" run is still in flight.
   final _validating = <String>{};
 
+  /// Per-component outcome of the last detection pass that ran here (the one
+  /// on open, the "check every component" button, or a row's own validate).
+  /// Rows render from it: "每个组件行内显示结果" is only meaningful once the
+  /// page knows which rows it has actually looked at.
+  final _detected = <String, ModelState>{};
+
+  /// The detection pass found a component whose files are present but wrong,
+  /// so the single button that re-checks *everything* goes on top of the list.
+  bool _showCheckAll = false;
+
+  /// A whole-list check is running.
+  bool _checkingAll = false;
+
   @override
   void initState() {
     TranslationModelStore.instance.addListener(_update);
     super.initState();
+    // Detection when the page opens, not when the user asks for it: "are my
+    // model files usable?" is the whole reason this page exists, and having
+    // to click seven rows to find out was the reported defect. It runs after
+    // the first frame on purpose — the pass is cheap (it answers from the
+    // size@mtime ledger, see [TranslationModels.runDetectionPass]), but the
+    // very first one does read each model header, and blocking the first
+    // frame with that would make the page look frozen.
+    WidgetsBinding.instance.addPostFrameCallback((_) => _detectOnOpen());
+  }
+
+  /// Every component this page lists: the three sections as the registry
+  /// partitions them, minus the rows with nothing behind them (gate G5).
+  List<ModelComponent> _listedComponents() => [
+    for (final section in ModelSection.values)
+      ...TranslationModels.listedComponents(section),
+  ];
+
+  /// The pass that runs as soon as the page opens.
+  void _detectOnOpen() {
+    if (!mounted) return;
+    final result = TranslationModels.runDetectionPass(_listedComponents());
+    setState(() {
+      _detected.addAll(result.states);
+      _showCheckAll = result.hasFailures;
+    });
   }
 
   @override
@@ -51,6 +102,107 @@ class _TranslationModelsPageState extends State<TranslationModelsPage> {
     return "${(bytes / (1 << 10)).toStringAsFixed(0)} KB";
   }
 
+  /// One click, every component: a full [validateComponent] pass over
+  /// everything the page lists that actually has files on disk.
+  ///
+  /// Rows whose files are missing are skipped: "not installed" is not a
+  /// defect, and turning them red would bury the rows that do have a problem.
+  ///
+  /// `checkHashes` stays off deliberately. The button re-runs every structural
+  /// and dictionary rule — which is what "把全部组件都检测一遍" asks for — while
+  /// the SHA-256 comparison would hash ~700 MB of models **on the UI isolate**
+  /// and freeze the page for seconds. Anyone who wants that answer has it per
+  /// row (the 校验已放入的文件 button), where the cost is an explicit click on
+  /// one component.
+  Future<void> _checkAllComponents() async {
+    if (_checkingAll) return;
+    final targets = _listedComponents()
+        .where(
+          (c) =>
+              c.enabled && TranslationModels.stateOf(c) != ModelState.absent,
+        )
+        .toList();
+    if (targets.isEmpty) {
+      setState(() => _showCheckAll = false);
+      return;
+    }
+    setState(() {
+      _checkingAll = true;
+      _validating.addAll(targets.map((c) => c.id));
+    });
+    var failed = 0;
+    for (final component in targets) {
+      final verdict = await validateComponent(component);
+      if (!mounted) return;
+      if (!verdict.ok) failed++;
+      setState(() {
+        _detected[component.id] = verdict.state;
+        _validating.remove(component.id);
+      });
+    }
+    setState(() {
+      _checkingAll = false;
+      // All green now: the notice goes away with the reason that raised it.
+      _showCheckAll = failed > 0;
+    });
+    context.showMessage(
+      message: failed == 0
+          ? "All model files passed the check".tl
+          : "@n of @m model components failed the full check".tlParams({
+              'n': failed,
+              'm': targets.length,
+            }),
+    );
+  }
+
+  /// The notice above the sections — shown only while a detection pass found
+  /// something actually wrong with a file that is there.
+  Widget _buildCheckAllNotice(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+      child: Container(
+        padding: const EdgeInsets.fromLTRB(12, 10, 8, 10),
+        decoration: BoxDecoration(
+          color: context.colorScheme.errorContainer.withValues(alpha: 0.5),
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: Row(
+          children: [
+            Icon(
+              Icons.warning_amber_rounded,
+              color: context.colorScheme.error,
+              size: 20,
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                "Model files need attention".tl,
+                style: TextStyle(color: context.colorScheme.onErrorContainer),
+              ),
+            ),
+            if (_checkingAll)
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 8),
+                child: SizedBox(
+                  width: 18,
+                  height: 18,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2.2,
+                    color: context.colorScheme.primary,
+                  ),
+                ),
+              )
+            else
+              Button.filled(
+                onPressed: _checkAllComponents,
+                child: Text("Check all model files".tl),
+              ).fixHeight(32),
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     var requiredIds = TranslationModels.requiredFor(
@@ -70,26 +222,26 @@ class _TranslationModelsPageState extends State<TranslationModelsPage> {
               }
             }());
 
-    final detComponents = TranslationModels.all
-        .where((c) => c.kind == ModelKind.detector)
-        .toList();
-    final recComponents = TranslationModels.all
-        .where((c) =>
-            c.kind != ModelKind.detector &&
-            !c.requiresGpuEp &&
-            c.tier != ModelTier.high)
-        .toList();
-    final highAndGpuComponents = TranslationModels.all
-        .where((c) =>
-            c.kind != ModelKind.detector &&
-            (c.requiresGpuEp || c.tier == ModelTier.high))
-        .toList();
+    // Unpublished assets are filtered out by the registry (gate G5), so the
+    // three dead "未发布 · 暂不可用" rows are not part of the list at all — the
+    // row, not the wording, was the defect. See
+    // [TranslationModels.isUnpublishedAsset] for what un-hides them.
+    final detComponents = TranslationModels.listedComponents(
+      ModelSection.detection,
+    );
+    final recComponents = TranslationModels.listedComponents(
+      ModelSection.recognition,
+    );
+    final highAndGpuComponents = TranslationModels.listedComponents(
+      ModelSection.highAndGpu,
+    );
 
     return Scaffold(
       body: SmoothCustomScrollView(
         scrollbarTopPadding: context.padding.top + 56,
         slivers: [
           SliverAppbar(title: Text("Translation models".tl)),
+          if (_showCheckAll) _buildCheckAllNotice(context).toSliver(),
           SelectSetting(
             title: "Model quality".tl,
             settingKey: "imageTranslationModelQuality",
@@ -219,8 +371,13 @@ class _TranslationModelsPageState extends State<TranslationModelsPage> {
 
     Widget trailing;
     if (!component.enabled) {
-      // R-3 / §7.2.1: assets that are registered but never published say so
-      // and offer nothing to click; reserved placeholders keep "Coming soon".
+      // R-3 / §7.2.1: reserved placeholders (no files) keep "Coming soon".
+      // The "Unpublished · not available" arm below is now a fallback that the
+      // list never reaches: unpublished assets are filtered out before rows
+      // are built (gate G5, [TranslationModels.isUnpublishedAsset]), which is
+      // what defect 2 asked for — no dead row, not a nicer label on it. It
+      // stays so that anything rendering this builder from a list that skipped
+      // the filter still tells the truth.
       trailing = Text(
         component.files.isEmpty
             ? "Coming soon".tl
@@ -309,14 +466,19 @@ class _TranslationModelsPageState extends State<TranslationModelsPage> {
       subtitle += " · ${"Required by current settings".tl}";
     }
     if (component.enabled) {
-      // §7.2.3 "行内状态": the validation verdict, in words.
+      // §7.2.3 "行内状态": the validation verdict, in words. Once a detection
+      // pass has covered this row, "present" reports what it now means — the
+      // structure gate ran over these exact bytes and passed — instead of the
+      // untouched "nothing has looked at this yet" wording.
       switch (modelState) {
         case ModelState.invalid:
           subtitle += '\n${"Invalid".tl}: ${TranslationModels.validationDetail(component) ?? ""}';
         case ModelState.verified:
           subtitle += ' · ${"Validated".tl}';
         case ModelState.present:
-          subtitle += ' · ${"Files present, not validated yet".tl}';
+          subtitle += _detected.containsKey(component.id)
+              ? ' · ${"Structure checks passed".tl}'
+              : ' · ${"Files present, not validated yet".tl}';
         case ModelState.absent:
           break;
       }
@@ -412,7 +574,18 @@ class _TranslationModelsPageState extends State<TranslationModelsPage> {
     setState(() => _validating.add(component.id));
     final verdict = await validateComponent(component, checkHashes: true);
     if (!mounted) return;
-    setState(() => _validating.remove(component.id));
+    setState(() {
+      _validating.remove(component.id);
+      _detected[component.id] = verdict.state;
+      // A row the user just repaired takes the notice with it; one that still
+      // fails keeps it, because the button is how they re-check all of them at
+      // once instead of hunting row by row.
+      if (verdict.ok) {
+        _showCheckAll = TranslationModels.runDetectionPass(
+          _listedComponents(),
+        ).hasFailures;
+      }
+    });
     final name = _componentName(component);
     if (verdict.ok) {
       final extra = verdict.warnings.isEmpty ? '' : '\n${verdict.warnings.first}';

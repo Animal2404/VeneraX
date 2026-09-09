@@ -1,3 +1,21 @@
+// ===========================================================================
+// OWNERSHIP — read this before touching the two files below.
+//
+// `translation_models.dart` and
+// `lib/pages/settings/translation_models_settings.dart` are owned
+// EXCLUSIVELY by the local-model validation task (defects: symbolic ONNX axes
+// rejected by the validator, unpublished rows rendered as dead ends, detection
+// only on demand, English-only diagnostics).
+//
+// A `git checkout --` / `git restore` on either path does NOT just undo the
+// change you meant to undo: it also deletes the settings-page wiring that the
+// validator work depends on, because the list filter, the detection-on-open
+// pass and the one-click recheck all live here. This has already happened
+// once in reality (a sibling task restored this file from HEAD and took the
+// release-blocking fix's UI half down with it). If a file in this pair has to
+// be reverted, revert it together with `local_model_import.dart` and say so.
+// ===========================================================================
+
 import 'dart:async';
 
 import 'package:crypto/crypto.dart';
@@ -63,6 +81,66 @@ enum ModelKind {
   detector,
   rec,
   mangaEncoder,
+}
+
+/// A heading of the model-management list.
+///
+/// The split is a property of the registry, not of the page: keeping it here
+/// is what lets "do not list unpublished assets" have one implementation and
+/// one test instead of three copies inside a `build()` (defect 2).
+enum ModelSection {
+  detection,
+  recognition,
+  highAndGpu;
+
+  /// Whether [c] belongs under this heading. Identical to the predicate each
+  /// section used while it was still written out in the page.
+  bool contains(ModelComponent c) => switch (this) {
+    ModelSection.detection => c.kind == ModelKind.detector,
+    ModelSection.recognition =>
+      c.kind != ModelKind.detector &&
+          !c.requiresGpuEp &&
+          c.tier != ModelTier.high,
+    ModelSection.highAndGpu =>
+      c.kind != ModelKind.detector &&
+          (c.requiresGpuEp || c.tier == ModelTier.high),
+  };
+}
+
+/// What one detection pass over a set of components found.
+///
+/// Produced by [TranslationModels.runDetectionPass] — the pass the
+/// model-management page runs as soon as it opens, and again from its
+/// "check every component" button.
+class ModelSweepResult {
+  const ModelSweepResult({
+    required this.states,
+    required this.failed,
+    required this.rechecks,
+  });
+
+  /// Component id → the state each row should now render.
+  final Map<String, ModelState> states;
+
+  /// Ids judged [ModelState.invalid]: a file that is there and is wrong.
+  ///
+  /// [ModelState.absent] is deliberately NOT a failure. "Not installed" is a
+  /// choice the row already shows as a Download button; raising the
+  /// check-everything notice for it would train the user to ignore the notice.
+  final List<String> failed;
+
+  /// How many structure gates actually parsed a file during this pass.
+  /// Zero means every answer came from the size@mtime ledger — the property
+  /// that makes "detect as soon as the page opens" cheap enough to allow.
+  final int rechecks;
+
+  bool get hasFailures => failed.isNotEmpty;
+
+  /// The human reason behind a row's failure, when it failed.
+  String? detailOf(ModelComponent c) =>
+      states[c.id] == ModelState.invalid
+          ? TranslationModels.validationDetail(c)
+          : null;
 }
 
 /// A downloadable model component (detector / OCR / translator).
@@ -448,6 +526,102 @@ abstract class TranslationModels {
   }
 
   // ------------------------------------------------------------------------
+  // Settings-list visibility — decision gate G5
+  // ------------------------------------------------------------------------
+
+  /// A component that is registered, declares downloadable files, and is
+  /// disabled: an **unpublished asset**.
+  ///
+  /// Exactly three are in this state — `ocr_ja_fp16`, `ocr_zh_fp16`,
+  /// `ocr_zh_high_fp16`. For all three the only source is a `{release}` URL
+  /// behind a `models` tag that has never existed, and the model files carry
+  /// no `expected_sha256` either. Such a row is a dead end: nothing to
+  /// download, nothing to drop in, nothing to click. The management page
+  /// therefore leaves it out of the list entirely — the earlier "未发布 · 暂不
+  /// 可用" label (and greyed-out row) was tried and rejected by users, who
+  /// read it as a broken feature.
+  ///
+  /// **The condition for un-hiding one of these is decision gate G5, not a UI
+  /// change:**
+  /// ① the asset is actually published under the fork's `models` release
+  ///    (`tool/model_export/publish.py` has run, `ASSETS.md` records it), and
+  /// ② every file it declares carries an `expectedSha256`, so a download can
+  ///    be verified against what upstream shipped.
+  /// Only then does `enabled: true` belong on the component. Flipping that
+  /// flag is the *whole* of the un-hide — this predicate keys off `enabled`,
+  /// so no page edit is waiting to be remembered, and
+  /// `test/model_dict_consistency_test.dart` pins both the membership and the
+  /// fact that enabling alone re-lists the row.
+  ///
+  /// A disabled component with **no** files (`text_detector_manga`) is not an
+  /// unpublished asset but a roadmap placeholder, and keeps its "Coming soon"
+  /// row. `enabled` itself stays the data switch it always was: it gates
+  /// `isInstalled` / `workerPaths` (V10-2) independently of what the list shows.
+  static bool isUnpublishedAsset(ModelComponent c) =>
+      !c.enabled && c.files.isNotEmpty;
+
+  /// The components [section] should render: its own partition, minus
+  /// unpublished assets. One place for the rule, so the page cannot drift
+  /// back to listing dead rows.
+  static List<ModelComponent> listedComponents(ModelSection section) => all
+      .where((c) => section.contains(c) && !isUnpublishedAsset(c))
+      .toList();
+
+  // ------------------------------------------------------------------------
+  // Detection pass (model-management page, plan §7.2.3 "行内状态")
+  // ------------------------------------------------------------------------
+
+  /// How often the FFI-free structure gate has actually parsed a component.
+  ///
+  /// The gate reads every declared input/output of a model out of the file's
+  /// bytes; on a 343 MB encoder that is milliseconds, but it must still happen
+  /// at most once per size@mtime fingerprint — which is the difference between
+  /// "opening the page is free" and "opening the page re-reads 574 MB".
+  static int get structureGateRuns => _structureGateRuns;
+
+  static int _structureGateRuns = 0;
+
+  @visibleForTesting
+  static void resetStructureGateRunsForTest() => _structureGateRuns = 0;
+
+  /// One cheap detection pass over [components].
+  ///
+  /// Nothing here hashes a file, opens an ORT session, or touches the network:
+  /// [stateOf] answers from the verdict ledger while the size@mtime
+  /// fingerprint holds, and otherwise runs the pure-Dart structure gate (red
+  /// line R3 — no FFI on this isolate). That is what makes it safe to run the
+  /// moment the page opens instead of waiting for a click, and what makes the
+  /// second and hundredth open free ([ModelSweepResult.rechecks] == 0).
+  ///
+  /// Disabled components are skipped: [validateComponent] refuses them and
+  /// that would report unpublished assets as failures.
+  static ModelSweepResult runDetectionPass(
+    Iterable<ModelComponent> components,
+  ) {
+    final states = <String, ModelState>{};
+    final failed = <String>[];
+    final before = _structureGateRuns;
+    for (final c in components) {
+      if (!c.enabled) continue;
+      ModelState state;
+      try {
+        state = stateOf(c);
+      } catch (e) {
+        // A detection pass must never be the thing that breaks the page.
+        Log.error('Translation Models', 'detection pass failed for ${c.id}: $e');
+        continue;
+      }
+      states[c.id] = state;
+      if (state == ModelState.invalid) failed.add(c.id);
+    }
+    return ModelSweepResult(
+      states: states,
+      failed: failed,
+      rechecks: _structureGateRuns - before,
+    );
+  }
+
+  // ------------------------------------------------------------------------
   // Validation ledger (plan §7.2.1 / §7.2.2, decision R-3)
   //
   // Component id -> last verdict, stamped with the fingerprint (size +
@@ -485,6 +659,10 @@ abstract class TranslationModels {
     final fp = _componentFingerprint(c);
     final v = _verdicts[c.id];
     if (v != null && v.fingerprint == fp) return v.state;
+    // Fingerprints differ (or nothing was ever recorded): this is the one
+    // place a model file is re-parsed, and the counter is how the tests prove
+    // that re-opening the page does not do it again.
+    _structureGateRuns++;
     final check = checkComponentStructure(c);
     final problem = check.problem;
     if (problem != null) {

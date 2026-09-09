@@ -20,6 +20,18 @@
 /// falls back to the declared metadata, which already covers every crash
 /// class of plan D-10 / D-11 (wrong file kind, dict↔model class mismatch,
 /// fp16 IO on a CPU component, truncated / HTML-instead-of-model downloads).
+///
+/// ## Reading a declared shape (the rule that broke every install once)
+/// `TensorShapeProto.Dimension` is a protobuf **oneof**: `dim_value` (a
+/// literal) or `dim_param` (a symbolic name). Paddle2ONNX names its dynamic
+/// axes (`p2o.DynamicDimension.3`), torch exports name them too (`height`),
+/// and some exporters write `dim_value = -1`. All of those say *"any size"*,
+/// so every one of them satisfies a required shape; only an axis pinned to a
+/// *different literal* contradicts one. A symbolic name is therefore never
+/// evidence of a mismatch — treat it as such and healthy models are declared
+/// broken (that is defect 1). Counts a graph leaves open (the class axis)
+/// cannot be compared at all: they are reported as runtime-resolved notes by
+/// [runtimeResolvedClassNote], never guessed.
 library;
 
 import 'dart:convert';
@@ -27,8 +39,10 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
+import 'package:venera/foundation/app.dart';
 import 'package:venera/foundation/image_translation/translation_models.dart';
 import 'package:venera/foundation/log.dart';
+import 'package:venera/utils/translations.dart';
 
 // ===========================================================================
 // Public verdict type
@@ -64,6 +78,199 @@ class ImportVerdict {
   String toString() =>
       'ImportVerdict($state, ok: $ok'
       '${warnings.isEmpty ? '' : ', ${warnings.length} warning(s)'})';
+}
+
+// ===========================================================================
+// User-facing wording
+// ===========================================================================
+
+/// Every sentence this validator can show a human.
+///
+/// The user reading it is Chinese-speaking and cannot read English, so the
+/// skeleton is Chinese: `<结论>：<原因>。<下一步>`. Technical identifiers stay
+/// verbatim inside the sentence — `rec.onnx`, `float32`, `softmax_11.tmp_0`,
+/// `[?,3,?,?]`, a `dim_param` name — because they are the handle a user (or a
+/// bug report) has to grab, and translating them would remove the only
+/// diagnostic value the message has.
+///
+/// `assets/translation.json` is what the running app actually renders: it
+/// carries the same ids under `zh_CN` (byte-identical to the fallback below)
+/// and `zh_TW` (Traditional wording). This table is the floor for the two
+/// places where the asset bundle is not reachable — the worker isolate and a
+/// unit test — and `test/model_dict_consistency_test.dart` fails the build if
+/// the two sources ever drift apart, so "the JSON is the source" is a checked
+/// statement rather than an intention.
+abstract final class ModelMessages {
+  /// Keys in `assets/translation.json` are namespaced with this prefix
+  /// (`modelCheck.missingFile`), so a validator string can never collide with
+  /// a natural-language UI label in the same flat table.
+  static const namespace = 'modelCheck.';
+
+  /// `id → Chinese skeleton with @placeholders`.
+  static const skeletons = <String, String>{
+    // ---- the file itself -------------------------------------------------
+    'missingFile': '缺少文件：@file。请把该文件放入 @dir，或下载这个组件后再试。',
+    'emptyFile':
+        '文件为空（0 字节）：@file。这通常是网盘同步或复制中断留下的半成品，'
+        '请重新复制一份完整的文件。',
+    'lockedFile':
+        '文件正被其他程序占用：@file（同步盘还在下载、编辑器还开着，'
+        '或杀毒软件正在扫描）。请等它忙完之后再校验。',
+    'fileUnreadable': '无法读取 @file（@os）。',
+    // ---- "this is not a model" ------------------------------------------
+    'notOnnxModel':
+        '不像是一个 ONNX 模型：@file 的开头是 @byte。被改名的文档、下载到的'
+        '错误网页、以及损坏的文件都是这个样子。请确认放入的确实是 .onnx 模型。',
+    'truncatedModel':
+        '@file 在模型数据中途就结束了（下载被截断？）。请重新复制一份完整的文件。',
+    'badProtobuf': '@file 不是可以解析的 protobuf 数据。',
+    'badVarint': '@file 里的长度编码（varint）已经损坏。',
+    'unreadableModel': '@file 不是可以读取的 ONNX 模型。',
+    'inconsistentLengths':
+        '@file 不是可以读取的 ONNX 模型（内部各段的长度互相对不上）。',
+    'noGraph': '@file 是一个 ONNX 容器，但里面没有模型图。',
+    'noOutput': '@file 没有声明任何输出（graph output）。',
+    // ---- shapes ----------------------------------------------------------
+    'badImageInputShape':
+        '输入形状不符：@role需要 @need 形式的 float32 图像输入，'
+        '但 @file 没有这样的输入。它的输入是 @inputs。'
+        '请确认放入的是同一种模型。',
+    'badImageInputAxis':
+        '输入形状不符：@role需要 @need 形式的 float32 图像输入，'
+        '但 @file 的@axis，无法按这个形状喂数据。它的输入是 @inputs。'
+        '请确认放入的是正确的@role。',
+    'axisPinned': '第 @i 维（@name）固定为 @got，这里需要 @want',
+    'axisBatch': '批量',
+    'axisChannel': '通道数',
+    'axisHeight': '高',
+    'axisWidth': '宽',
+    'roleDetector': '文字检测模型',
+    'roleRec': '文字识别模型',
+    'roleEncoder': 'manga-ocr 编码器',
+    'detMapChannels':
+        '输出不是概率图：检测模型应输出单通道的概率图（[batch,height,width] 或 '
+        '[batch,1,height,width]），但 @file 的第一个输出是 @shape，'
+        '不是 DBNet 能用的结果。请更换检测模型。',
+    'detNotTensor': '@file 没有输出概率图（它的第一个输出不是张量）。',
+    'recNotTensor': '@file 没有输出 CTC 概率（它的第一个输出不是张量）。',
+    'recOutputRank':
+        '输出形状不符：识别模型应输出 CTC 概率 [batch,sequence,classes]，'
+        '但 @file 的第一个输出是 @shape（@rank 维张量）。'
+        '把检测模型放进识别位，报的就是这个错。请更换识别模型。',
+    'decoderInputs':
+        '输入形状不符：manga-ocr 解码器需要一个 int64 的 token 输入和一个 '
+        'float32 的编码器隐层输入，但 @file 的输入是 @inputs。',
+    'decoderOutput':
+        '输出形状不符：解码器应输出 [batch,position,vocabulary] 的词表概率，'
+        '但 @file 的第一个输出是 @shape。',
+    'decoderNotTensor':
+        '@file 没有输出词表概率（它的第一个输出不是张量）。',
+    'float16OnCpu':
+        '精度不匹配：“@file”声明了 float16 张量（@tensors），'
+        '但“@comp”走的是 CPU 路径，只能读 float32——硬跑只会安静地出乱码。'
+        '这看起来是该模型的 FP16 版本，请换用 FP32 版本。',
+    'float16NeedsGpu':
+        '“@file”声明的是 float16 输入输出，只能在 GPU 执行提供者上运行。',
+    'fixedBatch':
+        '“@file”的批量维被固定为 1：可以用，但批量识别不会让它更快'
+        '（每次只能送进一张裁切图）。',
+    'runtimeResolvedClasses':
+        '“@file”的类别数要到运行时才知道（输出 @shape 中下标 2 的那一维是动态的'
+        '@note），所以@check没有执行——这一项只有真实会话能判断'
+        '（runtime-resolved）。',
+    // ---- dictionary / vocabulary pairing --------------------------------
+    'dictClassMismatch':
+        '类别数对不上：模型输出 @classes 类，而 "@dict" 只有 @lines 行。'
+        '程序使用词典时会在最前面补一个空白类、最后补一个空格类，'
+        '所以模型必须正好输出 @lines + @extra = @need 类。'
+        '换了别的语言的词典、或换了另一代模型，就会这样对不上。'
+        '请更换与该词典配套的模型。',
+    'vocabClassMismatch':
+        '词表对不上：解码器输出 @classes 个 token 类，而 vocab.txt 有 @lines 行。'
+        '超出词表的 token 在解码时会被悄悄丢掉，'
+        '请让解码器和词表来自同一个 manga-ocr 版本。',
+    'dictNotUtf8':
+        '@file 不是合法的 UTF-8 文本——多半是被改名的二进制文件，'
+        '或者是下载到一半断掉的词典。',
+    'dictEmpty':
+        '@file 里没有任何词典内容。请把真正的词典放进去（每行一个字或一个词）。',
+    'dictMissingOwn':
+        '这个组件识别文字所需的词典（dict.txt）不存在。请把词典文件放入 @dir。',
+    'dictMissingShared':
+        '这个组件识别文字所需的词典不存在（它借用 "@from" 的 dict.txt）。'
+        '请先安装那个提供词典的基础 OCR 组件。',
+    'sharedDictNotUtf8':
+        '借用的 dict.txt 不是合法的 UTF-8 文本，请重新安装提供它的那个基础 OCR '
+        '组件。',
+    // ---- checksums, runtime probe, bookkeeping ---------------------------
+    'checksumMatch': '校验和与发布版本一致',
+    'checksumDiffers':
+        '校验和与发布版本不一致（实际为 @actual）。已按本地导入处理：'
+        '只按文件结构判断能否使用。',
+    'structureNotDoubleChecked': '结构无法二次核对（@err）',
+    'runtimeLoadRefused':
+        '“@file”完全无法被 ONNX 运行时加载——它只是名字叫模型文件而已。',
+    'atRuntime': '运行时检查结果：@problem',
+    'classCountDrift':
+        '“@file”在元数据里声明 @declared 类，运行时却看到 @runtime 类：'
+        '这个模型自相矛盾，不可信。请重新获取该文件。',
+    'allFilesOk': '@count 个文件全部通过检查。',
+    'componentNotPublished':
+        '该组件尚未发布，应用不会加载它的文件，校验它的本地副本没有意义。',
+    'validatorCrashed':
+        '校验无法完成（@err）。文件已按“未校验”保留为可用状态：请重试，'
+        '或重新下载该组件。',
+    'dynamicAxesNote': '（显示为 ? 的维度是动态的，符号名为 @names）',
+    'checkDictPair': '“类别数 = 词典行数 + @extra”这项核对',
+    'checkVocabPair': '“类别数 = 词表行数”这项核对',
+    'symbolicAxes': '，符号名为 @names',
+    'fileDoesNotExist': '文件不存在（@path）',
+  };
+
+  /// [skeletons['componentNotPublished']], as a `const` the early return in
+  /// [validateComponent] can hand to an [ImportVerdict] without a lookup.
+  static const componentNotPublished =
+      '该组件尚未发布，应用不会加载它的文件，校验它的本地副本没有意义。';
+
+  /// Assemble message [id]: `assets/translation.json` wins for the current
+  /// locale, the Chinese [skeletons] entry is the floor, and `@name` tokens
+  /// are filled from [params].
+  static String render(String id, [Map<String, Object> params = const {}]) {
+    final skeleton = localized(id) ?? skeletons[id];
+    if (skeleton == null) return id;
+    var text = skeleton;
+    for (final entry in params.entries) {
+      text = text.replaceAll('@${entry.key}', '${entry.value}');
+    }
+    return text;
+  }
+
+  /// A label that lives in the table under its own name (a component's
+  /// `displayNameKey`): the localised text when it is loaded, the key
+  /// otherwise — never a crash, because a name is not worth one.
+  /// Labels live under their own name, without the `modelCheck.` prefix: a
+  /// component's `displayNameKey` is shared with the settings page.
+  static String label(String key) => localized(key, namespaced: false) ?? key;
+
+  /// The table entry for the current locale, or null when the bundle is not
+  /// loaded (worker isolate, unit test) or has no such key.
+  static String? localized(String id, {bool namespaced = true}) {
+    try {
+      final locale = App.locale;
+      final table = locale.languageCode == 'en'
+          ? 'en_US'
+          : '${locale.languageCode}_${locale.countryCode}';
+      final tableKey = namespaced ? '$namespace$id' : id;
+      return AppTranslation.translations[table]?[tableKey];
+    } catch (_) {
+      // Two real cases, both expected: `AppTranslation.translations` is a
+      // `late final` that only the UI startup fills (so reading it throws in
+      // the worker isolate and in a unit test), and `App.locale` reads
+      // `appdata`, which may not be ready yet. The caller then renders the
+      // Chinese skeleton — the same text `zh_CN` carries.
+      return null;
+    }
+  }
 }
 
 // ===========================================================================
@@ -141,6 +348,11 @@ class OnnxTensor {
   final int elemType;
 
   /// Shape; `null` entries are dynamic (symbolic or unknown) dimensions.
+  ///
+  /// [readOnnxSignature] normalises every spelling of "dynamic" to `null`,
+  /// including the `-1` that Paddle writes as a literal `dim_value`.
+  /// Hand-built signatures (a [SessionIntrospector]) may still carry `-1`:
+  /// go through [staticDim] rather than reading this list directly.
   final List<int?> dims;
 
   /// Symbolic names (`dim_param`) per dimension, `''` when absent.
@@ -149,6 +361,39 @@ class OnnxTensor {
   /// False for non-tensor ports (sequences, maps) — not usable by the worker.
   final bool isTensor;
 
+  /// The literal size of axis [i], or null when that axis is **dynamic**.
+  ///
+  /// `TensorShapeProto.Dimension` is a protobuf `oneof`: either `dim_value`
+  /// (a literal) or `dim_param` (a symbolic name). Paddle2ONNX writes every
+  /// dynamic axis as `dim_param = "p2o.DynamicDimension.3"`, HuggingFace
+  /// torch exports as `dim_param = "height"`, and older Paddle exports as
+  /// `dim_value = -1` — three spellings of the same statement: *"this axis is
+  /// not pinned, it accepts any size"*. A dynamic axis therefore can never
+  /// contradict a required shape, and only a **pinned** axis that differs is
+  /// a mismatch. (A symbolic name is never itself evidence of anything: that
+  /// misreading is what marked every healthy install invalid.)
+  int? staticDim(int i) {
+    if (i < 0 || i >= dims.length) return null;
+    final d = dims[i];
+    if (d == null || d < 0) return null;
+    if (i < dimParams.length && dimParams[i].isNotEmpty) return null;
+    return d;
+  }
+
+  /// The symbolic name (`dim_param`) of axis [i], `''` when it has none.
+  String dimParam(int i) => (i >= 0 && i < dimParams.length) ? dimParams[i] : '';
+
+  /// Whether axis [i] declares no fixed size (see [staticDim]).
+  bool isDynamicDim(int i) => i >= 0 && i < dims.length && staticDim(i) == null;
+
+  /// Whether axis [i] can carry [expected]: either it is dynamic ("any"), or
+  /// it is pinned to exactly [expected]. This is the only question a static
+  /// shape gate may ask of a declared axis.
+  bool axisAllows(int i, int expected) {
+    final d = staticDim(i);
+    return d == null || d == expected;
+  }
+
   bool get isFloat => elemType == OnnxElementType.float;
   bool get isFloat16 =>
       elemType == OnnxElementType.float16 ||
@@ -156,18 +401,46 @@ class OnnxTensor {
   bool get isInt64 => elemType == OnnxElementType.int64;
   int get rank => dims.length;
 
+  /// Shape for human messages: dynamic axes render as `?`, never as their
+  /// symbolic name (see [symbolicAxesNote] for the diagnostic form).
   String get shapeText {
     final parts = <String>[];
     for (var i = 0; i < dims.length; i++) {
-      final d = dims[i];
-      final p = i < dimParams.length ? dimParams[i] : '';
-      parts.add(d == null ? (p.isEmpty ? '?' : p) : '$d');
+      final d = staticDim(i);
+      parts.add(d == null ? '?' : '$d');
     }
     return '[${parts.join(',')}]';
   }
 
+  /// `axis=symbol` pairs of the dynamic axes, for diagnostics only.
+  String? get symbolicAxesNote {
+    final named = <String>[];
+    for (var i = 0; i < dims.length; i++) {
+      final p = i < dimParams.length ? dimParams[i] : '';
+      if (isDynamicDim(i) && p.isNotEmpty) named.add('$i=$p');
+    }
+    return named.isEmpty ? null : named.join(', ');
+  }
+
   @override
   String toString() => '$name: ${OnnxElementType.nameOf(elemType)}$shapeText';
+}
+
+/// Renders a tensor list for an error message.
+///
+/// Dynamic axes appear as `?` in the shapes, and the symbolic names behind
+/// them are kept only as a trailing annotation: they say *why* an axis is
+/// open, they are never output as the proof of a mismatch (that wording is
+/// what told the user a healthy model was broken).
+String describeTensors(Iterable<OnnxTensor> tensors) {
+  final listed = tensors.toList();
+  final body = listed.map((t) => t.toString()).join('; ');
+  final notes = <String>[
+    for (var t in listed)
+      if (t.symbolicAxesNote != null) '${t.name}: ${t.symbolicAxesNote}',
+  ];
+  if (notes.isEmpty) return body;
+  return '$body${ModelMessages.render('dynamicAxesNote', {'names': notes.join('; ')})}';
 }
 
 /// Declared graph inputs/outputs of one ONNX model.
@@ -197,15 +470,19 @@ class OnnxMetaReaderException implements Exception {
 // ONNX protobuf metadata reader
 // ===========================================================================
 //
-// Layout used (ONNX's onnx.proto field numbers):
+// Layout used (ONNX's onnx.proto field numbers, verified against the eight
+// real model files of a live install — see the note on [parseGraph]):
 //   ModelProto        : ir_version=1(varint) graph=7(bytes) opset_import=8 …
 //   GraphProto        : node=1 name=2 initializer=5 doc_string=6
-//                       output=11 input=12 value_info=13 …
+//                       input=11 output=12 value_info=13 …
+//                       (11 IS the input list — this file had 11/12 swapped
+//                       once, and the test fixtures agreed with the swap; see
+//                       the note inside [parseGraph])
 //   ValueInfoProto    : name=1 type=2
 //   TypeProto         : tensor_type=1 sequence_type=4 map_type=5 …
 //   TypeProto.Tensor  : elem_type=1(varint) shape=2
 //   TensorShapeProto  : dim=1
-//   TensorShapeProto.Dimension : dim_value=1(varint) dim_param=2(string)
+//   TensorShapeProto.Dimension : oneof { dim_value=1(varint) dim_param=2(string) }
 //
 // Only ValueInfo subtrees are materialised; everything else (above all the
 // multi-hundred-megabyte `initializer` weight blobs of GraphProto field 5)
@@ -214,20 +491,25 @@ class OnnxMetaReaderException implements Exception {
 
 /// Reads the declared graph input/output metadata of an ONNX file.
 ///
-/// Throws [OnnxMetaReaderException] with a human message when the file is
-/// not readable as an ONNX model (wrong bytes, truncated download, HTML
-/// error page saved under a `.onnx` name, …).
-OnnxSignature readOnnxSignature(String path) {
+/// Throws [OnnxMetaReaderException] with a human message (Chinese, per
+/// [ModelMessages]) when the file is not readable as an ONNX model: wrong
+/// bytes, truncated download, HTML error page saved under a `.onnx` name…
+OnnxSignature readOnnxSignature(String path, {String? fileName}) {
+  final label = fileName ?? _baseName(path);
   final file = File(path);
   if (!file.existsSync()) {
-    throw OnnxMetaReaderException('the file does not exist ($path)');
+    throw OnnxMetaReaderException(
+      ModelMessages.render('fileDoesNotExist', {'path': path}),
+    );
   }
   final raf = file.openSync();
   try {
     if (raf.lengthSync() == 0) {
-      throw const OnnxMetaReaderException('the file is empty (0 bytes)');
+      throw OnnxMetaReaderException(
+        ModelMessages.render('emptyFile', {'file': label}),
+      );
     }
-    final r = _ProtoReader(raf);
+    final r = _ProtoReader(raf, label);
     final first = r.readByte();
     // Rewind BOTH the bookkeeping and the actual file handle — they are
     // assumed to stay in lockstep everywhere else in the reader.
@@ -236,9 +518,10 @@ OnnxSignature readOnnxSignature(String path) {
     if (first != 0x08) {
       // ModelProto always starts with the ir_version varint, field 1.
       throw OnnxMetaReaderException(
-        'it does not look like an ONNX model (starts with 0x'
-        '${first.toRadixString(16).padLeft(2, '0')}; a renamed document, an '
-        'HTML error page or a corrupt download all look like this)',
+        ModelMessages.render('notOnnxModel', {
+          'file': label,
+          'byte': '0x${first.toRadixString(16).padLeft(2, '0')}',
+        }),
       );
     }
     return r.parseModel(raf.lengthSync());
@@ -247,11 +530,29 @@ OnnxSignature readOnnxSignature(String path) {
   }
 }
 
+/// Trailing path segment, for messages about a file the reader only knows by
+/// path.
+String _baseName(String path) {
+  final normalised = path.replaceAll(r'\', '/');
+  final cut = normalised.lastIndexOf('/');
+  return cut < 0 || cut == normalised.length - 1
+      ? normalised
+      : normalised.substring(cut + 1);
+}
+
 class _ProtoReader {
-  _ProtoReader(this.file);
+  _ProtoReader(this.file, this.fileName);
 
   final RandomAccessFile file;
+
+  /// What to call the file in a message: the name the component expects,
+  /// not the (possibly absolute) path.
+  final String fileName;
   int pos = 0;
+
+  OnnxMetaReaderException _fail(String id) => OnnxMetaReaderException(
+    ModelMessages.render(id, {'file': fileName}),
+  );
 
   int readByte() {
     pos += 1;
@@ -260,14 +561,12 @@ class _ProtoReader {
 
   Uint8List readBytes(int n) {
     if (n < 0) {
-      throw const OnnxMetaReaderException('the file is not valid protobuf');
+      throw _fail('badProtobuf');
     }
     final buf = Uint8List(n);
     final got = file.readIntoSync(buf);
     if (got != n) {
-      throw const OnnxMetaReaderException(
-        'the file ends in the middle of the model data (truncated download?)',
-      );
+      throw _fail('truncatedModel');
     }
     pos += n;
     return buf;
@@ -277,7 +576,7 @@ class _ProtoReader {
 
   void skip(int n) {
     if (n < 0) {
-      throw const OnnxMetaReaderException('the file is not valid protobuf');
+      throw _fail('badProtobuf');
     }
     pos += n;
     file.setPositionSync(pos);
@@ -288,7 +587,7 @@ class _ProtoReader {
     var shift = 0;
     while (true) {
       if (shift > 63) {
-        throw const OnnxMetaReaderException('a varint in the file is corrupt');
+        throw _fail('badVarint');
       }
       final b = readByte();
       result |= (b & 0x7f) << shift;
@@ -310,9 +609,7 @@ class _ProtoReader {
       case 2:
         skip(readVarint());
       default:
-        throw const OnnxMetaReaderException(
-          'the file is not a readable ONNX model',
-        );
+        throw _fail('unreadableModel');
     }
   }
 
@@ -331,9 +628,7 @@ class _ProtoReader {
     }
     if (pos != end) {
       // A sub-field overran its parent: the file is inconsistent.
-      throw const OnnxMetaReaderException(
-        'the file is not a readable ONNX model (internal lengths disagree)',
-      );
+      throw _fail('inconsistentLengths');
     }
   }
 
@@ -347,9 +642,7 @@ class _ProtoReader {
       }
     });
     if (graph == null) {
-      throw const OnnxMetaReaderException(
-        'it is an ONNX container but contains no model graph',
-      );
+      throw _fail('noGraph');
     }
     return graph!;
   }
@@ -357,16 +650,36 @@ class _ProtoReader {
   OnnxSignature parseGraph(int length) {
     final inputs = <OnnxTensor>[];
     final outputs = <OnnxTensor>[];
+    // PRIMARY CAUSE of "every installed model is invalid" — read this before
+    // "fixing" the shape rules.
+    //
+    // onnx.proto says `GraphProto.input = 11` and `GraphProto.output = 12`.
+    // This reader had them the other way round, so `sig.inputs` held the
+    // graph's OUTPUTS and vice versa: every healthy model was parsed
+    // inside-out, and the user-facing sentence literally read
+    //     its inputs are softmax_11.tmp_0: float32[…,6625]
+    // which is an output tensor wearing an input's name. Ground truth was
+    // taken from the eight real files of a live install (a separate protobuf
+    // walk, not this reader): field 11 is always `x` / `pixel_values`, field
+    // 12 is always `sigmoid_0.tmp_0` / `softmax_11.tmp_0` / `logits`.
+    //
+    // Why the tests stayed green across the whole period: the fixture writer
+    // in `test/local_model_import_test.dart` was built to the SAME inverted
+    // numbers. Reader and test agreed with each other and both disagreed with
+    // the format — the shape of a test suite that can never catch its own
+    // premise. A "symbolic dimensions are rejected" bug (the secondary
+    // cause, see [OnnxTensor.staticDim]) was hiding underneath it and only
+    // became visible once the two sides were re-derived from onnx.proto.
     scanScope(length, (fn, wt) {
       if (wt != 2) {
         skipBody(wt);
         return;
       }
       switch (fn) {
-        case 11: // output
-          outputs.add(parseValueInfo(readVarint()));
-        case 12: // input
+        case 11: // input
           inputs.add(parseValueInfo(readVarint()));
+        case 12: // output
+          outputs.add(parseValueInfo(readVarint()));
         default:
           // 1 node, 2 name, 5 initializer (huge!), 6 doc_string, 13 value_info…
           skip(readVarint());
@@ -463,6 +776,9 @@ class _ProtoReader {
     return (dims, params);
   }
 
+  /// One `TensorShapeProto.Dimension` — a `oneof` of `dim_value` (1) and
+  /// `dim_param` (2). Returns the literal size, or `null` when the axis is
+  /// dynamic, plus the symbolic name (empty when there is none).
   (int?, String) parseDimension(int length) {
     int? value;
     var param = '';
@@ -475,6 +791,13 @@ class _ProtoReader {
         skipBody(wt);
       }
     });
+    // A negative `dim_value` is not a size: Paddle's exporter writes -1 for
+    // "unknown", which protobuf encodes as an unsigned varint that lands here
+    // as 2^64-1 → -1 in Dart's 64-bit int. Normalise it (and any other
+    // nonsense negative) to "dynamic" so the shape rules never mistake it
+    // for a pinned axis.
+    final pinned = value;
+    if (pinned != null && pinned < 0) value = null;
     return (value, param);
   }
 }
@@ -537,13 +860,13 @@ String? dictClassMismatchProblem({
   required String dictName,
 }) {
   if (classes == dictLines + dictCharsetExtraClasses) return null;
-  return 'the model outputs $classes classes, but "$dictName" has $dictLines '
-      'lines: the OCR worker reads the dictionary as-is and adds one blank '
-      'class in front plus one space class at the end, so the model must '
-      'output exactly $dictLines + $dictCharsetExtraClasses = '
-      '${dictLines + dictCharsetExtraClasses} classes. A dictionary for a '
-      'different language, or a model of another generation, mismatches '
-      'exactly like this.';
+  return ModelMessages.render('dictClassMismatch', {
+    'classes': classes,
+    'dict': dictName,
+    'lines': dictLines,
+    'extra': dictCharsetExtraClasses,
+    'need': dictLines + dictCharsetExtraClasses,
+  });
 }
 
 /// The manga-ocr rule: decoder output classes == vocab lines.
@@ -552,32 +875,137 @@ String? vocabClassMismatchProblem({
   required int vocabLines,
 }) {
   if (classes == vocabLines) return null;
-  return 'the decoder outputs $classes token classes, but "vocab.txt" has '
-      '$vocabLines lines. Token ids beyond the vocabulary are silently '
-      'dropped when decoding, so decoder and vocabulary must come from the '
-      'same manga-ocr release.';
+  return ModelMessages.render(
+    'vocabClassMismatch',
+    {'classes': classes, 'lines': vocabLines},
+  );
 }
 
+/// What a *dynamic* class axis means for the dictionary cross-check.
+///
+/// The `C == N + 2` gate (and the manga `C == vocab` gate) compares two
+/// numbers. If the graph leaves its last axis open — `dim_param`, or the -1
+/// Paddle writes — then `C` is **runtime-resolved**: the worker learns it
+/// from the tensor it actually gets back (`_probeRecClasses` in
+/// `translation_worker.dart`), and no static reading of the file can name it.
+/// That is not a defect, and guessing a number here would be worse than
+/// saying nothing: a wrong guess either strands a working model or waves
+/// through a broken one. So the cross-check is skipped and this note records
+/// exactly which check did not run, per file.
+String? runtimeResolvedClassNote(
+  ModelComponent c,
+  ModelFile file,
+  OnnxSignature sig,
+) {
+  final role = roleOf(c, file.name);
+  if (role != ModelFileRole.rec && role != ModelFileRole.mangaDecoder) {
+    return null;
+  }
+  final out = out3OrNull(sig);
+  if (out == null) return null;
+  if (out.staticDim(2) != null) return null;
+  final symbol = out.dimParam(2);
+  return ModelMessages.render('runtimeResolvedClasses', {
+    'file': file.name,
+    'shape': out.shapeText,
+    'note': symbol.isEmpty
+        ? ''
+        : ModelMessages.render('symbolicAxes', {'names': symbol}),
+    'check': ModelMessages.render(
+      role == ModelFileRole.rec ? 'checkDictPair' : 'checkVocabPair',
+      {'extra': dictCharsetExtraClasses},
+    ),
+  });
+}
+
+/// Is there an input this app can feed?
+///
+/// The rule is the one a declared shape actually permits: an axis counts as
+/// satisfied when it is **pinned to the expected value or dynamic** ("any"),
+/// and only a pinned axis with a different value is a mismatch — see
+/// [OnnxTensor.axisAllows] for why the `dim_value` / `dim_param` oneof makes
+/// that the only reading that is not nonsense.
+///
+/// [staticHeight] / [staticWidth] pin the spatial axes (the manga-ocr encoder
+/// is compiled for 224×224); an open axis stays open, because nothing in the
+/// graph forbids the size the worker will feed.
 bool _hasImageInput(OnnxSignature sig, {int? staticHeight, int? staticWidth}) {
   for (var t in sig.inputs) {
     if (!t.isTensor || !t.isFloat || t.rank != 4) continue;
-    if (t.dims[1] != 3) continue;
-    if (staticHeight != null && t.dims[2] != null && t.dims[2] != staticHeight) {
-      continue;
-    }
-    if (staticWidth != null && t.dims[3] != null && t.dims[3] != staticWidth) {
-      continue;
-    }
+    if (!t.axisAllows(1, 3)) continue;
+    if (staticHeight != null && !t.axisAllows(2, staticHeight)) continue;
+    if (staticWidth != null && !t.axisAllows(3, staticWidth)) continue;
     return true;
   }
   return false;
 }
 
+/// "This is not the kind of model this slot expects", in words.
+///
+/// Two different answers, because they are two different problems for the
+/// user: no image-shaped input at all (wrong file), versus an input whose
+/// declared axes cannot accept what the worker feeds — which is named axis by
+/// axis (`第 1 维（通道数）固定为 4，这里需要 3`), since "the shape is wrong"
+/// without a number to look at is not actionable.
+String _badImageInput(
+  ModelFile file,
+  OnnxSignature sig,
+  String role,
+  String need, {
+  int? staticHeight,
+  int? staticWidth,
+}) {
+  final params = {
+    'file': file.name,
+    'role': role,
+    'need': need,
+    'inputs': describeTensors(sig.inputs),
+  };
+  final axis = _pinnedImageAxis(sig, staticHeight: staticHeight, staticWidth: staticWidth);
+  if (axis == null) {
+    return ModelMessages.render('badImageInputShape', params);
+  }
+  return ModelMessages.render('badImageInputAxis', {...params, 'axis': axis});
+}
+
+/// The first axis of an otherwise image-shaped input that is *pinned* to a
+/// value the worker cannot use, described in words; null when no input even
+/// has the rank/element type of an image.
+String? _pinnedImageAxis(
+  OnnxSignature sig, {
+  int? staticHeight,
+  int? staticWidth,
+}) {
+  for (final t in sig.inputs) {
+    if (!t.isTensor || !t.isFloat || t.rank != 4) continue;
+    for (final (axis, want) in [
+      (1, 3),
+      if (staticHeight != null) (2, staticHeight),
+      if (staticWidth != null) (3, staticWidth),
+    ]) {
+      final got = t.staticDim(axis);
+      if (got != null && got != want) {
+        return ModelMessages.render('axisPinned', {
+          'i': axis,
+          'name': ModelMessages.render('axis${_axisKey(axis)}'),
+          'got': got,
+          'want': want,
+        });
+      }
+    }
+  }
+  return null;
+}
+
+String _axisKey(int axis) => const ['Batch', 'Channel', 'Height', 'Width'][axis];
+
 /// Hard structural problems of one ONNX file, human-readable, or null.
 ///
 /// Deliberately conservative: rules only reject shapes that provably cannot
 /// work with the worker's fixed pre/post processing, never "unusual but
-/// probably fine".
+/// probably fine". A count that the graph does not fix (a dynamic class axis)
+/// is *not* a defect — it is simply outside what a static check may judge, so
+/// it is reported as a note by [runtimeResolvedClassNote] instead.
 String? onnxStructuralProblem(
   ModelComponent c,
   ModelFile file,
@@ -585,7 +1013,7 @@ String? onnxStructuralProblem(
 ) {
   final role = roleOf(c, file.name);
   if (sig.outputs.isEmpty) {
-    return '"${file.name}" declares no graph output at all.';
+    return ModelMessages.render('noOutput', {'file': file.name});
   }
   final fp16 = _fp16Problem(c, file, sig);
   if (fp16 != null) return fp16;
@@ -594,47 +1022,52 @@ String? onnxStructuralProblem(
   switch (role) {
     case ModelFileRole.detector:
       if (!_hasImageInput(sig)) {
-        return '"${file.name}" is not shaped like a text detector: it needs '
-            'a float32 image input [batch,3,height,width], but its inputs '
-            'are ${sig.inputs.map((t) => t.toString()).join('; ')}.';
+        return _badImageInput(
+          file,
+          sig,
+          ModelMessages.render('roleDetector'),
+          '[batch,3,height,width]',
+        );
       }
       if (!out.isTensor) {
-        return '"${file.name}" does not output a probability map (its first '
-            'output is not a tensor).';
+        return ModelMessages.render('detNotTensor', {'file': file.name});
       }
       if (out.rank == 3) return null;
-      if (out.rank == 4 && out.dims[1] == 1) return null;
-      return '"${file.name}" should output a single-channel probability map '
-          '([batch,height,width] or [batch,1,height,width]), but its first '
-          'output is ${out.shapeText} — that is not a DBNet map.';
+      if (out.rank == 4 && out.axisAllows(1, 1)) return null;
+      return ModelMessages.render(
+        'detMapChannels',
+        {'file': file.name, 'shape': out.shapeText},
+      );
     case ModelFileRole.rec:
       if (!_hasImageInput(sig)) {
-        return '"${file.name}" is not shaped like a recognition model: it '
-            'needs a float32 image input [batch,3,height,width], but its '
-            'inputs are ${sig.inputs.map((t) => t.toString()).join('; ')}.';
+        return _badImageInput(
+          file,
+          sig,
+          ModelMessages.render('roleRec'),
+          '[batch,3,height,width]',
+        );
       }
       if (!out.isTensor) {
-        return '"${file.name}" does not output a CTC tensor (its first '
-            'output is not a tensor).';
+        return ModelMessages.render('recNotTensor', {'file': file.name});
       }
       if (out.rank != 3) {
-        return '"${file.name}" should output CTC probabilities '
-            '[batch,sequence,classes], but its first output is '
-            '${out.shapeText} — a rank-${out.rank} tensor. A text detector '
-            'placed in a recognition slot fails exactly like this.';
-      }
-      if (out.dims[2] == null) {
-        return 'the output class count of "${file.name}" is dynamic '
-            '(${out.shapeText}), so it can never be matched against a fixed '
-            'dictionary — inference would read the wrong stride and produce '
-            'garbage.';
+        return ModelMessages.render('recOutputRank', {
+          'file': file.name,
+          'shape': out.shapeText,
+          'rank': out.rank,
+        });
       }
       return null;
     case ModelFileRole.mangaEncoder:
       if (!_hasImageInput(sig, staticHeight: 224, staticWidth: 224)) {
-        return '"${file.name}" is not shaped like the manga-ocr encoder: it '
-            'needs a float32 image input [batch,3,224,224], but its inputs '
-            'are ${sig.inputs.map((t) => t.toString()).join('; ')}.';
+        return _badImageInput(
+          file,
+          sig,
+          ModelMessages.render('roleEncoder'),
+          '[batch,3,224,224]',
+          staticHeight: 224,
+          staticWidth: 224,
+        );
       }
       return null;
     case ModelFileRole.mangaDecoder:
@@ -645,16 +1078,19 @@ String? onnxStructuralProblem(
         (t) => t.isTensor && t.isFloat && t.rank >= 2,
       );
       if (!hasTokens || !hasHidden) {
-        return '"${file.name}" is not shaped like the manga-ocr decoder: it '
-            'needs an int64 token input and a float32 encoder-hidden input, '
-            'but its inputs are '
-            '${sig.inputs.map((t) => t.toString()).join('; ')}.';
+        return ModelMessages.render('decoderInputs', {
+          'file': file.name,
+          'inputs': describeTensors(sig.inputs),
+        });
       }
-      if (!out.isTensor || out.rank != 3 || out.dims[2] == null) {
-        return '"${file.name}" should output logits '
-            '[batch,position,vocabulary] with a static vocabulary size, but '
-            'its first output is '
-            '${out.isTensor ? out.shapeText : 'not a tensor'}.';
+      if (!out.isTensor) {
+        return ModelMessages.render('decoderNotTensor', {'file': file.name});
+      }
+      if (out.rank != 3) {
+        return ModelMessages.render(
+          'decoderOutput',
+          {'file': file.name, 'shape': out.shapeText},
+        );
       }
       return null;
     case ModelFileRole.dict:
@@ -670,15 +1106,16 @@ String? _fp16Problem(ModelComponent c, ModelFile file, OnnxSignature sig) {
   if (c.requiresGpuEp) return null;
   final bad = <String>[
     for (var t in sig.inputs)
-      if (t.isTensor && t.isFloat16) '${t.name} (input)',
+      if (t.isTensor && t.isFloat16) '${t.name}（输入）',
     for (var t in sig.outputs)
-      if (t.isTensor && t.isFloat16) '${t.name} (output)',
+      if (t.isTensor && t.isFloat16) '${t.name}（输出）',
   ];
   if (bad.isEmpty) return null;
-  return '"${file.name}" declares float16 tensors (${bad.join(', ')}) but '
-      '"${c.displayNameKey ?? c.id}" runs on the CPU path, which only reads '
-      'float32 — inference would silently produce garbage. This looks like '
-      'an FP16 build of the model.';
+  return ModelMessages.render('float16OnCpu', {
+    'file': file.name,
+    'tensors': bad.join('、'),
+    'comp': ModelMessages.label(c.displayNameKey ?? c.id),
+  });
 }
 
 /// Non-fatal findings, e.g. the fixed-batch note of plan §7.2.2 ④.
@@ -693,10 +1130,9 @@ List<String> onnxStructuralWarnings(
   if ((role == ModelFileRole.detector || role == ModelFileRole.rec) &&
       mainInput != null &&
       mainInput.rank >= 1 &&
-      mainInput.dims[0] == 1) {
+      mainInput.staticDim(0) == 1) {
     warnings.add(
-      '"${file.name}" has its batch dimension fixed to 1: usable, but '
-      'batched OCR cannot speed it up (one crop per call).',
+      ModelMessages.render('fixedBatch', {'file': file.name}),
     );
   }
   if (c.requiresGpuEp) {
@@ -705,8 +1141,7 @@ List<String> onnxStructuralWarnings(
     );
     if (fp16) {
       warnings.add(
-        '"${file.name}" declares float16 IO and can only run on the GPU '
-        'execution provider.',
+        ModelMessages.render('float16NeedsGpu', {'file': file.name}),
       );
     }
   }
@@ -753,6 +1188,13 @@ class _ComponentAnalysis {
   bool get ok => problems.isEmpty;
 }
 
+/// Add a per-file note without clobbering the one already there (the checksum
+/// verdict and a structural note can both concern the same file).
+void _appendNote(_ComponentAnalysis a, String fileName, String note) {
+  final old = a.notes[fileName];
+  a.notes[fileName] = (old == null || old.isEmpty) ? note : '$old / $note';
+}
+
 /// Full validation of one component's local files (plan §7.2.2).
 ///
 /// * existence, non-emptiness, "not still held by a sync client" (Windows);
@@ -780,9 +1222,7 @@ Future<ImportVerdict> validateComponent(
     return const ImportVerdict(
       ok: false,
       state: ModelState.invalid,
-      reason:
-          'This component is not published yet, so its files are never '
-          'loaded by the app; validating local copies of it is pointless.',
+      reason: ModelMessages.componentNotPublished,
     );
   }
   final a = _ComponentAnalysis();
@@ -797,12 +1237,14 @@ Future<ImportVerdict> validateComponent(
         final actual = await _sha256Of(path);
         if (actual == expected) {
           shaMatched[file.name] = true;
-          a.notes[file.name] = 'checksum matches the published asset';
+          _appendNote(a, file.name, ModelMessages.render('checksumMatch'));
         } else {
           shaMatched[file.name] = false;
-          a.notes[file.name] =
-              'checksum differs from the published asset (got $actual) — '
-              'treated as a local import and judged by structure';
+          _appendNote(
+            a,
+            file.name,
+            ModelMessages.render('checksumDiffers', {'actual': actual}),
+          );
         }
       }
     }
@@ -819,19 +1261,21 @@ Future<ImportVerdict> validateComponent(
         if (runtime == null) {
           a.failedFile = file.name;
           a.problems.add(
-            '"${file.name}" cannot be loaded by the ONNX runtime at all — '
-            'it is a model file in name only.',
+            ModelMessages.render('runtimeLoadRefused', {'file': file.name}),
           );
           break;
         }
         final problem = onnxStructuralProblem(component, file, runtime);
         if (problem != null && shaMatched[file.name] != true) {
           a.failedFile = file.name;
-          a.problems.add('at runtime, $problem');
+          a.problems.add(
+            ModelMessages.render('atRuntime', {'problem': problem}),
+          );
           break;
         }
         final runtimeOut = out3OrNull(runtime);
-        final runtimeClasses = runtimeOut?.dims[2];
+        // `dims[2]` on its own would read Paddle's -1 as a class count.
+        final runtimeClasses = runtimeOut?.staticDim(2);
         if (runtimeClasses != null && shaMatched[file.name] != true) {
           String? pairProblem;
           if (roleOf(component, file.name) == ModelFileRole.rec &&
@@ -851,7 +1295,9 @@ Future<ImportVerdict> validateComponent(
           }
           if (pairProblem != null) {
             a.failedFile = file.name;
-            a.problems.add('at runtime, $pairProblem');
+            a.problems.add(
+              ModelMessages.render('atRuntime', {'problem': pairProblem}),
+            );
             break;
           }
           final staticOut = out3OrNull(a.signatures[file.name]!);
@@ -859,9 +1305,11 @@ Future<ImportVerdict> validateComponent(
               staticOut!.dims[2] != runtimeClasses) {
             a.failedFile = file.name;
             a.problems.add(
-              '"${file.name}" declares ${staticOut.dims[2]} classes in its '
-              'metadata but the runtime sees $runtimeClasses — the graph is '
-              'inconsistent with itself and cannot be trusted.',
+              ModelMessages.render('classCountDrift', {
+                'file': file.name,
+                'declared': staticOut.staticDim(2) ?? '?',
+                'runtime': runtimeClasses,
+              }),
             );
             break;
           }
@@ -873,7 +1321,10 @@ Future<ImportVerdict> validateComponent(
     final ok = a.ok;
     final state = ok ? ModelState.verified : ModelState.invalid;
     final reason = ok
-        ? 'All ${component.files.length} file(s) passed the checks.'
+        ? ModelMessages.render(
+            'allFilesOk',
+            {'count': component.files.length},
+          )
         : a.problems.join('\n');
     TranslationModels.recordVerdict(
       component,
@@ -901,8 +1352,7 @@ Future<ImportVerdict> validateComponent(
       ok: false,
       state: ModelState.present,
       reason:
-          'Validation could not be completed ($e). The files were left '
-          'usable (unverified) — retry, or re-download.',
+          ModelMessages.render('validatorCrashed', {'err': e}),
       warnings: List.unmodifiable(a.warnings),
       notes: Map.unmodifiable(a.notes),
     );
@@ -961,25 +1411,24 @@ void _analyzeFiles(
     if (!f.existsSync()) {
       a.failedFile = file.name;
       a.problems.add(
-        '"${file.name}" is missing — place it into ${component.directory} '
-        '(or download the component) to use this model.',
+        ModelMessages.render('missingFile', {
+          'file': file.name,
+          'dir': component.directory,
+        }),
       );
       return;
     }
     if (f.lengthSync() == 0) {
       a.failedFile = file.name;
       a.problems.add(
-        '"${file.name}" is empty (0 bytes) — an interrupted copy from a '
-        'network drive usually leaves files like this behind.',
+        ModelMessages.render('emptyFile', {'file': file.name}),
       );
       return;
     }
     if (checkLocks && _isLocked(path)) {
       a.failedFile = file.name;
       a.problems.add(
-        '"${file.name}" is still being held by another program (a sync '
-        'client mid-copy, an open editor, antivirus…). Let that finish and '
-        'validate again.',
+        ModelMessages.render('lockedFile', {'file': file.name}),
       );
       return;
     }
@@ -1007,13 +1456,20 @@ void _analyzeFiles(
             // The bytes are bit-identical to the published asset, so the
             // model is exactly what upstream shipped; do not block on a
             // reader quirk, only note it.
-            a.notes[file.name] =
-                '${a.notes[file.name] ?? ''}structure could not be '
-                'double-checked (${e.message})';
+            _appendNote(
+              a,
+              file.name,
+              ModelMessages.render(
+                'structureNotDoubleChecked',
+                {'err': e.message},
+              ),
+            );
             continue;
           }
           a.failedFile = file.name;
-          a.problems.add('"${file.name}": ${e.message}.');
+          // The reader's own message already names the file and explains the
+          // defect in Chinese; wrapping it again would put English around it.
+          a.problems.add(e.message);
           return;
         }
         a.signatures[file.name] = sig;
@@ -1030,11 +1486,20 @@ void _analyzeFiles(
           }
         }
         a.warnings.addAll(onnxStructuralWarnings(component, file, sig));
+        // A class axis the graph leaves open is recorded as a note and the
+        // matching cross-check below simply does not run: never guessed.
+        final resolved = runtimeResolvedClassNote(component, file, sig);
+        if (resolved != null) {
+          _appendNote(a, file.name, resolved);
+          a.warnings.add(resolved);
+        }
         if (role == ModelFileRole.rec || role == ModelFileRole.mangaDecoder) {
           final out = out3OrNull(sig);
           if (out != null) {
-            if (role == ModelFileRole.rec) recClasses = out.dims[2];
-            if (role == ModelFileRole.mangaDecoder) decoderClasses = out.dims[2];
+            if (role == ModelFileRole.rec) recClasses = out.staticDim(2);
+            if (role == ModelFileRole.mangaDecoder) {
+              decoderClasses = out.staticDim(2);
+            }
           }
         }
       case ModelFileRole.other:
@@ -1103,20 +1568,20 @@ int? _readTextLines(String path, String fileName, _ComponentAnalysis a) {
   } on FormatException {
     a.failedFile = fileName;
     a.problems.add(
-      '"$fileName" is not valid UTF-8 text — it is probably a binary file '
-      'renamed, or a download that died halfway.',
+      ModelMessages.render('dictNotUtf8', {'file': fileName}),
     );
     return null;
   } on FileSystemException catch (e) {
     a.failedFile = fileName;
-    a.problems.add('"$fileName" cannot be read ($e).');
+    a.problems.add(
+      ModelMessages.render('fileUnreadable', {'file': fileName, 'os': e}),
+    );
     return null;
   }
   if (lines.isEmpty) {
     a.failedFile = fileName;
     a.problems.add(
-      '"$fileName" contains no dictionary lines — place the real dictionary '
-      'file there (one character/word per line).',
+      ModelMessages.render('dictEmpty', {'file': fileName}),
     );
     return null;
   }
@@ -1131,12 +1596,14 @@ int? _readSharedDictLines(
 ) {
   if (!File(dictPath).existsSync()) {
     a.failedFile = null; // foreign file — do not indict a local one
-    final origin =
-        component.dictFrom != null ? ", shared from '${component.dictFrom}'" : '';
+    final from = component.dictFrom;
     a.problems.add(
-      'the dictionary this component recognises text with ("dict.txt"'
-      '$origin) is missing — install the base OCR component it borrows the '
-      'dictionary from first.',
+      from == null
+          ? ModelMessages.render(
+              'dictMissingOwn',
+              {'dir': component.directory},
+            )
+          : ModelMessages.render('dictMissingShared', {'from': from}),
     );
     return null;
   }
@@ -1144,10 +1611,7 @@ int? _readSharedDictLines(
     return dictLineCountSync(dictPath);
   } on FormatException {
     a.failedFile = null;
-    a.problems.add(
-      'the shared "dict.txt" is not valid UTF-8 text — reinstall the base '
-      'OCR component it comes from.',
-    );
+    a.problems.add(ModelMessages.render('sharedDictNotUtf8'));
     return null;
   }
 }
