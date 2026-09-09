@@ -50,6 +50,107 @@ enum _TranslateOutcome {
   noContent,
 }
 
+/// Machine-readable split of one translation group's wall time: the structured
+/// twin of the `GroupPerf ...` log line, and the only sanctioned source for the
+/// card's translation / rendering `ms/page` figures (plan 12-B).
+///
+/// Why this exists: recognition already had a structured measurement source
+/// (`OcrBatchPerf`, built at the worker's own timing site and sent back with
+/// the batch response), so its `ms/page` was honest. Translation and rendering
+/// had *only* a log string, so both rows stayed blank -- and the fix is not to
+/// regex numbers out of that string. Parsing display text is what produced
+/// Phase 2's "detMs is actually the batch size" incident: a scraped field
+/// survives a rewording, its meaning does not. So the producer constructs this
+/// object from the same locals it already logs and hands it to its caller
+/// **with the response** (`onGroupPerf` on [ImageTranslationService
+/// .translatePageGroup]). The log line is now formatted *from* the object
+/// instead of the object being scraped *out of* the line, so the two cannot
+/// drift, and no display code reads text.
+///
+/// Additivity holds by construction: `resolveMs + ocrMs + llmMs + renderMs ==
+/// totalMs` ([resolveMs] is the additive remainder), so the split can be shown
+/// without double-counting. Each timing is a **phase's elapsed group time**,
+/// not a sum of per-page costs: chunks and renders run concurrently inside a
+/// phase, so [llmMs] is the wall time of the one shared request and [renderMs]
+/// the wall time of the concurrent draw loop. Dividing by the pages that phase
+/// actually carried ([llmPages], [renderPages]) is what "ms per page at this
+/// phase" means here -- the same convention as `OcrBatchPerf.totalMs / pages`.
+class GroupPerf {
+  const GroupPerf({
+    required this.pages,
+    required this.ocrCachedPages,
+    required this.ocrRunPages,
+    required this.llmPages,
+    required this.renderPages,
+    required this.resolveMs,
+    required this.ocrMs,
+    required this.llmMs,
+    required this.renderMs,
+    required this.totalMs,
+    required this.bytesIn,
+    required this.bytesOut,
+  });
+
+  /// Pages the group was handed (input size, cache-resolved ones included).
+  final int pages;
+
+  /// Pages whose OCR row came from the intermediate store, and pages the group
+  /// had to recognize: stage 1's split, so a slow group can be told apart from
+  /// a cold one.
+  final int ocrCachedPages;
+  final int ocrRunPages;
+
+  /// Pages whose bubbles went into the shared LLM request. Zero when every page
+  /// was cache-resolved or had nothing pending: there is then no per-page
+  /// translation cost to quote, and [translationMsPerPage] is null rather than
+  /// 0 (unreadable is N/A, never a fake measurement).
+  final int llmPages;
+
+  /// Pages the stage-3 draw loop visited (already-settled ones excluded).
+  final int renderPages;
+
+  /// Wall time of the stage-1 cache lookups: the additive remainder of the
+  /// group total (`totalMs - ocrMs - llmMs - renderMs`).
+  final int resolveMs;
+  final int ocrMs;
+  final int llmMs;
+  final int renderMs;
+
+  /// Whole-group wall time, from the stopwatch the log line already printed.
+  final int totalMs;
+
+  /// Encoded input / written output bytes (the log shows both in kB).
+  final int bytesIn;
+  final int bytesOut;
+
+  /// Mean milliseconds the shared request spent per page it carried, or null
+  /// when it carried none. Plain arithmetic on already-held fields: the data
+  /// fold calls it once, the widget tree computes nothing.
+  double? get translationMsPerPage =>
+      llmPages > 0 && llmMs > 0 ? llmMs / llmPages : null;
+
+  /// Mean milliseconds one page took to draw, or null when nothing was drawn.
+  double? get renderMsPerPage =>
+      renderPages > 0 && renderMs > 0 ? renderMs / renderPages : null;
+
+  /// Whole-group wall time per input page, or null for an empty group. This is
+  /// the group's *end-to-end* cost (resolve + recognize + ask + draw), which is
+  /// what the committed stream's warm-up rate divides by.
+  double? get totalMsPerPage =>
+      pages > 0 && totalMs > 0 ? totalMs / pages : null;
+
+  /// The `GroupPerf ...` telemetry line, formatted from this object. Field
+  /// names and order are exactly what they were before the object existed, so
+  /// existing log greps keep working; the new denominator is appended.
+  String toLogLine() =>
+      'GroupPerf pages=$pages in_kb=${(bytesIn / 1024).round()} '
+      'ocr_cached=$ocrCachedPages ocr_run=$ocrRunPages '
+      'parts={resolveMs:$resolveMs,ocrMs:$ocrMs,llmMs:$llmMs,renderMs:$renderMs} '
+      'llm_ms=$llmMs render_ms=$renderMs render_pages=$renderPages '
+      'out_kb=${(bytesOut / 1024).round()} total_ms=$totalMs '
+      'llm_pages=$llmPages';
+}
+
 class _TranslationTask {
   _TranslationTask(
     this.cacheKey,
@@ -623,6 +724,14 @@ class ImageTranslationService with ChangeNotifier {
   ///
   /// Returns a success flag per input page, aligned with [pages]; it only
   /// throws [PipelineCanceled] when [shouldCancel] fires between pages.
+  ///
+  /// [onGroupPerf] receives the group's [GroupPerf] -- the structured split of
+  /// its wall time -- once every phase has settled, i.e. with the response and
+  /// before this future completes. It is the display channel for the
+  /// translation / rendering rates the progress card shows (plan 12-B): the
+  /// caller never has to read the `GroupPerf` log line to get a number. Not
+  /// called when the group was cancelled or threw, because there is then no
+  /// complete measurement to hand back.
   Future<List<bool>> translatePageGroup(
     List<({String cacheKey, Uint8List imageBytes})> pages,
     String comicKey,
@@ -630,17 +739,19 @@ class ImageTranslationService with ChangeNotifier {
     required TranslationChapterIdentity chapter,
     bool Function()? shouldCancel,
     void Function(TranslationStage stage, double completedPages)? onStage,
+    void Function(GroupPerf perf)? onGroupPerf,
   }) async {
     var success = List.filled(pages.length, false);
     if (pages.isEmpty) return success;
-    // Stage-2 split timing (per group). The OCR worker's perf log already
-    // splits a batch internally (`parts={detMs,recGpuMs,decMsInRec,restMs}`),
-    // but until now nothing made a group's wall time separable into
-    // "waiting on the LLM endpoint" vs "drawing the page" — the two halves
-    // of stage 2 are billed to completely different resources (network vs
-    // CPU raster) and only a split number says which one to attack. The
-    // line below is additive by construction: ocr_ms + llm_ms + render_ms
-    // ≤ total_ms, with the slack being cache lookups and bookkeeping.
+    // Stage-2 split timing (per group), measured by the four stopwatches below
+    // and published as a [GroupPerf] value object plus its log line. The OCR
+    // worker's perf log already splits a batch internally
+    // (`parts={detMs,recGpuMs,decMsInRec,restMs}`), but a group's wall time was
+    // not separable into "waiting on the LLM endpoint" vs "drawing the page" --
+    // the two halves of stage 2 are billed to completely different resources
+    // (network vs CPU raster) and only a split number says which one to attack.
+    // The split is additive by construction: resolveMs + ocrMs + llmMs +
+    // renderMs == totalMs, with resolveMs being the cache-lookup slack.
     final groupSw = Stopwatch()..start();
     final ocrRunSw = Stopwatch();
     final llmSw = Stopwatch();
@@ -802,10 +913,16 @@ class ImageTranslationService with ChangeNotifier {
 
     var texts = <String>[];
     var sliceAt = List<int>.filled(pages.length, 0);
+    // Pages whose bubbles actually go into the shared request -- the
+    // denominator of the translation phase's ms/page. Counted here, at the
+    // same site that builds `texts`, so the divisor and the measured
+    // `llmMs` can never describe different page sets.
+    var llmPages = 0;
     for (var i = 0; i < pages.length; i++) {
       var po = pendingOcr[i];
       if (po == null) continue;
       sliceAt[i] = texts.length;
+      if (po.pending.isNotEmpty) llmPages++;
       texts.addAll(po.pending.map((b) => b.text));
     }
 
@@ -903,16 +1020,36 @@ class ImageTranslationService with ChangeNotifier {
     await Future.wait(renderFutures);
     renderSw.stop();
     groupSw.stop();
-    Log.info(
-      'Image Translation',
-      'GroupPerf pages=${pages.length} in_kb=${(bytesIn / 1024).round()} '
-      'ocr_cached=$reusedOcr ocr_run=${ocrNeededIndices.length} '
-      'parts={resolveMs:${groupSw.elapsedMilliseconds - ocrRunSw.elapsedMilliseconds - llmSw.elapsedMilliseconds - renderSw.elapsedMilliseconds},ocrMs:${ocrRunSw.elapsedMilliseconds},llmMs:${llmSw.elapsedMilliseconds},renderMs:${renderSw.elapsedMilliseconds}} '
-      'llm_ms=${llmSw.elapsedMilliseconds} render_ms=${renderSw.elapsedMilliseconds} '
-      'render_pages=${renderFutures.length} out_kb=${(bytesOut / 1024).round()} '
-      'total_ms=${groupSw.elapsedMilliseconds}',
+    // The structured twin of this group's timing, built from the very values
+    // the log line prints below (plan 12-B: one producer, two renderings, so
+    // the display can never disagree with the log and never has to parse it).
+    final groupPerf = GroupPerf(
+      pages: pages.length,
+      ocrCachedPages: reusedOcr,
+      ocrRunPages: ocrNeededIndices.length,
+      llmPages: llmPages,
+      renderPages: renderFutures.length,
+      resolveMs:
+          groupSw.elapsedMilliseconds -
+          ocrRunSw.elapsedMilliseconds -
+          llmSw.elapsedMilliseconds -
+          renderSw.elapsedMilliseconds,
+      ocrMs: ocrRunSw.elapsedMilliseconds,
+      llmMs: llmSw.elapsedMilliseconds,
+      renderMs: renderSw.elapsedMilliseconds,
+      totalMs: groupSw.elapsedMilliseconds,
+      bytesIn: bytesIn,
+      bytesOut: bytesOut,
     );
+    Log.info('Image Translation', groupPerf.toLogLine());
+    // The terminal stage report goes first on purpose: the pre-translation
+    // loop credits its translation sample at the moment the answer landed, and
+    // that crossing is only observed through `onStage`. For a group whose draw
+    // loop never ran (every page settled before stage 3) the terminal report
+    // below is the *only* crossing there is, so reporting the timing first
+    // would stamp the sample with the post-render clock instead.
     onStage?.call(TranslationStage.rendering, completedPages());
+    onGroupPerf?.call(groupPerf);
     return success;
   }
 

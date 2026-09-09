@@ -429,18 +429,38 @@ class PreTranslationActivity {
   final _translateRate = _ThroughputTracker();
   final _pipelineRate = _ThroughputTracker();
 
+  /// Stage-3 draw cost (pages drawn / milliseconds spent drawing), fed by the
+  /// structured [GroupPerf] the translation service reports. Separate from
+  /// [_pipelineRate] because that one counts *commits* — pages the job is
+  /// finished with, which is what the ETA divides — while this one measures the
+  /// drawing phase alone, which is what the Rendered row's `ms/页` claims.
+  final _renderWork = _ThroughputTracker();
+
   /// Rolling pages/min of the recognition sweep, or null when it has not run
   /// long enough to say (never 0 — see [_ThroughputTracker]).
   double? get sweepPagesPerMinute => _sweepRate.pagesPerMinute;
+
+  /// Full figure set of each stream, including the first-sample (warm-up) rate
+  /// and the sample count the card prints next to it (plan 12-B/12-C). The
+  /// `…PagesPerMinute` getters above stay the *stable* wall-clock numbers the
+  /// ETA is allowed to use.
+  PhaseRates get sweepRates => _sweepRate.view;
+  PhaseRates get translateRates => _translateRate.view;
+  PhaseRates get commitRates => _pipelineRate.view;
+
+  /// Draw-phase cost per page (`ms/页` of the Rendered row); null until a group
+  /// reported a measured render, never 0 for a group that drew nothing.
+  PhaseRates get renderWorkRates => _renderWork.view;
 
   /// When the sweep last credited a page; lets readers notice the stream went
   /// quiet instead of quoting the last known rate forever.
   DateTime? get lastOcrSampleAt => _sweepRate.lastSampleAt;
 
-  /// Rolling pages/min of answered translation requests (groups crossing
-  /// into rendering). Null until two crossings span a few seconds. The fold
-  /// additionally hides it while a sweep owns the card (stage-2 crossings
-  /// cannot happen mid-sweep anyway — chapters run strictly in sequence).
+  /// Stable (wall-clock window) pages/min of answered translation requests.
+  /// Null until two of them span a few seconds — use [translateRates] for what
+  /// the card shows. The fold additionally hides it while a sweep owns the card
+  /// (stage-2 requests cannot land mid-sweep anyway — chapters run strictly in
+  /// sequence).
   double? get translatePagesPerMinute => _translateRate.pagesPerMinute;
 
   /// Rolling pages/min of committed (fully translated + rendered) pages.
@@ -450,19 +470,62 @@ class PreTranslationActivity {
 
   /// Called by the sweep once per OCR chunk (and per fetch failure). Cheap:
   /// one append plus an occasional window trim, on the producer side, so the
-  /// UI's build path only reads a pre-computed double.
-  void recordOcrPages(int pages, {DateTime? at}) => _sweepRate.add(pages, at: at);
+  /// UI's build path only reads a pre-computed double. [workMs] is that chunk's
+  /// own measured wall time — the duration that lets the very first chunk
+  /// already carry a rate (plan 12-C). A fetch failure has no such number and
+  /// says so by passing null, which keeps it out of the ms/page denominator.
+  void recordOcrPages(int pages, {int? workMs, DateTime? at}) =>
+      _sweepRate.add(pages, workMs: workMs, at: at);
+
+  /// Called once per group whose [GroupPerf] came back, i.e. once per answered
+  /// translation request, with the pages that request carried and the wall
+  /// time it spent on them. This replaces the translating→rendering crossing
+  /// as the translation stream's producer: the crossing was a *proxy* for
+  /// "an answer landed", needed only while nothing measured the request
+  /// itself. Now that the service reports a structured [GroupPerf] (plan 12-B),
+  /// sampling the measurement directly is both more accurate and what makes a
+  /// single answered request enough to print a rate.
+  ///
+  /// [at] should be the moment the answer landed (the crossing), not the moment
+  /// the group finished drawing — otherwise the window's wall-clock span would
+  /// include rendering time it is not measuring.
+  void recordTranslatedGroup(GroupPerf perf, {DateTime? at}) {
+    _translateRate.add(
+      perf.llmPages,
+      workMs: perf.llmMs > 0 ? perf.llmMs : null,
+      at: at,
+    );
+  }
+
+  /// Stage-3 cost of the same group: pages the draw loop visited over the wall
+  /// time it visited them. Fed by the same [GroupPerf], reported once.
+  /// [at] exists so a test can keep every sample of a window on one fake clock;
+  /// the loop reports without it, straight from the arrival of the response.
+  void recordRenderWork(GroupPerf perf, {DateTime? at}) {
+    _renderWork.add(
+      perf.renderPages,
+      workMs: perf.renderMs > 0 ? perf.renderMs : null,
+      at: at,
+    );
+  }
 
   /// Called once per group at its translating→rendering crossing, with the
   /// page count the service was handed. Producer-side, like the others.
-  void recordTranslatedPages(int pages, {DateTime? at}) =>
-      _translateRate.add(pages, at: at);
+  ///
+  /// Kept for callers that have a crossing but no [GroupPerf] to go with it
+  /// (tests, and any future path that learns about an answer from the stage
+  /// report alone); the pre-translation loop samples [recordTranslatedGroup]
+  /// instead, because that sample carries a duration.
+  void recordTranslatedPages(int pages, {int? workMs, DateTime? at}) =>
+      _translateRate.add(pages, workMs: workMs, at: at);
 
   /// Called once per *committed* group — deliberately coarse: this number
   /// means "pages fully done", and crediting in-flight fractions would just
-  /// re-derive the weighted bar with extra steps.
-  void recordSettledPages(int pages, {DateTime? at}) =>
-      _pipelineRate.add(pages, at: at);
+  /// re-derive the weighted bar with extra steps. [workMs] is that group's
+  /// end-to-end [GroupPerf.totalMs] when the service measured one, which is
+  /// what lets the Rendered row also answer plan 12-C's first sample.
+  void recordSettledPages(int pages, {int? workMs, DateTime? at}) =>
+      _pipelineRate.add(pages, workMs: workMs, at: at);
 
   /// Pages finished inside groups that have not committed yet, weighted by how
   /// far each in-flight page has got, plus whole groups already waiting on the
@@ -487,23 +550,32 @@ class PreTranslationActivity {
   }
 }
 
-/// Sliding-window pages/min for one progress stream (the recognition sweep,
-/// or stage-2 commits). Two deliberate choices:
+/// Sliding-window throughput and per-page cost for one progress stream (the
+/// recognition sweep, the answered translation requests, or settled commits).
+/// Three deliberate choices:
 ///
 ///  * window, not EMA: "how many pages landed in the last [_window]" answers
 ///    what the job is doing *now* and self-heals after a pause with no reset
 ///    hook;
 ///  * recomputed on add(), never on read: the task card rebuilds on every
-///    coalesced notify and must not scan a list or read the clock while
-///    building. Reading a pre-computed double is free.
+///    coalesced notify *and* on every wall-clock tick (plan 12-A), and must not
+///    scan a list or read the clock while building. Reading a [PhaseRates]
+///    snapshot is a field read;
+///  * a sample may carry the **duration its pages were measured over**
+///    ([add]'s `workMs`, plan 12-B). That is what lets a single finished batch
+///    already state a rate and an ms/page instead of withholding both until two
+///    samples happen to straddle [_minSpan] — the complaint behind plan 12-C.
 ///
 /// A rate with fewer than two samples, or samples spanning less than
-/// [_minSpan], is null: "unreadable" is N/A, not a 0 that would read as "the
-/// job is doing zero pages per minute".
+/// [_minSpan], leaves [PhaseRates.stablePagesPerMinute] null: "unreadable" is
+/// N/A, not a 0 that would read as "the job is doing zero pages per minute".
 class _ThroughputTracker {
-  final _samples = <({DateTime at, int pages})>[];
+  final _samples = <({DateTime at, int pages, int? workMs})>[];
   DateTime? _lastAt;
   double? _rate;
+  double? _measuredRate;
+  double? _msPerPage;
+  int _measuredSamples = 0;
 
   static const _window = Duration(seconds: 120);
   static const _minSpan = Duration(seconds: 3);
@@ -512,33 +584,180 @@ class _ThroughputTracker {
 
   double? get pagesPerMinute => _rate;
 
-  void add(int pages, {DateTime? at}) {
+  /// Everything the card shows for this stream, computed here so the widget
+  /// tree reads plain numbers (plan 12-B/12-C).
+  PhaseRates get view {
+    var stable = _rate;
+    var measured = _measuredRate;
+    return PhaseRates(
+      pagesPerMinute: stable ?? measured,
+      stablePagesPerMinute: stable,
+      measuredPagesPerMinute: measured,
+      msPerPage: _msPerPage,
+      // The count has to back the number it is printed next to: a wall-clock
+      // window is made of every sample in it, a measured warm-up rate only of
+      // the samples that carried a duration. Claiming "3 samples" behind a
+      // rate two of them never contributed to would be the same kind of
+      // over-claim plan 12-C exists to prevent.
+      samples: stable != null
+          ? _samples.length
+          : measured != null
+          ? _measuredSamples
+          : _samples.length,
+    );
+  }
+
+  /// [pages] pages that the producer measured over [workMs] milliseconds of its
+  /// own wall time (null = "this sample says nothing about duration", e.g. a
+  /// fetch failure that was never timed).
+  ///
+  /// [at] is when the work *happened*, which the caller may know better than
+  /// this moment: a translation group is credited at its batch answer, not at
+  /// the end of its drawing. That is also why the insert below is sorted —
+  /// with overlapping groups, the answers can be *reported* out of the order
+  /// their arrivals happened in.
+  void add(int pages, {int? workMs, DateTime? at}) {
     if (pages <= 0) return;
     var now = at ?? DateTime.now();
-    _samples.add((at: now, pages: pages));
-    while (now.difference(_samples.first.at) > _window) {
+    var sample = (at: now, pages: pages, workMs: workMs);
+    if (_samples.isEmpty || !_samples.last.at.isAfter(now)) {
+      _samples.add(sample);
+    } else {
+      // Back-dated sample: slot it in from the back, which is where it nearly
+      // always lands (the window is small and out-of-order is rare). Appending
+      // it would leave the list unsorted, and both the trim and the span below
+      // are defined over event order — an unsorted head makes the span
+      // negative or short, i.e. an *inflated* rate, i.e. an ETA that promises
+      // the job arrives sooner than it can.
+      var i = _samples.length;
+      while (i > 0 && _samples[i - 1].at.isAfter(now)) {
+        i--;
+      }
+      _samples.insert(i, sample);
+    }
+    // The window is anchored at the newest event, not at the call order.
+    var newest = _samples.last.at;
+    if (_lastAt == null || newest.isAfter(_lastAt!)) {
+      _lastAt = newest;
+    }
+    while (newest.difference(_samples.first.at) > _window) {
       _samples.removeAt(0);
     }
-    _lastAt = now;
-    var span = now.difference(_samples.first.at);
+    var span = newest.difference(_samples.first.at);
     if (_samples.length >= 2 && span >= _minSpan) {
       var total = 0;
       for (var s in _samples) {
         total += s.pages;
       }
       _rate = total * 60000 / span.inMilliseconds;
+    } else {
+      // Recomputed to null, not left alone. The window trims, so the two
+      // samples that produced this rate can leave it while the number stays:
+      // after a pause longer than [_window], a job that has answered exactly
+      // one request would still show — and the ETA would still be built on —
+      // the rate of a burst that ended minutes ago. That is the "stale but
+      // plausible" failure mode this whole card exists to remove.
+      _rate = null;
+    }
+    // The duration view of the same window. Samples without a measured
+    // duration are skipped on both sides of the division, so the rate and the
+    // ms/page always describe the *same* set of pages — and a 0 ms duration
+    // (a sub-millisecond, fully cache-resolved phase) is treated as "not
+    // measurable" rather than as an infinite speed.
+    var measuredMs = 0;
+    var measuredPages = 0;
+    _measuredSamples = 0;
+    for (var s in _samples) {
+      var ms = s.workMs;
+      if (ms == null || ms <= 0) continue;
+      measuredMs += ms;
+      measuredPages += s.pages;
+      _measuredSamples++;
+    }
+    if (measuredPages > 0 && measuredMs > 0) {
+      _msPerPage = measuredMs / measuredPages;
+      _measuredRate = measuredPages * 60000 / measuredMs;
+    } else {
+      _msPerPage = null;
+      _measuredRate = null;
     }
   }
+}
+
+/// The figures one progress stream contributes to the card, all pre-computed
+/// by [_ThroughputTracker] on write so a rebuild never recomputes anything.
+///
+/// The three rates answer different questions and are kept apart on purpose:
+///
+///  * [stablePagesPerMinute] is pages per minute of *wall clock* across a
+///    window of at least two samples spanning a few seconds. It is the only
+///    figure honest enough to divide a remaining-page count by, so it is the
+///    ETA source — plan 12-A requires "not enough samples" to print `—` rather
+///    than an arrival time built on one sample;
+///  * [measuredPagesPerMinute] is pages per minute of *measured work*: what the
+///    durations the producers reported add up to inside the window. One
+///    finished batch already answers it, which is exactly what plan 12-C asked
+///    the card to stop withholding; it excludes the gaps between batches, so
+///    it reads fast on a job that then waits on the network;
+///  * [pagesPerMinute] is the display rate: the wall-clock one once there is
+///    one, the measured one while the job is still warming up.
+///
+/// [samples] is how many samples sit in the window. The card prints it next to
+/// the rate (`12 页/分 · 2 样本`) instead of quietly promoting a first sample to
+/// a stable figure — the user judges the number's trustworthiness rather than
+/// having to take the display's word for it (plan 12-C, decision D3).
+class PhaseRates {
+  const PhaseRates({
+    required this.pagesPerMinute,
+    required this.stablePagesPerMinute,
+    required this.measuredPagesPerMinute,
+    required this.msPerPage,
+    required this.samples,
+  });
+
+  /// Nothing measured yet: every figure null, so the card prints `—`.
+  static const unknown = PhaseRates(
+    pagesPerMinute: null,
+    stablePagesPerMinute: null,
+    measuredPagesPerMinute: null,
+    msPerPage: null,
+    samples: 0,
+  );
+
+  final double? pagesPerMinute;
+  final double? stablePagesPerMinute;
+  final double? measuredPagesPerMinute;
+
+  /// Mean milliseconds one page of this phase cost, over the measured samples
+  /// in the window. Null when no sample in the window carried a duration.
+  final double? msPerPage;
+
+  /// Samples in the window — the confidence figure shown beside the rate.
+  final int samples;
+
+  /// `int?` so an unmeasured stream prints `—` rather than `0 样本`, which would
+  /// claim a measurement of zero happened.
+  int? get sampleCount => samples > 0 ? samples : null;
+
+  /// True while the shown rate still comes from measured work rather than from
+  /// a wall-clock window: the warm-up state plan 12-C wants disclosed (the card
+  /// discloses it through [sampleCount]).
+  bool get isWarmup =>
+      pagesPerMinute != null && stablePagesPerMinute == null;
 }
 
 /// Everything the pre-translation card shows about a running job, folded into
 /// one immutable snapshot so `build()` only formats numbers it is handed.
 ///
-/// All derivation lives here, in the data layer: no text parsing (the worker's
-/// batch stats arrive structured through [TranslationWorker.lastPerf]), no IO,
-/// and one clock read per construction — construction rides the coalesced
-/// activity notifies, not the frame rate. Unreadable figures are null and the
-/// card prints `—`; they are never a fabricated 0.
+/// All derivation lives here, in the data layer: no text parsing (the OCR
+/// batch stats arrive structured through [TranslationWorker.lastPerf], the
+/// translation group's split through the service's structured [GroupPerf] —
+/// never regexed out of either log line), no IO, and one clock read per
+/// construction. Construction rides the coalesced activity notifies **and** the
+/// wall-clock tick of [PreTranslationProgressTicker] (plan 12-A), never the
+/// frame rate: a tick with no event behind it still re-folds, which is exactly
+/// what makes `createdAt -> now` move. Unreadable figures are null and the card
+/// prints `—`; they are never a fabricated 0.
 class PreTranslationProgress {
   PreTranslationProgress({
     required this.running,
@@ -554,6 +773,11 @@ class PreTranslationProgress {
     required this.recognitionRatePerMinute,
     required this.translationRatePerMinute,
     required this.commitRatePerMinute,
+    required this.recognitionSamples,
+    required this.translationSamples,
+    required this.commitSamples,
+    required this.translationMsPerPage,
+    required this.renderMsPerPage,
     required this.batch,
     required this.msPerPage,
     required this.elapsed,
@@ -626,9 +850,18 @@ class PreTranslationProgress {
     var focusRendering =
         !sweepActive && stage == TranslationStage.rendering;
 
-    var recRate = activity?.sweepPagesPerMinute;
-    var translateRate = activity?.translatePagesPerMinute;
-    var commitRate = activity?.pagesPerMinute;
+    // One [PhaseRates] per stream: the shown rate (wall-clock window once it
+    // exists, otherwise the measured warm-up figure), the sample count behind
+    // it, and the phase's own ms/page. Plan 12-B/12-C.
+    var rec = activity?.sweepRates ?? PhaseRates.unknown;
+    var trans = activity?.translateRates ?? PhaseRates.unknown;
+    var commit = activity?.commitRates ?? PhaseRates.unknown;
+    var render = activity?.renderWorkRates ?? PhaseRates.unknown;
+    // The ETA is deliberately sourced from the *stable* rates only: a first
+    // sample may be shown as a rate, but multiplying it into a promise about
+    // every remaining page is the "fake ETA" plan 12-A forbids.
+    var recRate = rec.stablePagesPerMinute;
+    var commitRate = commit.stablePagesPerMinute;
     Duration? eta;
     if (activity != null && task.isRunning) {
       if (sweepActive) {
@@ -666,14 +899,26 @@ class PreTranslationProgress {
       focusTranslating: focusTranslating,
       focusRendering: focusRendering,
       // Each phase line gets *its own* stream's number; the three are never
-      // interchangeable. While the sweep owns the card a stage-2 crossing
-      // cannot be happening, and once it stopped, a stale recognition figure
+      // interchangeable. While the sweep owns the card no stage-2 request can
+      // be landing, and once it stopped a stale recognition figure
       // would quote the wrong stream — so each rate is nulled outside its
-      // phase, and the card prints `—`, never a borrowed number.
-      recognitionRatePerMinute: sweepActive ? recRate : null,
-      translationRatePerMinute: sweepActive ? null : translateRate,
-      commitRatePerMinute: commitRate,
+      // phase, and the card prints `—`, never a borrowed number. The sample
+      // count travels with the rate it describes (plan 12-C: the first sample
+      // is shown, and shown *as* a first sample).
+      recognitionRatePerMinute: sweepActive ? rec.pagesPerMinute : null,
+      recognitionSamples: sweepActive ? rec.sampleCount : null,
+      translationRatePerMinute: sweepActive ? null : trans.pagesPerMinute,
+      translationSamples: sweepActive ? null : trans.sampleCount,
+      translationMsPerPage: sweepActive ? null : trans.msPerPage,
+      commitRatePerMinute: commit.pagesPerMinute,
+      commitSamples: commit.sampleCount,
+      renderMsPerPage: render.msPerPage,
       batch: freshBatch,
+      // Recognition's ms/page stays the worker's own per-page measurement
+      // (`OcrBatchPerf.totalMs / pages`) rather than the sweep window's: the
+      // batch number is timed inside the engine, it is what this row has always
+      // quoted, and the sweep's chunk wall time (which also feeds its warm-up
+      // rate) additionally contains the queueing between chunks. Null -> `—`.
       msPerPage: freshBatch != null && freshBatch.pages > 0
           ? freshBatch.totalMs / freshBatch.pages
           : null,
@@ -724,20 +969,41 @@ class PreTranslationProgress {
   final bool focusTranslating;
   final bool focusRendering;
 
-  /// Pages/min for the recognition sweep (null = not enough data yet). Only
+  /// Pages/min shown on the Recognized row: the sweep window's rate, available
+  /// from the first measured chunk onward (plan 12-C). Only
   /// non-null while a sweep is active — a stale recognition rate next to a
   /// translating job would read as the wrong stream's speed.
   final double? recognitionRatePerMinute;
 
   /// Pages/min of answered translation requests (the translating→rendering
-  /// crossings in the last window). Null before enough crossings and while a
-  /// sweep owns the card.
+  /// requests in the last window), from the first answered one onward; the
+  /// sample count printed next to it says how much data the rate rests on
+  /// (plan 12-C). Null while a sweep owns the card, which prints `—` instead.
   final double? translationRatePerMinute;
 
   /// Pages/min of fully settled (committed = drawn + cached) pages — the
   /// *rendering* line's rate; null until at least two commits span a few
   /// seconds.
   final double? commitRatePerMinute;
+
+  /// Samples behind [recognitionRatePerMinute] / [translationRatePerMinute] /
+  /// [commitRatePerMinute], shown next to each rate as `· N 样本` so a
+  /// first-sample (warm-up) figure is visibly a first-sample figure rather than
+  /// a promoted one (plan 12-C). Null = nothing measured in the window, which
+  /// prints `—`, never `0 样本` — a 0 would claim a measurement happened.
+  final int? recognitionSamples;
+  final int? translationSamples;
+  final int? commitSamples;
+
+  /// Mean milliseconds this phase's measured work spent per page it carried,
+  /// for the two stage-2 rows (plan 12-B). Translation comes from the shared
+  /// request's own wall time ([GroupPerf.llmMs] over [GroupPerf.llmPages]);
+  /// rendering from the draw loop's ([GroupPerf.renderMs] over
+  /// [GroupPerf.renderPages]). Both are structured values the service reported
+  /// at its timing sites — nothing here is read back out of a log line, which
+  /// is the coupling Phase 2's detMs accident ruled out. Null prints `—`.
+  final double? translationMsPerPage;
+  final double? renderMsPerPage;
 
   /// The freshest OCR batch's structured stats, or null when there is no
   /// batch or the last one is too old to quote.
@@ -780,6 +1046,11 @@ class PreTranslationTaskSummary {
     this.recognitionRatePerMinute,
     this.translationRatePerMinute,
     this.renderRatePerMinute,
+    this.recognitionSamples,
+    this.translationSamples,
+    this.renderSamples,
+    this.translationMsPerPage,
+    this.renderMsPerPage,
     this.msPerPage,
     this.epName,
     this.sessions,
@@ -800,24 +1071,40 @@ class PreTranslationTaskSummary {
   /// So the summary keeps the last measured figure of all three streams
   /// even when the card ended mid-another-phase (e.g. cancelled during a
   /// sweep: the chapter-before's translation rate is still real data).
+  ///
+  /// What is kept is the *shown* figure (`PhaseRates.pagesPerMinute`: the
+  /// wall-clock window once it exists, else the measured warm-up value) plus
+  /// its sample count, so a finished card repeats exactly what the user was
+  /// looking at rather than dropping a warm-up rate that was on screen.
   factory PreTranslationTaskSummary.capture(
     PreTranslationProgress p, {
     PreTranslationActivity? activity,
-  }) => PreTranslationTaskSummary(
-    recognized: p.recognized,
-    translated: p.translated,
-    rendered: p.rendered,
-    recognitionRatePerMinute:
-        activity?.sweepPagesPerMinute ?? p.recognitionRatePerMinute,
-    translationRatePerMinute:
-        activity?.translatePagesPerMinute ?? p.translationRatePerMinute,
-    renderRatePerMinute: p.commitRatePerMinute,
-    msPerPage: p.msPerPage,
-    epName: p.epName,
-    sessions: p.sessions,
-    arenaMb: p.arenaMb,
-    degradedLabel: p.degradedLabel,
-  );
+  }) {
+    var rec = activity?.sweepRates;
+    var trans = activity?.translateRates;
+    var commit = activity?.commitRates;
+    return PreTranslationTaskSummary(
+      recognized: p.recognized,
+      translated: p.translated,
+      rendered: p.rendered,
+      recognitionRatePerMinute:
+          rec?.pagesPerMinute ?? p.recognitionRatePerMinute,
+      translationRatePerMinute:
+          trans?.pagesPerMinute ?? p.translationRatePerMinute,
+      renderRatePerMinute: commit?.pagesPerMinute ?? p.commitRatePerMinute,
+      recognitionSamples: rec?.sampleCount ?? p.recognitionSamples,
+      translationSamples: trans?.sampleCount ?? p.translationSamples,
+      renderSamples: commit?.sampleCount ?? p.commitSamples,
+      translationMsPerPage: trans?.msPerPage ?? p.translationMsPerPage,
+      renderMsPerPage:
+          activity?.renderWorkRates.msPerPage ?? p.renderMsPerPage,
+      msPerPage: p.msPerPage,
+      epName: p.epName,
+      sessions: p.sessions,
+      arenaMb: p.arenaMb,
+      degradedLabel: p.degradedLabel,
+    );
+  }
 
   /// Final per-phase page counts. The last fold could include in-flight
   /// credit the commits never reached (a cancel mid-sweep really did
@@ -832,6 +1119,18 @@ class PreTranslationTaskSummary {
   final double? recognitionRatePerMinute;
   final double? translationRatePerMinute;
   final double? renderRatePerMinute;
+
+  /// Sample counts behind those three rates, frozen with them so the finished
+  /// card still discloses how little (or how much) data a shown rate rested on
+  /// (plan 12-C). Null prints `—`, never `0 样本`.
+  final int? recognitionSamples;
+  final int? translationSamples;
+  final int? renderSamples;
+
+  /// Per-phase `ms/页` of the two stage-2 phases, from the service's structured
+  /// [GroupPerf] (plan 12-B) — the last measured values the live card printed.
+  final double? translationMsPerPage;
+  final double? renderMsPerPage;
 
   /// Recognition ms/page from the freshest OCR batch at capture time.
   final double? msPerPage;
@@ -866,6 +1165,11 @@ class PreTranslationTaskSummary {
       recognitionRatePerMinute: recognitionRatePerMinute,
       translationRatePerMinute: translationRatePerMinute,
       commitRatePerMinute: renderRatePerMinute,
+      recognitionSamples: recognitionSamples,
+      translationSamples: translationSamples,
+      commitSamples: renderSamples,
+      translationMsPerPage: translationMsPerPage,
+      renderMsPerPage: renderMsPerPage,
       // The worker's last batch belongs to whoever used the pool *last*, not
       // necessarily to this finished job — deliberately not quoted here.
       batch: null,
@@ -886,6 +1190,11 @@ class PreTranslationTaskSummary {
     'recognitionRatePerMinute': recognitionRatePerMinute,
     'translationRatePerMinute': translationRatePerMinute,
     'renderRatePerMinute': renderRatePerMinute,
+    'recognitionSamples': recognitionSamples,
+    'translationSamples': translationSamples,
+    'renderSamples': renderSamples,
+    'translationMsPerPage': translationMsPerPage,
+    'renderMsPerPage': renderMsPerPage,
     'msPerPage': msPerPage,
     'epName': epName,
     'sessions': sessions,
@@ -903,6 +1212,11 @@ class PreTranslationTaskSummary {
       translationRatePerMinute: (json['translationRatePerMinute'] as num?)
           ?.toDouble(),
       renderRatePerMinute: (json['renderRatePerMinute'] as num?)?.toDouble(),
+      recognitionSamples: (json['recognitionSamples'] as num?)?.toInt(),
+      translationSamples: (json['translationSamples'] as num?)?.toInt(),
+      renderSamples: (json['renderSamples'] as num?)?.toInt(),
+      translationMsPerPage: (json['translationMsPerPage'] as num?)?.toDouble(),
+      renderMsPerPage: (json['renderMsPerPage'] as num?)?.toDouble(),
       msPerPage: (json['msPerPage'] as num?)?.toDouble(),
       epName: json['epName']?.toString(),
       sessions: (json['sessions'] as num?)?.toInt(),
@@ -927,6 +1241,13 @@ class PreTranslationRefresh {
   /// What the card defaults to: half the old hard-coded rebuild floor was
   /// 500 ms twice a second; one second is the middle of the honest range
   /// (the rates are 120-second window figures anyway).
+  ///
+  /// Since plan 12-A this number means two things, by design: how often an
+  /// event burst is allowed to rebuild the list ([PreTranslationTaskManager
+  /// ._notifyActivity]) **and** how often [PreTranslationProgressTicker]
+  /// repaints it when nothing happens at all. One knob, one cadence — a card
+  /// that repainted faster than its own coalescing window would only ever show
+  /// the same figures more often.
   static const defaultMs = 1000;
 
   /// 0.5–5 s. The floor is the previous hard-coded coalescing window: below
@@ -950,6 +1271,152 @@ class PreTranslationRefresh {
 
   static Duration intervalFrom(Object? stored) =>
       Duration(milliseconds: intervalMs(stored));
+}
+
+/// Cancellation of a scheduled periodic callback, as handed back by a
+/// [PreTranslationTickScheduler].
+typedef PreTranslationTickCancellation = void Function();
+
+/// Schedules [tick] once per [interval] until the returned handle is called.
+/// Production uses [Timer.periodic]; tests substitute a manual clock so the
+/// whole class can be exercised without waiting on a real second (plan 12-A's
+/// acceptance rule: no test may depend on real sleeping).
+typedef PreTranslationTickScheduler =
+    PreTranslationTickCancellation Function(Duration interval, void Function() tick);
+
+/// Wall-clock repaint driver for the pre-translation progress card (plan 12-A).
+///
+/// **What it is not**: the manager's `_notifyActivity`, which coalesces
+/// *events*. That one only ever fires while events happen — no OCR chunk, no
+/// stage change, no notify — so a card whose most visible figure is `createdAt
+/// → now` sits frozen at "已用时 2:38" however long the user watches it. Treating
+/// the coalescing window as a refresh period was the concept swap 12-A names:
+/// "don't rebuild more than once per interval" and "rebuild once per interval"
+/// are different promises, and only the second one is what the setting says.
+///
+/// So this class holds the second promise alone: it owns one [Timer.periodic]
+/// and calls [onTick] when it fires. It never touches the managers'
+/// [ChangeNotifier]s — the repaint is the card's own, which is what keeps a
+/// 1 Hz tick from rebuilding every other listener of the task manager (the
+/// comic page, the reader) for one ticking clock label.
+///
+/// Three guards, all plan 12-A's requirements:
+///  * [shouldTick] false → the timer **stops itself** on the next tick, so a
+///    finished, failed or paused job cannot leave a timer running;
+///  * [isVisible] false → the tick is swallowed (no rebuild of a page nobody is
+///    looking at). The timer keeps running, so the first tick after the page
+///    returns repaints it with the then-current elapsed time;
+///  * [dispose] always cancels, and it is safe to call twice.
+///
+/// The interval is re-read on every tick, so the user moving the "刷新间隔"
+/// slider changes the cadence within one tick instead of needing the page
+/// rebuilt first.
+class PreTranslationProgressTicker {
+  PreTranslationProgressTicker({
+    required this.onTick,
+    required this.interval,
+    this.shouldTick = _always,
+    this.isVisible = _always,
+    this.clock = DateTime.now,
+    PreTranslationTickScheduler? scheduler,
+  }) : _schedule = scheduler ?? _periodicScheduler;
+
+  static bool _always() => true;
+
+  static PreTranslationTickCancellation _periodicScheduler(
+    Duration interval,
+    void Function() tick,
+  ) {
+    final timer = Timer.periodic(interval, (_) => tick());
+    return timer.cancel;
+  }
+
+  /// Called with the clock reading taken for this tick. Everything the card
+  /// shows is derived from that one reading (the fold's `now`), so a repaint
+  /// and the figure it prints cannot disagree.
+  final void Function(DateTime now) onTick;
+
+  /// Current refresh interval. Read per tick, never cached by the caller.
+  final Duration Function() interval;
+
+  /// Whether there is anything to refresh at all (a running pre-translation
+  /// job). False stops the timer; see [start] for how it gets restarted.
+  final bool Function() shouldTick;
+
+  /// Whether the page showing the card can actually see it.
+  final bool Function() isVisible;
+
+  /// The clock [onTick] is handed. Injectable so a test can advance time
+  /// without waiting for it.
+  final DateTime Function() clock;
+
+  final PreTranslationTickScheduler _schedule;
+
+  PreTranslationTickCancellation? _cancel;
+  Duration? _runningFor;
+
+  /// Whether a periodic callback is currently armed.
+  bool get isRunning => _cancel != null;
+
+  /// The interval the armed timer was started with, or null when it is stopped.
+  Duration get runningInterval => _runningFor ?? Duration.zero;
+
+  /// Arm the timer. Idempotent, and cheap enough to call from every rebuild:
+  /// it does nothing when a timer with the same interval is already armed.
+  void start() {
+    var want = _checkedInterval();
+    if (_cancel != null && _runningFor == want) return;
+    _teardown();
+    _runningFor = want;
+    _cancel = _schedule(want, _fire);
+  }
+
+  /// Disarm. Called when the job leaves the running state or the page goes
+  /// away; a later [start] re-arms.
+  void stop() {
+    _teardown();
+  }
+
+  void dispose() {
+    _teardown();
+  }
+
+  void _teardown() {
+    _cancel?.call();
+    _cancel = null;
+    _runningFor = null;
+  }
+
+  void _fire() {
+    // A job that is no longer running (finished, failed, cancelled, paused)
+    // has nothing left to count up: stop instead of repainting a frozen card.
+    if (!shouldTick()) {
+      stop();
+      return;
+    }
+    // Off-screen: skip the rebuild, keep the timer, so coming back repaints on
+    // the next tick without any extra wiring.
+    if (!isVisible()) return;
+    var want = _checkedInterval();
+    if (want != _runningFor) {
+      // The user moved the refresh-interval slider since the last tick.
+      start();
+      return;
+    }
+    onTick(clock());
+  }
+
+  /// The interval, made non-null and non-zero: a scheduler handed a zero or
+  /// negative duration would spin, and [interval] is a user-facing setting
+  /// read through a plain map lookup, so it is defended at the one place that
+  /// turns it into a timer. [PreTranslationRefresh] already clamps the stored
+  /// value; this is the belt to that pair of braces.
+  Duration _checkedInterval() {
+    var want = interval();
+    return want.isNegative || want == Duration.zero
+        ? const Duration(milliseconds: PreTranslationRefresh.defaultMs)
+        : want;
+  }
 }
 
 /// Manages background pre-translation jobs. Mirrors the structure of the
@@ -992,9 +1459,14 @@ class PreTranslationTaskManager with ChangeNotifier {
   ///    work is every window, forever while a job runs; 0.5 s therefore
   ///    stays the floor, and the 1 s default halves the notify load the old
   ///    500 ms coalescing produced;
-  ///  * nothing is lost by waiting: every figure on the card is either a
-  ///    120-second window rate or a committed counter, none of which change
-  ///    meaningfully inside one interval;
+  ///  * nothing is lost for the figures this path *feeds*: every number an
+  ///    event carries is a 120-second window rate or a committed counter, none
+  ///    of which move meaningfully inside one interval. The one figure that
+  ///    does change with no event at all is `createdAt -> now`, and it is not
+  ///    this path's job any more — plan 12-A split the two meanings apart, and
+  ///    [PreTranslationProgressTicker] owns the "repaint even though nothing
+  ///    happened" half. Reading a coalescing window as a refresh period was the
+  ///    concept swap that made the card look frozen;
   ///  * the trailing timer still guarantees the *final* change is not
   ///    swallowed — the last notify of a burst fires one window after the
   ///    first, so a coalesced burst always lands.
@@ -1482,13 +1954,19 @@ class PreTranslationTaskManager with ChangeNotifier {
     // first, so removal happens before Future.any's await returns.
     var active = <Future<void>>{};
 
-    void commit(int groupIndex, GroupResult result) {
+    void commit(int groupIndex, GroupResult result, GroupPerf? measured) {
       applyGroupResult(committer, chapter, activity, groupIndex, result);
       // One throughput sample per *committed group* — the commit is the only
       // moment a page is genuinely finished, and sampling here (not per
       // in-flight page) keeps the pages/min figure meaning "pages done",
-      // matching the phase lines next to it.
-      activity?.recordSettledPages(result.done + result.failed);
+      // matching the phase lines next to it. The group's own end-to-end wall
+      // time rides along when the service measured one, which is what lets the
+      // Rendered row answer plan 12-C's first sample instead of waiting for a
+      // second commit to straddle three seconds.
+      activity?.recordSettledPages(
+        result.done + result.failed,
+        workMs: measured?.totalMs,
+      );
       _refreshKeepAlive(task);
       _saveActiveThrottled();
       notifyListeners();
@@ -1510,6 +1988,11 @@ class PreTranslationTaskManager with ChangeNotifier {
       );
       activity?.groups[groupIndex] = groupActivity;
       _notifyActivity();
+      // This group's structured timing, held *per group* rather than in one
+      // shared slot: up to `overlap` groups are in flight at once, and a
+      // committer that releases two of them in one go must not bill the second
+      // one with the first one's milliseconds.
+      GroupPerf? measured;
       f =
           () async {
             try {
@@ -1520,10 +2003,11 @@ class PreTranslationTaskManager with ChangeNotifier {
                 range.start,
                 range.end,
                 groupActivity,
+                onMeasured: (perf) => measured = perf,
               );
               // A canceled/paused-out group returns null; skip committing it so
               // counts stay at the group boundary and a resume redoes it.
-              if (result != null) commit(groupIndex, result);
+              if (result != null) commit(groupIndex, result, measured);
             } catch (e, s) {
               // Never let a group future complete with an error: with groups
               // overlapping, an errored future would make `Future.any` rethrow and
@@ -1628,6 +2112,17 @@ class PreTranslationTaskManager with ChangeNotifier {
         List<({int index, String cacheKey, Uint8List bytes})> chunkData,
       ) async {
         if (chunkData.isEmpty) return;
+        // The chunk's own wall time: the recognition stream's first sample is
+        // only honest if it carries the duration those pages were measured
+        // over (plan 12-C). Timed here, at the call site, so the number
+        // includes exactly what the sweep waited for.
+        final chunkSw = Stopwatch()..start();
+        // Whether the batch actually came back. A chunk that threw cost wall
+        // time but produced no recognition, and billing its milliseconds to
+        // the pages it failed would leak retry/timeout latency into the
+        // sweep's ms/page — the fetch-failure path below already credits pages
+        // without a duration for exactly this reason, and the two must agree.
+        var recognized = false;
         try {
           final results = await pipeline.ocrPages(
             chunkData.map((e) => e.bytes).toList(),
@@ -1643,16 +2138,21 @@ class PreTranslationTaskManager with ChangeNotifier {
               );
             }
           }
+          recognized = true;
         } catch (e, s) {
           Log.warning('Pre-translation', 'GPU OCR sweep chunk failed: $e\n$s');
         }
+        chunkSw.stop();
         processed += chunkData.length;
         ocrSlot.completedPages = processed * 0.55;
         // Raw count for the "recognized X / total" line: the 0.55 weight
         // above is for the bar's page-equivalents and must not leak into a
         // figure that is printed next to a page total.
         ocrSlot.recognizedPages = processed;
-        activity?.recordOcrPages(chunkData.length);
+        activity?.recordOcrPages(
+          chunkData.length,
+          workMs: recognized ? chunkSw.elapsedMilliseconds : null,
+        );
         _notifyActivity();
       }
 
@@ -1938,10 +2438,18 @@ class PreTranslationTaskManager with ChangeNotifier {
           g,
           (g + groupSize).clamp(0, targets.length),
         );
-        await _retryGroup(task, chapter, pageKeys, slice);
+        GroupPerf? measured;
+        await _retryGroup(task, chapter, pageKeys, slice, (perf) {
+          measured = perf;
+        });
         // The retry pass settles its slice whole; count it as committed
-        // throughput so a long retry sweep also shows live pages/min.
-        _activities[task.id]?.recordSettledPages(slice.length);
+        // throughput so a long retry sweep also shows live pages/min, with the
+        // slice's own end-to-end milliseconds so the first slice is already a
+        // rate (plan 12-C).
+        _activities[task.id]?.recordSettledPages(
+          slice.length,
+          workMs: measured?.totalMs,
+        );
         _refreshKeepAlive(task);
         _saveActiveThrottled();
         notifyListeners();
@@ -1957,8 +2465,9 @@ class PreTranslationTaskManager with ChangeNotifier {
     PreTranslationTask task,
     PreTranslationChapter chapter,
     List<String> pageKeys,
-    List<int> indices,
-  ) async {
+    List<int> indices, [
+    void Function(GroupPerf perf)? onMeasured,
+  ]) async {
     // The retry sweep runs after the forward loop, so no other group holds a
     // slot; index 0 makes this the head one, and the card keeps naming a stage
     // instead of dropping back to a bare "running" for the whole sweep.
@@ -1967,7 +2476,7 @@ class PreTranslationTaskManager with ChangeNotifier {
     activity?.groups[0] = slot;
     _notifyActivity();
     try {
-      await _retrySlice(task, chapter, pageKeys, indices, slot);
+      await _retrySlice(task, chapter, pageKeys, indices, slot, onMeasured);
     } finally {
       activity?.groups.remove(0);
       _notifyActivity();
@@ -1979,10 +2488,14 @@ class PreTranslationTaskManager with ChangeNotifier {
     PreTranslationChapter chapter,
     List<String> pageKeys,
     List<int> indices,
-    PreTranslationGroupActivity activity,
-  ) async {
+    PreTranslationGroupActivity activity, [
+    void Function(GroupPerf perf)? onMeasured,
+  ]) async {
     var service = ImageTranslationService.instance;
     var settledBeforeBatch = 0;
+    // See [_processGroup]: the arrival moment, not the render completion, is
+    // what the translation window measures.
+    DateTime? answeredAt;
     var pending = <({int index, String cacheKey, Uint8List imageBytes})>[];
     void reportFetchPhase() {
       activity
@@ -2038,15 +2551,28 @@ class PreTranslationTaskManager with ChangeNotifier {
         ),
         shouldCancel: () => _canceledIds.contains(task.id),
         onStage: (stage, completed) {
-          // Same translation-stream sampling as the forward pass: the group
-          // crossing into rendering is its answer coming back.
+          // Same sampling rule as the forward pass: the crossing is no longer
+          // the stream's sample source (the GroupPerf below carries pages plus
+          // duration), it only records *when* the answer landed.
           var crossed = activity.noteStage(stage);
           // The service scores only the pages it was handed, on the same scale.
           activity.completedPages = settledBeforeBatch + completed;
-          if (crossed && pending.isNotEmpty) {
-            _activities[task.id]?.recordTranslatedPages(pending.length);
-          }
+          if (crossed) answeredAt = DateTime.now();
           _notifyActivity();
+        },
+        onGroupPerf: (perf) {
+          // Same rule as the forward pass: bill a request that happened, and
+          // credit a cache-resolved arrival without a duration.
+          if (perf.llmPages > 0) {
+            _activities[task.id]?.recordTranslatedGroup(perf, at: answeredAt);
+          } else {
+            _activities[task.id]?.recordTranslatedPages(
+              pending.length,
+              at: answeredAt,
+            );
+          }
+          _activities[task.id]?.recordRenderWork(perf);
+          onMeasured?.call(perf);
         },
       );
       for (var j = 0; j < pending.length; j++) {
@@ -2088,8 +2614,12 @@ class PreTranslationTaskManager with ChangeNotifier {
     List<String> pageKeys,
     int start,
     int end,
-    PreTranslationGroupActivity activity,
-  ) async {
+    PreTranslationGroupActivity activity, {
+    /// Receives this group's [GroupPerf] exactly once, when the service reports
+    /// it. The caller keeps it next to the group so the commit sample can carry
+    /// the same group's end-to-end milliseconds (plan 12-C's first sample).
+    void Function(GroupPerf perf)? onMeasured,
+  }) async {
     var service = ImageTranslationService.instance;
     var pending = <({int index, String cacheKey, Uint8List imageBytes})>[];
     var done = 0;
@@ -2102,6 +2632,11 @@ class PreTranslationTaskManager with ChangeNotifier {
     // Pages this group settled before the batch call; the service reports its
     // own settled count relative to what it was handed, so the two add up.
     var preSettled = 0;
+    // When this group's batch answer landed, i.e. the moment its pages became
+    // "translated". The GroupPerf arrives later (after the draw loop), and the
+    // translation window must be spanned by the arrival times, not by the
+    // render completions, or it quietly starts measuring a different phase.
+    DateTime? answeredAt;
     activity.stage = TranslationStage.fetching;
     _notifyActivity();
 
@@ -2163,17 +2698,38 @@ class PreTranslationTaskManager with ChangeNotifier {
           onStage: (stage, completed) {
             // The translating→rendering crossing is the moment this group's
             // batch response landed (see PreTranslationGroupActivity
-            // .noteStage): credit the translation stream with exactly the
-            // pages the service was handed, once per group. Same all-or-
-            // nothing-per-request semantics as translatedThrough's count.
+            // .noteStage). It no longer *samples* the translation stream — the
+            // structured GroupPerf below carries both the pages and the
+            // duration, which is a measurement instead of a proxy — but it is
+            // still the timestamp the perf sample is credited at, so the
+            // window measures "answer landed", not "page finished drawing".
             var crossed = activity.noteStage(stage);
             // The service scores only the pages it was handed, on the same
             // page-unit scale, so the two halves simply add up.
             activity.completedPages = preSettled + completed;
-            if (crossed && pending.isNotEmpty) {
-              _activities[task.id]?.recordTranslatedPages(pending.length);
-            }
+            if (crossed) answeredAt = DateTime.now();
             _notifyActivity();
+          },
+          onGroupPerf: (perf) {
+            // Measured work when there was a request to measure: the pages it
+            // carried and the wall time it spent (plan 12-B/12-C).
+            if (perf.llmPages > 0) {
+              _activities[task.id]?.recordTranslatedGroup(perf, at: answeredAt);
+            } else {
+              // A group whose text came from the cache asked nothing, so there
+              // is no request to bill and no ms/page to claim — but its pages
+              // really were answered, and dropping the sample entirely would
+              // make a resumed chapter re-rendering from cached text (the
+              // fastest thing the pipeline does) show `页/分: —`. Credit the
+              // arrival, duration-less, exactly as the crossing used to: the
+              // wall-clock window still sees it, the measured figures don't.
+              _activities[task.id]?.recordTranslatedPages(
+                pending.length,
+                at: answeredAt,
+              );
+            }
+            _activities[task.id]?.recordRenderWork(perf);
+            onMeasured?.call(perf);
           },
         );
         for (var j = 0; j < pending.length; j++) {

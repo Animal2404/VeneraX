@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:intl/intl.dart';
 import 'package:venera/components/components.dart';
+import 'package:venera/foundation/appdata.dart';
 import 'package:venera/foundation/comic_source_update_tasks.dart';
 import 'package:venera/foundation/context.dart';
 import 'package:venera/foundation/data_sync_tasks.dart';
@@ -31,7 +32,10 @@ class TasksPage extends StatefulWidget {
   State<TasksPage> createState() => _TasksPageState();
 }
 
-class _TasksPageState extends State<TasksPage> with SingleTickerProviderStateMixin {
+class _TasksPageState extends State<TasksPage>
+    with
+        SingleTickerProviderStateMixin,
+        WidgetsBindingObserver {
   static const _webdavMigrationFailurePreviewLimit = 20;
 
   final followUpdateManager = FollowUpdateTaskManager.instance;
@@ -49,12 +53,78 @@ class _TasksPageState extends State<TasksPage> with SingleTickerProviderStateMix
 
   late TabController _tabController;
 
+  /// Plan 12-A: the card's own wall-clock repaint driver.
+  ///
+  /// The task manager's notify is an *event coalescer*: with nothing happening
+  /// it never fires, which is exactly why "已用时" used to sit frozen between two
+  /// recognition chunks. This ticker is the other, independent promise -- fire
+  /// on the interval whether or not anything changed. It repaints **this page
+  /// only** (a plain `setState`), never `notifyListeners`, so a ticking clock
+  /// cannot rebuild the comic page or the reader that also listen to the
+  /// manager; and it is armed only while the list can show a running job.
+  late final PreTranslationProgressTicker _progressTicker;
+
+  /// Whether the page is currently where a rebuild would be seen: `TickerMode`
+  /// (false once another route covers this one -- the Navigator mutes an
+  /// offstage route's tickers) and the app being in the foreground.
+  bool _pageVisible = true;
+  bool _appVisible = true;
+
+  /// Refresh cadence, from the same setting the event coalescer honours. A
+  /// plain in-memory map read, resolved by the ticker once per tick.
+  Duration _progressRefreshInterval() =>
+      PreTranslationRefresh.intervalFrom(
+        appdata.implicitData[PreTranslationRefresh.settingKey],
+      );
+
+  bool get _wantsProgressTicks =>
+      _pageVisible &&
+      _appVisible &&
+      // The card only exists on the "Current" tab; a tick while the user
+      // reads the history list would rebuild nothing they can see.
+      _tabController.index == 0 &&
+      preTranslateManager.currentTasks.any((t) => t.isRunning);
+
+  void _syncProgressTicker() {
+    if (_wantsProgressTicks) {
+      _progressTicker.start();
+    } else {
+      _progressTicker.stop();
+    }
+  }
+
+  /// Whether the app is in a state where painting is worth doing. `inactive`
+  /// counts as visible on purpose: on desktop it is what a window that merely
+  /// lost focus reports, and the tasks page is still on screen there. Full
+  /// background (`hidden` / `paused`) and teardown (`detached`) are not.
+  static bool _foregroundState(AppLifecycleState? state) =>
+      state == null ||
+      state == AppLifecycleState.resumed ||
+      state == AppLifecycleState.inactive;
+
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _appVisible = _foregroundState(WidgetsBinding.instance.lifecycleState);
+    _progressTicker = PreTranslationProgressTicker(
+      interval: _progressRefreshInterval,
+      shouldTick: () => mounted && _wantsProgressTicks,
+      isVisible: () => mounted && _pageVisible && _appVisible,
+      onTick: (_) {
+        // The tick's own clock reading is what makes the repaint meaningful:
+        // elapsed is derived from `now - createdAt`, so a repaint with no new
+        // data still moves the number. Nothing here recomputes anything -- the
+        // fold below reads pre-computed figures, and this is its only trigger.
+        if (mounted) setState(() {});
+      },
+    );
     _tabController = TabController(length: 2, vsync: this);
     _tabController.addListener(() {
       if (mounted) setState(() {});
+      // The card lives on the Current tab; switching away tears the ticker
+      // down instead of letting it repaint an off-screen list.
+      _syncProgressTicker();
     });
     followUpdateManager.addListener(update);
     historyRefreshManager.addListener(update);
@@ -71,6 +141,12 @@ class _TasksPageState extends State<TasksPage> with SingleTickerProviderStateMix
 
   @override
   void dispose() {
+    // Plan 12-A: dispose 必达. The ticker holds a Timer.periodic, which outlives
+    // nothing else in this widget -- left running it would keep calling
+    // setState on a dead State (a framework error) and repaint a page that is
+    // no longer in the tree.
+    _progressTicker.dispose();
+    WidgetsBinding.instance.removeObserver(this);
     _tabController.dispose();
     followUpdateManager.removeListener(update);
     historyRefreshManager.removeListener(update);
@@ -84,6 +160,25 @@ class _TasksPageState extends State<TasksPage> with SingleTickerProviderStateMix
     modelStore.removeListener(update);
     preTranslateManager.removeListener(update);
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // Backgrounded: stop counting frames nobody can see. Coming back re-arms
+    // through the same path, and the first tick shows the elapsed time as it
+    // then is, so nothing about the job's numbers is lost by the pause.
+    _appVisible = _foregroundState(state);
+    _syncProgressTicker();
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // TickerMode flips when another route covers this one (the Navigator
+    // mutes an offstage route's tickers), and the dependency registered by
+    // reading it here is what makes this callback fire when it does.
+    _pageVisible = TickerMode.valuesOf(context).enabled;
+    _syncProgressTicker();
   }
 
   void update() {
@@ -192,6 +287,13 @@ class _TasksPageState extends State<TasksPage> with SingleTickerProviderStateMix
 
   @override
   Widget build(BuildContext context) {
+    // Every rebuild is also the moment the running-task set may have changed
+    // (a job started, ended, paused, cancelled), and this page rebuilds on all
+    // of those through `update()`. Arming/disarming here means the ticker can
+    // never outlive a job: `shouldTick` stops it from the inside as well, so
+    // even a missed rebuild cannot leave a periodic callback running.
+    _pageVisible = TickerMode.valuesOf(context).enabled;
+    _syncProgressTicker();
     return Scaffold(
       appBar: Appbar(title: Text("Tasks".tl)),
       body: Column(
@@ -662,21 +764,29 @@ class _TasksPageState extends State<TasksPage> with SingleTickerProviderStateMix
     ].join(' · ');
   }
 
-  /// One "phase — done/total — own rate" line for the pre-translation card.
-  /// The active phase gets the accent color and a heavier weight; the rest
-  /// recede to outline grey so the eye lands on what the job is doing right
-  /// now. Each phase carries **its own stream's** rate (recognition /
-  /// translation / rendering pages are measured by three separate windows in
-  /// the data layer — one shared number for all three used to quote the OCR
-  /// sweep's speed next to the translation line). An unmeasured stream prints
-  /// `—`; a 0 there would claim the phase is doing nothing, which was never
-  /// measured (project rule: unreadable is N/A, never a fake 0).
+  /// One "phase — done/total — own rate — own cost" line for the pre-translation
+  /// card. All three rows go through this one function, so their labels, units,
+  /// separators and `—` placeholders cannot drift apart (plan 12-D).
+  ///
+  /// Each row carries **its own stream's** figures: pages/min from that phase's
+  /// window, the sample count that rate rests on (plan 12-C — one finished
+  /// batch already is a rate, and the card says how little data it took rather
+  /// than hiding it or pretending it took more), and ms/page from that phase's
+  /// own measurement (plan 12-B: the OCR worker's structured batch perf for
+  /// recognition, the service's structured GroupPerf value object for the two
+  /// stage-2 phases).
+  ///
+  /// Nothing here parses, reads a clock or computes: every value is pre-derived
+  /// in [PreTranslationProgress], and an unmeasured one prints `—` — a 0 would
+  /// claim the phase is doing nothing, which was never measured (project rule:
+  /// unreadable is N/A, never a fake 0).
   Widget _phaseLine({
     required String labelKey,
     required int done,
     required int total,
     required bool active,
     required double? ratePagesPerMinute,
+    int? samples,
     double? msPerPage,
   }) {
     final style = active
@@ -685,23 +795,29 @@ class _TasksPageState extends State<TasksPage> with SingleTickerProviderStateMix
             fontWeight: FontWeight.w600,
           )
         : ts.s14.withColor(context.colorScheme.outline);
-    // ms/page only exists for recognition (the only per-page latency the OCR
-    // worker reports, from its structured batch perf); the other two phases
-    // honestly show pages/min alone.
-    final rate = ratePagesPerMinute == null
-        ? '—'
-        : "@rate pages/min".tlParams({
-            'rate': ratePagesPerMinute.toStringAsFixed(1),
-          });
+    final parts = <String>[
+      if (ratePagesPerMinute == null)
+        // Not one sample yet. `—`, never `0 页/分`.
+        '—'
+      else if (samples != null && samples > 0)
+        "@rate pages/min · @samples samples".tlParams({
+          'rate': ratePagesPerMinute.toStringAsFixed(1),
+          'samples': '$samples',
+        })
+      else
+        "@rate pages/min".tlParams({
+          'rate': ratePagesPerMinute.toStringAsFixed(1),
+        }),
+      if (msPerPage != null && msPerPage > 0)
+        "@ms ms/page".tlParams({'ms': msPerPage.round().toString()}),
+    ];
     return Row(
       children: [
         Text(labelKey.tlParams({'done': done, 'total': total}), style: style),
         const SizedBox(width: 8),
         Flexible(
           child: Text(
-            msPerPage == null
-                ? rate
-                : '$rate · ${"@ms ms/page".tlParams({'ms': msPerPage.round().toString()})}',
+            parts.join(' · '),
             style: style,
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
@@ -709,17 +825,6 @@ class _TasksPageState extends State<TasksPage> with SingleTickerProviderStateMix
         ),
       ],
     );
-  }
-
-  /// Clock format for elapsed/ETA readouts: `m:ss`, or `h:mm:ss` past an
-  /// hour. Null prints `—` — an unreadable figure is N/A, never a fake 0.
-  static String _fmtDuration(Duration? d) {
-    if (d == null) return '—';
-    var h = d.inHours;
-    var m = d.inMinutes % 60;
-    var s = d.inSeconds % 60;
-    if (h <= 0) return '$m:${s.toString().padLeft(2, '0')}';
-    return '$h:${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}';
   }
 
   Widget buildPreTranslateTaskCard(
@@ -853,12 +958,9 @@ class _TasksPageState extends State<TasksPage> with SingleTickerProviderStateMix
               ),
               // Phased progress: one row per pipeline phase, aligned with the
               // TranslationStage coarse phases (recognize / translate /
-              // render). The phase the job is actually in gets highlighted;
-              // three equally-bold rows would highlight nothing.
-              // Phased progress: one row per pipeline phase, aligned with the
-              // TranslationStage coarse phases (recognize / translate /
-              // render), each with its OWN rate. The phase the job is in gets
-              // highlighted; three equally-bold rows would highlight nothing.
+              // render), each with its OWN rate, sample count and ms/page. The
+              // phase the job is in gets highlighted; three equally-bold rows
+              // would highlight nothing.
               // Shown for live jobs and for finished ones alike — a done
               // card keeps its numbers (frozen summary), it no longer blanks
               // out just because the loop exited.
@@ -872,6 +974,7 @@ class _TasksPageState extends State<TasksPage> with SingleTickerProviderStateMix
                   total: task.total,
                   active: progressView.focusRecognizing,
                   ratePagesPerMinute: progressView.recognitionRatePerMinute,
+                  samples: progressView.recognitionSamples,
                   // Recognition is the one phase the worker measures per page.
                   msPerPage: progressView.msPerPage,
                 ),
@@ -882,6 +985,10 @@ class _TasksPageState extends State<TasksPage> with SingleTickerProviderStateMix
                   total: task.total,
                   active: progressView.focusTranslating,
                   ratePagesPerMinute: progressView.translationRatePerMinute,
+                  samples: progressView.translationSamples,
+                  // From the shared request's own measured wall time, reported
+                  // as a structured GroupPerf by the service (plan 12-B).
+                  msPerPage: progressView.translationMsPerPage,
                 ),
                 const SizedBox(height: 2),
                 _phaseLine(
@@ -890,6 +997,8 @@ class _TasksPageState extends State<TasksPage> with SingleTickerProviderStateMix
                   total: task.total,
                   active: progressView.focusRendering,
                   ratePagesPerMinute: progressView.commitRatePerMinute,
+                  samples: progressView.commitSamples,
+                  msPerPage: progressView.renderMsPerPage,
                 ),
                 // Without this note a live "Recognized 8/82" beside a static
                 // "Pages 0/82" reads as a contradiction; the sweep number is
@@ -915,13 +1024,13 @@ class _TasksPageState extends State<TasksPage> with SingleTickerProviderStateMix
                 Text(
                   isLive
                       ? "Elapsed @elapsed · ETA @eta (current rate)".tlParams({
-                          'elapsed': _fmtDuration(progressView.elapsed),
-                          'eta': _fmtDuration(progressView.eta),
+                          'elapsed': formatTaskDuration(progressView.elapsed),
+                          'eta': formatTaskDuration(progressView.eta),
                         })
                       : // After the end there is nothing left to estimate;
                         // the same number becomes the job's total time.
                         "Elapsed @elapsed".tlParams({
-                          'elapsed': _fmtDuration(progressView.elapsed),
+                          'elapsed': formatTaskDuration(progressView.elapsed),
                         }),
                   style: ts.s12.withColor(context.colorScheme.outline),
                 ),
@@ -2255,4 +2364,20 @@ class _RotatingIconState extends State<_RotatingIcon>
       child: Icon(widget.icon),
     );
   }
+}
+
+/// Clock format for the pre-translation card's elapsed / ETA readouts: `m:ss`,
+/// or `h:mm:ss` past an hour. `null` prints `—` — an unreadable figure is N/A,
+/// never a fake 0 (the project's standing rule).
+///
+/// Top-level and public so the plan 12-A acceptance can assert the *rendered*
+/// string ("已用时 still moves with zero events") against the very function the
+/// card calls, instead of a copy of its logic in a test.
+String formatTaskDuration(Duration? d) {
+  if (d == null) return '—';
+  var h = d.inHours;
+  var m = d.inMinutes % 60;
+  var s = d.inSeconds % 60;
+  if (h <= 0) return '$m:${s.toString().padLeft(2, '0')}';
+  return '$h:${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}';
 }

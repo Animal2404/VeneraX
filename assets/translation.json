@@ -1442,7 +1442,8 @@
     "Elapsed @elapsed": "用时 @elapsed",
     "Progress refresh interval": "进度刷新间隔",
     "How often the pre-translation progress card re-reads its per-phase rates. Lower refreshes faster but rebuilds the task list more often; higher is cheaper and slightly staler.": "预翻译进度卡片重新读取各阶段速率的频率。调低刷新更快，但任务列表重建更频繁；调高更省，数字略滞后。",
-    "@seconds s": "@seconds 秒"
+    "@seconds s": "@seconds 秒",
+    "@rate pages/min · @samples samples": "@rate 页/分钟 · @samples 样本"
   },
   "zh_TW": {
     "Reading Statistics": "閱讀統計",
@@ -2887,6 +2888,7 @@
     "Elapsed @elapsed": "用時 @elapsed",
     "Progress refresh interval": "進度刷新間隔",
     "How often the pre-translation progress card re-reads its per-phase rates. Lower refreshes faster but rebuilds the task list more often; higher is cheaper and slightly staler.": "預翻譯進度卡片重新讀取各階段速率的頻率。調低刷新更快，但工作列表重建更頻繁；調高更省，數字略滯後。",
-    "@seconds s": "@seconds 秒"
+    "@seconds s": "@seconds 秒",
+    "@rate pages/min · @samples samples": "@rate 頁/分鐘 · @samples 樣本"
   }
 }

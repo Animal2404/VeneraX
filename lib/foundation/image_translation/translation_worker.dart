@@ -142,6 +142,7 @@ class _WorkerResponse {
     this.report,
     this.perfLog,
     this.perf,
+    this.funnelLogs,
   ]);
 
   final int id;
@@ -155,6 +156,14 @@ class _WorkerResponse {
   /// without parsing the log line — parsing display strings is exactly the
   /// coupling that breaks when someone rewords a label.
   final OcrBatchPerf? perf;
+
+  /// One `OcrFunnel page=…` line per page of this request (F13.5). Built in
+  /// the worker isolate, **logged on the main isolate**: `Log` keeps its file
+  /// handle and its list in isolate-local statics, and `App.isInitialized` is
+  /// false inside a spawned isolate, so a `Log.*` call made there never
+  /// reaches `logs.txt` and cannot be captured by the user. Same reason the
+  /// perf line is handed back rather than logged at its own site.
+  final List<String>? funnelLogs;
 }
 
 /// Machine-readable form of one OCR batch's perf log: the counts and timings
@@ -722,6 +731,13 @@ class _IsolateWorker {
           Log.info('OCR Perf', message.perfLog!);
           TranslationWorker.instance.addPerfLog(message.perfLog!);
         }
+        // Per-page discard ledger (F13.5). Deliberately not added to
+        // `recentPerfLogs` and not shown on the diagnostics page: it is a
+        // greppable line for `logs.txt`, not display data, and mixing it into
+        // the perf ring would change what that panel's 20 entries mean.
+        for (var line in message.funnelLogs ?? const <String>[]) {
+          Log.info('OCR Funnel', line);
+        }
         if (message.perf != null) {
           TranslationWorker.instance._lastPerf = message.perf;
           TranslationWorker.instance._lastPerfAt = DateTime.now();
@@ -963,9 +979,17 @@ void _workerMain(SendPort mainPort) {
     if (message is _OcrPagesRequest) {
       try {
         state.currentPref = message.epPref;
-        var (results, perfLog, perf) = state.ocrPagesAll(message);
+        var (results, perfLog, perf, funnelLines) = state.ocrPagesAll(message);
         mainPort.send(
-          _WorkerResponse(message.id, results, null, state.report, perfLog, perf),
+          _WorkerResponse(
+            message.id,
+            results,
+            null,
+            state.report,
+            perfLog,
+            perf,
+            funnelLines,
+          ),
         );
       } catch (e, s) {
         mainPort.send(_WorkerResponse(message.id, null, '$e\n$s', state.report));
@@ -973,8 +997,18 @@ void _workerMain(SendPort mainPort) {
     } else if (message is _OcrPageRequest) {
       try {
         state.currentPref = message.epPref;
-        var blocks = state.ocrPage(message);
-        mainPort.send(_WorkerResponse(message.id, blocks, null, state.report));
+        var (blocks, funnelLines) = state.ocrPage(message);
+        mainPort.send(
+          _WorkerResponse(
+            message.id,
+            blocks,
+            null,
+            state.report,
+            null,
+            null,
+            funnelLines,
+          ),
+        );
       } catch (e, s) {
         mainPort.send(_WorkerResponse(message.id, null, '$e\n$s'));
       }
@@ -1003,6 +1037,336 @@ class DetParams {
   static const double unclipRatio = 1.8;
   static const double binaryThreshold = 0.3;
   static const double scoreThreshold = 0.5;
+
+  /// Smallest connected region (in probability-map pixels) still treated as
+  /// text. Below this the component is discarded by [ocrDetReject] — a dot of
+  /// ink, a speck of screening, the corner of a screen-tone cell.
+  static const int minAreaPixels = 12;
+}
+
+/// Why the detector threw one connected region away. The reasons are separate
+/// on purpose: they have different fixes (area → tile scale / unclip, score →
+/// model or binaryThreshold, sliver → an axis the box collapsed onto), and
+/// F13.5 is exactly the finding that a page which "found nothing" and a page
+/// that "found 200 things and kept 12" looked identical in the log.
+enum OcrDetReject {
+  /// Accepted — the region became a box.
+  none,
+
+  /// Region smaller than [DetParams.minAreaPixels] pixels.
+  tiny,
+
+  /// Mean probability inside the region under [DetParams.scoreThreshold].
+  lowScore,
+
+  /// Bounding box thinner than 3 px on either axis after unclip.
+  sliver,
+
+  /// Region centre fell outside the un-padded input region of its tile.
+  offRegion,
+}
+
+/// Classifies one detector candidate region. Pure, so the three thresholds
+/// that silently discard text have a lock on them: the classification order
+/// is the order the original inline `continue` chain evaluated them, and
+/// `OcrDetReject.none` is returned for exactly the regions the old code kept.
+///
+/// Note the short-circuit is preserved: a region rejected on area never has
+/// its score computed, so the `lowScore` count is "rejected on score *after*
+/// passing the area gate", not "would have failed the score gate".
+OcrDetReject ocrDetReject({
+  required int pixels,
+  required double scoreSum,
+  required int boxWidth,
+  required int boxHeight,
+  required bool centerInsideRegion,
+}) {
+  if (!centerInsideRegion) return OcrDetReject.offRegion;
+  if (pixels < DetParams.minAreaPixels) return OcrDetReject.tiny;
+  if (scoreSum / pixels < DetParams.scoreThreshold) {
+    return OcrDetReject.lowScore;
+  }
+  if (boxWidth < 3 || boxHeight < 3) return OcrDetReject.sliver;
+  return OcrDetReject.none;
+}
+
+/// Running detector-side discard count for a single page (F13.5).
+///
+/// Identities the line renders so they can be checked by eye:
+///
+/// ```text
+/// components == tiny + lowScore + sliver + offRegion + emitted
+/// clustering input == emitted - dupTile   (== the page's box list length)
+/// ```
+///
+/// The second one is *reported separately* as `detBoxes=` on
+/// [OcrPageFunnel] from the real list length, because after an OOM shrink
+/// replay the replayed tiles land in the `dupTile` bucket even though the
+/// stitch did not lose a line — so `emitted - dupTile` under-reads on a page
+/// that shrank. The list length is the measurement; this class is the
+/// decomposition.
+class OcrDetTally {
+  int components = 0;
+  int tiny = 0;
+  int lowScore = 0;
+  int sliver = 0;
+  int offRegion = 0;
+
+  /// Regions that passed every threshold and came back as a box.
+  int emitted = 0;
+
+  /// Emitted boxes discarded by the >0.5 IoU guard because an overlapping
+  /// detection tile had already produced the same line. Not a miss.
+  int dupTile = 0;
+
+  /// Regions discarded before the tile-stitch dedup ran.
+  int get dropped => tiny + lowScore + sliver + offRegion;
+
+  /// Everything the det layer threw away, dedup included — the
+  /// `droppedByDet=` term of the funnel line.
+  int get droppedAll => dropped + dupTile;
+
+  void record(OcrDetReject reject) {
+    components++;
+    switch (reject) {
+      case OcrDetReject.tiny:
+        tiny++;
+      case OcrDetReject.lowScore:
+        lowScore++;
+      case OcrDetReject.sliver:
+        sliver++;
+      case OcrDetReject.offRegion:
+        offRegion++;
+      case OcrDetReject.none:
+        emitted++;
+    }
+  }
+
+  /// The detection pass re-plays every batch after an OOM shrink (see the
+  /// `onShrink` note in [TranslationWorker]), and detection is deterministic
+  /// for a fixed tile plan, so the counters of an aborted attempt describe
+  /// work that is about to be counted again. Zeroed at the top of each
+  /// attempt so the published numbers always describe the plan that finished
+  /// — the same rule `detBatchesCount` follows.
+  void reset() {
+    components = 0;
+    tiny = 0;
+    lowScore = 0;
+    sliver = 0;
+    offRegion = 0;
+    emitted = 0;
+    dupTile = 0;
+  }
+
+  String render() => '{comps:$components tiny:$tiny lowScore:$lowScore '
+      'sliver:$sliver offRegion:$offRegion emitted:$emitted dupTile:$dupTile}';
+
+  @override
+  String toString() => render();
+}
+
+/// Why the recognition layer kept or threw away one cluster's text.
+///
+/// Split out of the old boolean plausibility gate because the two halves of
+/// that gate fail differently: `short` kills a single kana or an interjection
+/// ("ッ", "！") on `length < 2` before any content check runs, while `ratio`
+/// kills a long hallucinated string. Counting them together would hide
+/// exactly the case F13.5 was raised for.
+enum OcrReject {
+  /// Accepted: the text is going to become a block.
+  none,
+
+  /// The recognizers returned nothing at all (empty string after trim).
+  /// Distinct from [short]: a blank crop is a detection/crop problem, a
+  /// one-character crop is usually real text killed by the length gate.
+  empty,
+
+  /// Rejected by the `length < 2` rule alone.
+  short,
+
+  /// Long enough, but fewer than half the code points (and fewer than 2)
+  /// landed in the CJK / ASCII-letter ranges — the anti-hallucination line.
+  ratio,
+
+  /// Never attempted: the engine had no model, or every line of the cluster
+  /// was below the 8 px recognition floor, so no crop was ever sent.
+  untried,
+}
+
+/// The plausibility gate as a pure classifier. [OcrReject.none] is returned
+/// for exactly the strings the original boolean accepted, in the original
+/// evaluation order, so this is a rename of the decision and not a change of
+/// it — widening either half of this gate is a separate, measured decision
+/// (plan F13.5: "拿到分布数据再决定放宽哪半边").
+OcrReject ocrPlausibility(String text) {
+  if (text.isEmpty) return OcrReject.empty;
+  if (text.length < 2) return OcrReject.short;
+  var meaningful = text.runes
+      .where((r) => r > 0x2E80 || (r >= 0x30 && r <= 0x7A))
+      .length;
+  return meaningful >= math.max(2, text.length ~/ 2)
+      ? OcrReject.none
+      : OcrReject.ratio;
+}
+
+/// The per-page crop budget (F13.6): how many clusters of one page may be
+/// recognized, derived from the recognition batch so the cap tracks the
+/// memory the caller already agreed to.
+///
+/// Extracted as a function of `recBatch` alone so the *number* is locked by a
+/// test. It is deliberately unchanged by this work: raising it is a memory
+/// decision, not an observability one.
+int ocrPageCropLimit(int recBatch) => (recBatch * 4).clamp(32, 128);
+
+/// Which clusters survive [ocrPageCropLimit]. Today's policy — and this
+/// function is the honest statement of it, not a proposal — is "the topmost
+/// `limit` of the page, in reading order", which is why a dense page loses
+/// its **bottom as one block** rather than losing lines evenly.
+///
+/// The result is a kept-index list so the policy itself is testable and the
+/// cut position is measurable (`cutAtPct` on [OcrPageFunnel] renders the page
+/// fraction where the loss starts). Changing the selection to area- or
+/// confidence-ordered, or to an even in-page stride, is a change to **which
+/// text gets translated**; it is not instrumentation and is left for the
+/// round that reads the funnel data.
+List<int> ocrCropSelection({required int clusterCount, required int limit}) {
+  if (clusterCount <= limit) {
+    return [for (var i = 0; i < clusterCount; i++) i];
+  }
+  return [for (var i = 0; i < limit; i++) i];
+}
+
+/// One page's discard ledger, and the single greppable line that makes the
+/// worker's silent drops mutually distinguishable (F13.5 / F13.6).
+///
+/// The complaint this exists to answer is "there is Japanese on this page and
+/// it was not recognized". Before it, the log could not separate:
+///
+///  * the detector found the region and rejected it ([OcrDetTally] parts);
+///  * the region was kept, then discarded as a duplicate of the same text in
+///    the overlapping neighbouring detection tile (`det.dupTile`);
+///  * the cluster was cut by the page crop budget ([OcrPageFunnel]
+///    `droppedByCropLimit`) — the F13.6 case, which eats the **bottom** of a
+///    dense page and nothing else;
+///  * the cluster's crop was too thin to letter (`droppedTinyBounds`);
+///  * the text came back and was thrown away by the plausibility gate
+///    (`tooShort` / `implausible` / `empty`), or was never recognized at all
+///    (`untried`).
+///
+/// Each is counted once, per page, and the ledger closes on itself:
+///
+/// ```text
+/// components == tiny + lowScore + sliver + offRegion + emitted  (det layer)
+/// detBoxes   == emitted - det.dupTile                           (tile stitch)
+/// clusters   == droppedByCropLimit + droppedTinyBounds + workItems
+/// workItems  == blocks + tooShort + implausible + empty + untried
+/// ```
+///
+/// Those four lines are why this class exists: every one of them was a
+/// silent `continue` before, and a page that lost 90% of its text looked the
+/// same in the log whether the detector, the crop budget or the plausibility
+/// gate did it. The second identity is the one that stops holding after an
+/// OOM replay (see [OcrDetTally]) — which is itself a fact worth reading off
+/// the same line, since `degraded=` in the perf line names that page.
+///
+/// Nothing in the pipeline reads this class. It reports; it does not decide.
+class OcrPageFunnel {
+  OcrPageFunnel(this.pageIndex);
+
+  /// Page index as the caller labeled it, so the line can be matched to the
+  /// `pages=[...]` list in the batch perf line.
+  final int pageIndex;
+
+  /// Detector-side discards for this page.
+  final OcrDetTally det = OcrDetTally();
+
+  /// Boxes that actually reached the clustering pass, read off the page's own
+  /// list (a measurement, not a derived number — see [OcrDetTally]).
+  int detBoxes = 0;
+
+  /// Clusters the page's boxes grouped into, before any cropping.
+  int clusters = 0;
+
+  /// Budget this page was given ([ocrPageCropLimit]).
+  int cropLimit = 0;
+
+  /// Clusters cut because the page had more than [cropLimit].
+  int droppedByCropLimit = 0;
+
+  /// Page fraction (0-100) where the cut began, i.e. the top edge of the
+  /// first dropped cluster over the page height. `null` when nothing was
+  /// cut. This is the number that proves or kills "the bottom half vanished".
+  int? cutAtPct;
+
+  /// Clusters whose inflated box was under 8 px on an axis, so they never
+  /// became a crop.
+  int droppedTinyBounds = 0;
+
+  /// Clusters that reached the recognition stage.
+  int workItems = 0;
+
+  /// Recognition lines dropped inside a cluster for being under 8 px — a
+  /// *partial* loss inside a block that survived, which is why a bubble can
+  /// come back translated with one of its lines missing.
+  int recLinesDropped = 0;
+
+  // Final-state tallies. Mutually exclusive per cluster: the last
+  // recognition attempt (pass B if there was one) owns the verdict, so
+  // `blocks + tooShort + implausible + empty + untried == workItems`.
+  int blocks = 0;
+  int tooShort = 0;
+  int implausible = 0;
+  int empty = 0;
+  int untried = 0;
+
+  /// `droppedByDet` on the line: everything the detector or the tile stitch
+  /// discarded, before clustering ever saw it.
+  int get droppedByDet => det.droppedAll;
+
+  /// Counts the final verdict of one cluster. [reject] `null` means no
+  /// recognition attempt ran.
+  void countOutcome(OcrReject? reject) {
+    switch (reject ?? OcrReject.untried) {
+      case OcrReject.none:
+        blocks++;
+      case OcrReject.short:
+        tooShort++;
+      case OcrReject.ratio:
+        implausible++;
+      case OcrReject.empty:
+        empty++;
+      case OcrReject.untried:
+        untried++;
+    }
+  }
+
+  /// Clusters that produced no block. Derived, never accumulated, so the line
+  /// cannot drift from the identity it exists to demonstrate.
+  int get droppedFromCrops => droppedByCropLimit +
+      droppedTinyBounds +
+      tooShort +
+      implausible +
+      empty +
+      untried;
+
+  /// The developer-log body for this page. One line, `key=value` throughout,
+  /// so it survives being reworded less than prose would; grep it with
+  /// `OcrFunnel`.
+  String line() {
+    final cut = cutAtPct;
+    return 'OcrFunnel page=$pageIndex det=${det.render()}'
+        ' detBoxes=$detBoxes clusters=$clusters cropLimit=$cropLimit'
+        ' droppedByDet=${det.droppedAll}'
+        ' droppedByCropLimit=$droppedByCropLimit'
+        ' droppedTinyBounds=$droppedTinyBounds'
+        ' workItems=$workItems tooShort=$tooShort'
+        ' implausible=$implausible empty=$empty untried=$untried'
+        ' recLinesDropped=$recLinesDropped blocks=$blocks'
+        '${droppedByCropLimit > 0 && cut != null ? ' cutAtPct=$cut' : ''}';
+  }
+
+  @override
+  String toString() => line();
 }
 
 /// Parameters for text recognition padding and line expansion.
@@ -1071,6 +1435,22 @@ class _ClusterWork {
   String lang = '';
   String engine = '';
   bool isPlausible = false;
+
+  // --- observability only (F13.5); never read by any decision --------------
+  //
+  // `engine` is deliberately NOT set on the reject path: Pass B routes on
+  // `item.engine == 'ja'`, so recording which engine produced a rejection by
+  // writing to that field would silently move items between the two fallback
+  // queues and change which model a cluster is re-recognized with. The
+  // verdict therefore gets its own field.
+  //
+  // A `null` means "no crop was ever sent" (no model for the engine, or every
+  // line of the cluster under the 8 px recognition floor) and is tallied as
+  // [OcrReject.untried]. The last attempt owns the verdict, so a cluster
+  // rejected by Pass A and saved by Pass B is tallied as accepted, and one
+  // rejected twice is tallied once, under its final reason — not once per
+  // pass, which is what a call-site counter would have done.
+  OcrReject? reject;
 }
 
 /// Debug aid for acceptance criterion V9-5: with
@@ -1432,8 +1812,8 @@ class _WorkerState {
   // OCR page
   // -------------------------------------------------------------------------
 
-  List<OcrBlock> ocrPage(_OcrPageRequest req) {
-    final (results, _, _) = ocrPagesAll(_OcrPagesRequest(
+  (List<OcrBlock>, List<String>) ocrPage(_OcrPageRequest req) {
+    final (results, _, _, funnelLines) = ocrPagesAll(_OcrPagesRequest(
       req.id,
       [
         _PageInput(
@@ -1450,14 +1830,16 @@ class _WorkerState {
       detBatch: req.detBatch,
       recBatch: req.recBatch,
     ));
-    if (results.isEmpty) return const [];
+    if (results.isEmpty) return (const [], funnelLines);
     if (results.first.error != null) {
       throw Exception(results.first.error);
     }
-    return results.first.blocks ?? const [];
+    return (results.first.blocks ?? const [], funnelLines);
   }
 
-  (List<OcrPageResult>, String, OcrBatchPerf) ocrPagesAll(_OcrPagesRequest req) {
+  (List<OcrPageResult>, String, OcrBatchPerf, List<String>) ocrPagesAll(
+    _OcrPagesRequest req,
+  ) {
     final totalSw = Stopwatch()..start();
     final detSw = Stopwatch();
     final recSw = Stopwatch();
@@ -1503,8 +1885,13 @@ class _WorkerState {
     var detTilesCount = 0;
     var detBatchesCount = 0;
     final pageBoxes = <int, List<IntRect>>{};
+    // Per-page discard ledger (F13.5). One entry per page that decoded
+    // successfully; pages that failed to decode already carry an error result
+    // and would only add a misleading all-zero funnel.
+    final funnels = <int, OcrPageFunnel>{};
     for (final pageIdx in pageImages.keys) {
       pageBoxes[pageIdx] = <IntRect>[];
+      funnels[pageIdx] = OcrPageFunnel(pageIdx);
     }
 
     if (pageImages.isNotEmpty) {
@@ -1559,7 +1946,14 @@ class _WorkerState {
             stride: 32,
           );
           // The stats describe the plan that actually completed; failed
-          // attempts are not counted twice (same rule as rec).
+          // attempts are not counted twice (same rule as rec). The funnel
+          // follows the same rule: a replay re-derives identical boxes and
+          // the IoU guard below discards them as `dupTile`, so without this
+          // reset an OOM retreat would inflate the dedup count of every page
+          // in the batch and blame the tile stitch for a memory event.
+          for (final funnel in funnels.values) {
+            funnel.det.reset();
+          }
           detBatchesCount = batches.length;
 
           for (var batch in batches) {
@@ -1630,6 +2024,7 @@ class _WorkerState {
                 for (var b = 0; b < n; b++) {
                   final info = tileInfo[b];
                   final tileProbs = probsPtr + (b * plane);
+                  final tally = funnels[info.pageIndex]!.det;
                   final tileBoxes = _detPostprocessBatchSingle(
                     tileProbs,
                     w: targetW,
@@ -1638,6 +2033,7 @@ class _WorkerState {
                     realH: info.realH,
                     tileWidth: info.origW,
                     tileHeight: info.origH,
+                    tally: tally,
                   );
                   final boxesList = pageBoxes[info.pageIndex]!;
                   for (var box in tileBoxes) {
@@ -1645,6 +2041,12 @@ class _WorkerState {
                     box.bottom += info.top;
                     if (!boxesList.any((existing) => _iou(existing, box) > 0.5)) {
                       boxesList.add(box);
+                    } else {
+                      // The same line seen twice because two detection tiles
+                      // overlap by 128 px. F13.5: this used to be exactly as
+                      // invisible as a real rejection, and it is not one —
+                      // which is why it is tallied apart from `tiny`/`lowScore`.
+                      tally.dupTile++;
                     }
                   }
                 }
@@ -1673,13 +2075,35 @@ class _WorkerState {
     for (final entry in pageBoxes.entries) {
       final pageIdx = entry.key;
       final img = pageImages[pageIdx]!;
+      final funnel = funnels[pageIdx]!;
       var boxes = entry.value;
+      // Read the number off the list, not off the counters: this is what the
+      // clustering pass really received, so `detBoxes` stays true even if a
+      // shrink-ladder replayed some tiles.
+      funnel.detBoxes = boxes.length;
+      // The budget the page was given, stated even when it had nothing to
+      // spend — a `cropLimit=0` on an empty page would read as "the cap
+      // crushed this page", which is the opposite of the truth.
+      funnel.cropLimit = ocrPageCropLimit(effectiveProfile.recBatch);
       if (boxes.isEmpty) continue;
       var clusters = clusterOcrBoxes(boxes, img.width, img.height);
       clusters.sort((a, b) => _boundsOf(a).top.compareTo(_boundsOf(b).top));
-      final pageCropLimit = (effectiveProfile.recBatch * 4).clamp(32, 128);
+      // F13.5 / F13.6: the crop budget used to cut this list and say nothing.
+      // `cutAtPct` is the page fraction the cut started at, so the claim
+      // "dense pages lose their bottom" is measured per page instead of
+      // argued about.
+      funnel.clusters = clusters.length;
+      final pageCropLimit = funnel.cropLimit;
       if (clusters.length > pageCropLimit) {
-        clusters = clusters.sublist(0, pageCropLimit);
+        funnel.droppedByCropLimit = clusters.length - pageCropLimit;
+        funnel.cutAtPct = img.height > 0
+            ? (100 * _boundsOf(clusters[pageCropLimit]).top ~/ img.height)
+            : null;
+        final kept = ocrCropSelection(
+          clusterCount: clusters.length,
+          limit: pageCropLimit,
+        );
+        clusters = [for (final i in kept) clusters[i]];
       }
       for (var i = 0; i < clusters.length; i++) {
         final cluster = clusters[i];
@@ -1691,7 +2115,11 @@ class _WorkerState {
         final lineHeight = _medianLineHeight(cluster);
         final pad = math.max(4, (0.06 * lineHeight).round().clamp(4, 8));
         final bounds = detectedBounds.inflated(pad, pad, img.width, img.height);
-        if (bounds.width < 8 || bounds.height < 8) continue;
+        if (bounds.width < 8 || bounds.height < 8) {
+          funnel.droppedTinyBounds++;
+          continue;
+        }
+        funnel.workItems++;
         final colors = _sampleColors(img, bounds);
         workItems.add(
           _ClusterWork(
@@ -1744,7 +2172,12 @@ class _WorkerState {
           for (var i = 0; i < targets.length; i++) {
             final t = targets[i];
             final raw = texts[i].trim();
-            if (_isPlausible(raw)) {
+            // The whole cluster went to the decoder, so this attempt is
+            // always a real attempt — and the verdict of the *last* one wins
+            // (a Pass B retry replaces the Pass A reason, never adds to it).
+            final verdict = ocrPlausibility(raw);
+            t.reject = verdict;
+            if (verdict == OcrReject.none) {
               t.text = raw;
               t.lang = _detectLanguage(raw, 'ja');
               t.engine = 'ja';
@@ -1755,6 +2188,11 @@ class _WorkerState {
           if (!paths.recModels.containsKey(engine)) return;
           final lineClusterIdx = <int>[];
           final allLineItems = <({RgbaImage image, IntRect rect})>[];
+          // A cluster with no line at or over the 8 px recognition floor
+          // contributes no crop, so it is *not attempted* rather than
+          // attempted and rejected. Without this flag the funnel would blame
+          // the plausibility gate for a resolution problem.
+          final sentToRec = List<bool>.filled(targets.length, false);
           for (var i = 0; i < targets.length; i++) {
             final t = targets[i];
             final img = pageImages[t.pageIndex]!;
@@ -1763,6 +2201,14 @@ class _WorkerState {
                 RecParams.inflateLine(l, img.width, img.height),
             ]..sort((a, b) => a.top.compareTo(b.top));
             final validLines = sortedLines.where((r) => r.width >= 8 && r.height >= 8).toList();
+            final lostLines = sortedLines.length - validLines.length;
+            if (lostLines > 0) {
+              // Partial loss inside a cluster that survives: the block comes
+              // back translated with a line missing. F13.5's "not recognized"
+              // reports often mean exactly this, and it was invisible.
+              funnels[t.pageIndex]?.recLinesDropped += lostLines;
+            }
+            sentToRec[i] = validLines.isNotEmpty;
             for (var l in validLines) {
               lineClusterIdx.add(i);
               allLineItems.add((image: img, rect: l));
@@ -1792,8 +2238,11 @@ class _WorkerState {
 
           for (var i = 0; i < targets.length; i++) {
             final t = targets[i];
+            if (!sentToRec[i]) continue;
             final raw = clusterParts[i].join(' ').trim();
-            if (_isPlausible(raw)) {
+            final verdict = ocrPlausibility(raw);
+            t.reject = verdict;
+            if (verdict == OcrReject.none) {
               t.text = raw;
               t.lang = _detectLanguage(raw, engine);
               t.engine = engine;
@@ -1849,7 +2298,11 @@ class _WorkerState {
 
     for (var item in workItems) {
       final text = item.text.trim();
-      if (text.isEmpty || !item.isPlausible) continue;
+      if (text.isEmpty || !item.isPlausible) {
+        funnels[item.pageIndex]?.countOutcome(item.reject);
+        continue;
+      }
+      funnels[item.pageIndex]?.countOutcome(OcrReject.none);
       final lineHeight = _medianLineHeight(item.cluster);
       pageBlocks[item.pageIndex]?.add(
         OcrBlock(
@@ -1876,6 +2329,22 @@ class _WorkerState {
           blocks: pageBlocks[p.pageIndex] ?? const [],
         ));
       }
+    }
+
+    // One funnel line per page that reached the pipeline, in request order.
+    //
+    // These strings are *returned* rather than logged here on purpose: a
+    // worker isolate has its own copy of every `Log` static, and
+    // `App.isInitialized` is false in it, so a `Log.*` call made inside this
+    // isolate never opens `logs.txt` — it dies in an isolate-local list. The
+    // perf line has the same shape for the same reason (it is handed back and
+    // logged by `_IsolateWorker`), and the funnel has to follow that route or
+    // the user cannot grep it, which is the entire point of F13.5.
+    final funnelLines = <String>[];
+    for (final p in req.pages) {
+      if (pageErrors.containsKey(p.pageIndex)) continue;
+      final funnel = funnels[p.pageIndex];
+      if (funnel != null) funnelLines.add(funnel.line());
     }
 
     totalSw.stop();
@@ -1930,7 +2399,7 @@ class _WorkerState {
       restMs: parts.restMs,
     );
 
-    return (results, perfLog, perf);
+    return (results, perfLog, perf, funnelLines);
   }
 
   /// Median height of a cluster's line boxes — an estimate of the original
@@ -1942,14 +2411,6 @@ class _WorkerState {
   }
 
 
-
-  bool _isPlausible(String text) {
-    if (text.length < 2) return false;
-    var meaningful = text.runes
-        .where((r) => r > 0x2E80 || (r >= 0x30 && r <= 0x7A))
-        .length;
-    return meaningful >= math.max(2, text.length ~/ 2);
-  }
 
   /// Determines the language from the recognized script; falls back to the
   /// engine's own language when the text is ambiguous.
@@ -1983,9 +2444,9 @@ class _WorkerState {
     required int realH,
     required int tileWidth,
     required int tileHeight,
+    OcrDetTally? tally,
   }) {
     const binaryThreshold = DetParams.binaryThreshold;
-    const scoreThreshold = DetParams.scoreThreshold;
     const unclipRatio = DetParams.unclipRatio;
     var labels = Int32List(w * h);
     var boxes = <IntRect>[];
@@ -2026,16 +2487,25 @@ class _WorkerState {
 
       var centerX = (minX + maxX) / 2.0;
       var centerY = (minY + maxY) / 2.0;
-      if (centerX >= realW || centerY >= realH) {
-        continue;
-      }
-
-      if (count < 12 || scoreSum / count < scoreThreshold) {
-        continue;
-      }
       var boxW = maxX - minX + 1;
       var boxH = maxY - minY + 1;
-      if (boxW < 3 || boxH < 3) continue;
+      // One classifier instead of three bare `continue`s (F13.5). The
+      // evaluation order below is the order the guards were written in, so
+      // each region is counted under its *first* failing rule and the sum of
+      // the counters plus the accepted boxes equals the component count —
+      // which is what lets "the detector found nothing" be told apart from
+      // "the detector found 200 regions and the thresholds kept 12".
+      final verdict = ocrDetReject(
+        pixels: count,
+        scoreSum: scoreSum,
+        boxWidth: boxW,
+        boxHeight: boxH,
+        centerInsideRegion: centerX < realW && centerY < realH,
+      );
+      tally?.record(verdict);
+      if (verdict != OcrDetReject.none) {
+        continue;
+      }
       var offset = boxW * boxH * unclipRatio / (2 * (boxW + boxH));
       var scaleX = tileWidth / realW;
       var scaleY = tileHeight / realH;
