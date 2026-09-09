@@ -1,6 +1,7 @@
 import 'package:venera/foundation/app.dart';
 import 'package:venera/foundation/appdata.dart';
 import 'package:venera/foundation/image_translation/ort_capabilities.dart';
+import 'package:venera/foundation/image_translation/process_diagnostics.dart';
 
 enum TranslationPerformancePreset { saver, balanced, fast, custom }
 
@@ -23,6 +24,75 @@ enum PipelineMode {
   freeVram,
 }
 
+/// What the on-device tier is. These are the *only* signals a suggestion may
+/// rest on, and every one of them is either already in memory (the platform
+/// flag, the EP report from the first probe) or explicitly optional — a field
+/// the caller could not read is `null`, never a guessed number.
+enum AdviceBasis {
+  /// Not a desktop. Mobile keeps the shipped tier untouched: nothing measured
+  /// here says anything about a phone's memory.
+  mobile,
+
+  /// No EP report yet (nothing has been translated in this install). We do not
+  /// guess a GPU exists; the shipped default stays.
+  noGpuReport,
+
+  /// Probed, and the probe says CPU. The default tier is the right one.
+  cpuOnly,
+
+  /// A GPU EP is active but the detection model has no batch dimension to grow
+  /// ([EpReport.batchCapable] false), so the detection batch must stay 1.
+  gpuStaticBatch,
+
+  /// GPU confirmed and total video memory measured → banded by that number.
+  gpuVramBanded,
+
+  /// GPU confirmed but total video memory unreadable (no `nvidia-smi`, AMD or
+  /// Intel adapter, probe failed). Only the knobs whose cost is bounded
+  /// regardless of card size are raised.
+  gpuVramUnknown,
+}
+
+/// A machine-specific suggestion: which tier to use and the exact numbers behind
+/// it. Produced only by [TranslationPerformanceConfig.advise]; it changes nothing
+/// by itself — the user has to apply it.
+class PerformanceAdvice {
+  const PerformanceAdvice({
+    required this.preset,
+    required this.values,
+    required this.basis,
+    this.vramMb,
+  });
+
+  final TranslationPerformancePreset preset;
+  final TranslationPerformanceValues values;
+  final AdviceBasis basis;
+
+  /// The adapter total this advice was banded by, when there was one. Carried on
+  /// the result rather than re-read by the UI, so a row can show the machine it
+  /// actually described instead of whatever the cache says by then.
+  final int? vramMb;
+
+  /// Whether this install already runs the suggested numbers. False means there
+  /// is nothing to offer, so the UI shows no button instead of a lie.
+  ///
+  /// The tier *name* counts as part of the answer: staying on `custom` while
+  /// the suggested numbers happen to match is a different thing to have chosen
+  /// than selecting a tier, and the sliders would then move if the user ever
+  /// re-applied it.
+  bool get isActionable {
+    if (preset != TranslationPerformanceConfig.current) return true;
+    return !values.sameTuning(TranslationPerformanceConfig.effective);
+  }
+
+  /// Whether the suggestion is based on a GPU actually being present. Only
+  /// then may the UI claim to know something about this machine.
+  bool get isGpuBased =>
+      basis == AdviceBasis.gpuStaticBatch ||
+      basis == AdviceBasis.gpuVramBanded ||
+      basis == AdviceBasis.gpuVramUnknown;
+}
+
 class TranslationPerformanceValues {
   const TranslationPerformanceValues({
     required this.batchPages,
@@ -43,6 +113,21 @@ class TranslationPerformanceValues {
   final int detBatch;
   final int recBatch;
   final int pagesPerOcrCall;
+
+  /// Compare the seven writable numbers, ignoring [ep].
+  ///
+  /// The inference backend is its own setting (`imageTranslationExecutionProvider`)
+  /// and a batch suggestion never moves it, so both "is this already applied?"
+  /// and "may this tier keep its name?" have to be answered from the numbers
+  /// the apply path actually writes.
+  bool sameTuning(TranslationPerformanceValues other) =>
+      batchPages == other.batchPages &&
+      ocrWorkers == other.ocrWorkers &&
+      imageConcurrency == other.imageConcurrency &&
+      llmConcurrency == other.llmConcurrency &&
+      detBatch == other.detBatch &&
+      recBatch == other.recBatch &&
+      pagesPerOcrCall == other.pagesPerOcrCall;
 }
 
 abstract final class TranslationPerformanceConfig {
@@ -109,15 +194,37 @@ abstract final class TranslationPerformanceConfig {
       recBatch: 1,
       pagesPerOcrCall: 1,
     ),
+    /// The factory tier for a fresh install, so these two desktop numbers *are*
+    /// the first-run experience. Both were raised from the shipped `1` / `2`:
+    /// * `detBatch 2` — measured on a 6 GB desktop GPU (RTX 3060 Laptop,
+    ///   DirectML): a whole 8-page sweep at det 1 / rec 8 / group 8 peaked at
+    ///   2473 MB of 6144 MB, i.e. 40% used, 3.6 GB idle. One extra detection
+    ///   tile is 3·1280·896 floats = 13.8 MB of staging (the arena that held
+    ///   the whole measured call reported 36 MB), so det 2 asks for ~14 MB more
+    ///   plus the detector's own feature maps: 0.4% of the idle 3.6 GB, and the
+    ///   OOM ladder in `ocr_batching.dart` (`runWithShrinkLadder` + the sticky
+    ///   `cappedBy` ceiling) retreats it automatically on any card that
+    ///   disagrees.
+    /// * `pagesPerOcrCall 4` — half of the 8 pages per call that the same sweep
+    ///   ran successfully. Crossing pages amortises per-call setup and feeds
+    ///   the worker pool, and its cost is host RAM for the decoded RGBA pages
+    ///   (~7.2 MB each at 1125×1600, so a group of 4 is ~29 MB against the ~58
+    ///   MB the measured group of 8 held) — not video memory.
+    /// `recBatch` is deliberately NOT raised: the same sweep's timing split
+    /// (`parts={detMs:5300,recGpuMs:5700,decMsInRec:36000}` over 46.6 s) puts
+    /// recognition GPU at 12% of the wall clock and the CPU-side decode at
+    /// 78%. Doubling `recBatch` could therefore recover at most ~6% while
+    /// doubling the crop staging — a cost with no paying benefit. Mobile
+    /// numbers are untouched: nothing above was measured on a phone.
     TranslationPerformancePreset.balanced => TranslationPerformanceValues(
       batchPages: isDesktop ? 4 : 2,
       ocrWorkers: 0,
       imageConcurrency: isDesktop ? 3 : 2,
       llmConcurrency: 2,
       ep: EpPreference.auto,
-      detBatch: 1,
+      detBatch: isDesktop ? 2 : 1,
       recBatch: isDesktop ? 8 : 4,
-      pagesPerOcrCall: 2,
+      pagesPerOcrCall: isDesktop ? 4 : 2,
     ),
     TranslationPerformancePreset.fast => TranslationPerformanceValues(
       batchPages: isDesktop ? 8 : 4,
@@ -154,20 +261,255 @@ abstract final class TranslationPerformanceConfig {
   };
 
   static void apply(TranslationPerformancePreset preset) {
-    appdata.settings[settingKey] = preset.name;
-    if (preset != TranslationPerformancePreset.custom) {
-      var values = valuesFor(preset, isDesktop: App.isDesktop);
-      appdata.settings['imageTranslationPreBatchPages'] = values.batchPages;
-      appdata.settings['imageTranslationOcrWorkers'] = values.ocrWorkers;
-      appdata.settings['imageTranslationImageConcurrency'] =
-          values.imageConcurrency;
-      appdata.settings['imageTranslationLlmConcurrency'] =
-          values.llmConcurrency;
-      appdata.settings['imageTranslationOcrDetBatch'] = values.detBatch;
-      appdata.settings['imageTranslationOcrRecBatch'] = values.recBatch;
-      appdata.settings['imageTranslationPagesPerOcrCall'] = values.pagesPerOcrCall;
+    if (preset == TranslationPerformancePreset.custom) {
+      // Custom has no table of its own: the individual sliders already hold the
+      // numbers, so selecting it must not overwrite them.
+      appdata.settings[settingKey] = preset.name;
+      appdata.saveData();
+      return;
     }
+    applyValues(valuesFor(preset, isDesktop: App.isDesktop), preset: preset);
+  }
+
+  /// Write one concrete table and record which tier it came from. Used by the
+  /// machine suggestion (whose GPU tier is not a shipped preset, so it lands on
+  /// `custom` and stays editable by the sliders).
+  ///
+  /// [TranslationPerformanceValues.ep] is intentionally ignored: the inference
+  /// backend is its own setting and a throughput suggestion must not silently
+  /// move a user off the backend they picked.
+  static void applyValues(
+    TranslationPerformanceValues values, {
+    TranslationPerformancePreset preset = TranslationPerformancePreset.custom,
+  }) {
+    appdata.settings[settingKey] = preset.name;
+    appdata.settings['imageTranslationPreBatchPages'] = values.batchPages;
+    appdata.settings['imageTranslationOcrWorkers'] = values.ocrWorkers;
+    appdata.settings['imageTranslationImageConcurrency'] = values.imageConcurrency;
+    appdata.settings['imageTranslationLlmConcurrency'] = values.llmConcurrency;
+    appdata.settings['imageTranslationOcrDetBatch'] = values.detBatch;
+    appdata.settings['imageTranslationOcrRecBatch'] = values.recBatch;
+    appdata.settings['imageTranslationPagesPerOcrCall'] = values.pagesPerOcrCall;
     appdata.saveData();
+  }
+
+  /// Suggest a tier for this machine. Pure: every fact is passed in, so the
+  /// whole policy — including the parts that must stay false on a machine
+  /// without a GPU — is unit-testable without an isolate, a probe or a network.
+  ///
+  /// The conservatism is the point. [ep] is what the runtime actually probed
+  /// (null until the first translation has run); [totalVramMb] is what the
+  /// adapter reports as its *total* (null whenever no probe answered, which is
+  /// every AMD/Intel card and every machine without `nvidia-smi`). A null never
+  /// becomes a guessed number: it either keeps the shipped default or limits the
+  /// suggestion to the one knob whose cost is bounded whatever the card is.
+  ///
+  /// Nothing here touches [pipelineMode]. The factory default of the pipeline
+  /// topology stays [PipelineMode.freeVram] until decision gate G2 measures the
+  /// release handshake, and an aggressive batch is not an argument about it.
+  static PerformanceAdvice advise({
+    bool? isDesktop,
+    OrtEpKind? ep,
+    bool batchCapable = false,
+    int? totalVramMb,
+  }) {
+    final desktop = isDesktop ?? App.isDesktop;
+    final base = valuesFor(
+      TranslationPerformancePreset.balanced,
+      isDesktop: desktop,
+    );
+    if (!desktop) {
+      return PerformanceAdvice(
+        preset: TranslationPerformancePreset.balanced,
+        values: base,
+        basis: AdviceBasis.mobile,
+      );
+    }
+    if (ep == null) {
+      // Nothing has been probed. Saying "balanced" is the honest answer;
+      // saying "I detect no GPU" would be a lie we cannot support.
+      return PerformanceAdvice(
+        preset: TranslationPerformancePreset.balanced,
+        values: base,
+        basis: AdviceBasis.noGpuReport,
+      );
+    }
+    if (ep == OrtEpKind.cpu) {
+      return PerformanceAdvice(
+        preset: TranslationPerformancePreset.balanced,
+        values: base,
+        basis: AdviceBasis.cpuOnly,
+      );
+    }
+    if (!batchCapable) {
+      // A GPU is running, but the detection graph has no batch dimension to
+      // grow: only recognition can batch. Keep the shipped table's other
+      // numbers, pull detection back to one tile — and call the result what
+      // it is, `custom`, because those numbers no longer *are* the balanced
+      // tier (naming it balanced would have the read-back ignore the detBatch
+      // we just wrote, and show the user a tier that lies).
+      return PerformanceAdvice(
+        preset: TranslationPerformancePreset.custom,
+        values: TranslationPerformanceValues(
+          batchPages: base.batchPages,
+          ocrWorkers: base.ocrWorkers,
+          imageConcurrency: base.imageConcurrency,
+          llmConcurrency: base.llmConcurrency,
+          detBatch: 1,
+          recBatch: base.recBatch,
+          pagesPerOcrCall: base.pagesPerOcrCall,
+        ),
+        basis: AdviceBasis.gpuStaticBatch,
+      );
+    }
+    final vram = totalVramMb;
+    if (vram == null) {
+      // GPU confirmed, its size unknown: the detection batch is the only
+      // raising worth doing (one extra tile is 13.8 MB of host staging against
+      // a 36 MB arena measured for the whole call), and that is already the
+      // shipped default — so the answer here is deliberately "stay where you
+      // are".
+      return PerformanceAdvice(
+        preset: TranslationPerformancePreset.balanced,
+        values: base,
+        basis: AdviceBasis.gpuVramUnknown,
+      );
+    }
+    if (vram < 2048) {
+      // A GPU that small is a shared or very old one; do not push it at all.
+      return PerformanceAdvice(
+        preset: TranslationPerformancePreset.balanced,
+        values: base,
+        vramMb: vram,
+        basis: AdviceBasis.gpuVramBanded,
+      );
+    }
+    if (vram < 4096) {
+      // Derived, not measured (cloud test CT-2): trade the recognition stage —
+      // the one that actually allocated 2.4 GB with the pool — down, and run a
+      // single worker so only one copy of the models is resident.
+      return PerformanceAdvice(
+        preset: TranslationPerformancePreset.custom,
+        values: TranslationPerformanceValues(
+          batchPages: 2,
+          ocrWorkers: 1,
+          imageConcurrency: 3,
+          llmConcurrency: 2,
+          detBatch: 2,
+          recBatch: 4,
+          pagesPerOcrCall: 2,
+        ),
+        vramMb: vram,
+        basis: AdviceBasis.gpuVramBanded,
+      );
+    }
+    if (vram >= 12288) {
+      // At least twice the card every figure here was measured on. `fast` was
+      // built for that much memory; it is still not *measured* there, which is
+      // what cloud test CT-1 is for.
+      return PerformanceAdvice(
+        preset: TranslationPerformancePreset.fast,
+        values: valuesFor(
+          TranslationPerformancePreset.fast,
+          isDesktop: true,
+        ),
+        vramMb: vram,
+        basis: AdviceBasis.gpuVramBanded,
+      );
+    }
+    // 4 GB … 12 GB: the band the measurement was made in (6144 MB adapter,
+    // 2473 MB peak over a whole 8-page sweep at det 1 / rec 8 / group 8).
+    return PerformanceAdvice(
+      preset: TranslationPerformancePreset.custom,
+      values: TranslationPerformanceValues(
+        // Unchanged from the shipped tier: this groups pages for one *network*
+        // translation request, and nothing in the sweep measured it.
+        batchPages: 4,
+        // 0 = auto on purpose. A hand-set 6 is a lie on a GPU desktop:
+        // `resolveOcrPoolSize` clamps the pool to 2 whenever the EP is not CPU
+        // (translation_worker.dart:266-269), so auto is what actually runs.
+        ocrWorkers: 0,
+        // Downloads cost no video memory; the source's own rate limit plus the
+        // AIMD backoff is the gate. The user's run held 6 without a recorded
+        // 429, so 4 is a deliberate half-step, not the ceiling.
+        imageConcurrency: 4,
+        // Desktop slider maximum, and the value the reference run used. The
+        // pipeline's own GPU overlap rule intends 2 (pre_translation_tasks.dart:
+        // 1482-1486), so this buys network parallelism, not GPU contention.
+        llmConcurrency: 4,
+        detBatch: 2,
+        // Not 16: recognition's GPU half was 12% of the wall clock, its decode
+        // half 78% and CPU-side. A bigger rec batch cannot buy back time the
+        // GPU was not spending.
+        recBatch: 8,
+        // Half of the 8 pages per call the reference sweep ran; the rest of the
+        // cost is host RAM for decoded pages (~57 MB each), not VRAM.
+        pagesPerOcrCall: 4,
+      ),
+      vramMb: vram,
+      basis: AdviceBasis.gpuVramBanded,
+    );
+  }
+
+  /// [advise] fed from what this process already knows, with no new probe: the
+  /// caller passes the EP report's fields it holds anyway, plus whatever
+  /// [measuredVramMb] has managed to learn. [totalVramMb] defaults to that
+  /// cache, so a page that never probed simply gets the unreadable-memory
+  /// branch instead of a guess.
+  static PerformanceAdvice adviseForDevice({
+    OrtEpKind? ep,
+    bool batchCapable = false,
+    int? totalVramMb,
+  }) => advise(
+    isDesktop: App.isDesktop,
+    ep: ep,
+    batchCapable: batchCapable,
+    totalVramMb: totalVramMb ?? _measuredVramMb,
+  );
+
+  static int? _measuredVramMb;
+
+  /// Total video memory of the graphics adapter in MB, or null while nothing
+  /// has measured it. Null is the honest state on AMD, on Intel, and on
+  /// NVIDIA machines where the caller has not asked yet — [advise] treats it as
+  /// "do not get aggressive", never as "0 MB".
+  static int? get measuredVramMb => _measuredVramMb;
+
+  /// Ask the driver for the adapter's total video memory (a vendor probe: on
+  /// Windows/NVIDIA this shells out to `nvidia-smi`, ~30-100 ms, so it belongs
+  /// behind an explicit user action, not behind a settings page building
+  /// itself). Returns the cached value when the probe cannot answer, and keeps
+  /// an earlier good reading rather than replacing it with nothing.
+  static Future<int?> probeAdapterVram() async {
+    try {
+      final snap = await takeProcessSnapshot(vendorProbe: true);
+      final bytes = snap.gpuBudgetBytes;
+      if (bytes != null && bytes > 0) {
+        _measuredVramMb = (bytes / (1024 * 1024)).round();
+      }
+    } catch (e) {
+      // A failed probe says nothing about the card; the cache and the
+      // conservative branch it leaves in place are the answer.
+    }
+    return _measuredVramMb;
+  }
+
+  /// Write an [advise] result. The tier name is only kept when the numbers
+  /// really are that tier's own table: a named tier's values are recomputed by
+  /// [valuesFor] on every read, so writing a table under a name whose table it
+  /// is not would leave the sliders showing one thing and the engine running
+  /// another — the exact failure this whole file exists to avoid.
+  static void applyAdvice(PerformanceAdvice advice) {
+    var tierTable = valuesFor(advice.preset, isDesktop: App.isDesktop);
+    var keepsName =
+        advice.preset == TranslationPerformancePreset.custom ||
+        advice.values.sameTuning(tierTable);
+    applyValues(
+      advice.values,
+      preset: keepsName
+          ? advice.preset
+          : TranslationPerformancePreset.custom,
+    );
   }
 
   static void markCustom() {
@@ -175,8 +517,19 @@ abstract final class TranslationPerformanceConfig {
     appdata.saveData();
   }
 
+  /// Read an integer setting without lying about what the sliders show.
+  ///
+  /// `value is int` alone used to fall through to `int.tryParse('$value')`,
+  /// which returns null for a JSON round-tripped `2.0` — so a value written as
+  /// a double (a copy from another device, a hand-edited appdata.json, any
+  /// future float-producing widget) made the engine run the *fallback* while
+  /// the settings UI happily displayed 2: the slider accepts `num` and shows
+  /// `raw.toDouble()` (setting_components.dart:533-539). Truncating a double we
+  /// can read is what the display already promised.
   static int _intSetting(String key, int fallback) {
     var value = appdata.settings[key];
-    return value is int ? value : int.tryParse('$value') ?? fallback;
+    if (value is int) return value;
+    if (value is num) return value.toInt();
+    return int.tryParse('$value') ?? fallback;
   }
 }

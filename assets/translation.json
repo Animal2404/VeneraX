@@ -1426,7 +1426,15 @@
     "modelCheck.checkDictPair": "“类别数 = 词典行数 + @extra”这项核对",
     "modelCheck.checkVocabPair": "“类别数 = 词表行数”这项核对",
     "modelCheck.symbolicAxes": "，符号名为 @names",
-    "modelCheck.fileDoesNotExist": "文件不存在（@path）"
+    "modelCheck.fileDoesNotExist": "文件不存在（@path）",
+    "Suggested for this machine": "本机建议",
+    "Apply": "应用",
+    "Run one translation first. The suggestion needs to see which backend this machine actually uses, and nothing is changed until you apply it.": "请先翻译一次。建议需要看到本机实际使用的后端，且在您点击应用之前不会改动任何设置。",
+    "No graphics card was detected, so the standard settings are already the safe ones for this machine.": "未检测到独立显卡，因此标准设置对本机而言已是安全选项。",
+    "Suggested for this machine: @tier. Your detection model has no batch dimension, so detection stays at 1 tile per call.": "本机建议：@tier。您的检测模型没有批量维度，因此检测保持每次 1 块。",
+    "Suggested for this machine: @tier. A graphics card is in use, but its memory size could not be read, so only the settings that are safe on any card are suggested. Tap to check the graphics memory.": "本机建议：@tier。已在使用显卡，但读不到它的显存容量，因此只推荐在任何显卡上都安全的设置。点击可检测显存。",
+    "Suggested for this machine: @tier — detection batch @det, recognition batch @rec, @pages pages per recognition call.": "本机建议：@tier —— 检测批 @det，识别批 @rec，每次识别调用处理 @pages 页。",
+    "Suggested for this machine: @tier — @vram MB of graphics memory, detection batch @det, recognition batch @rec, @pages pages per recognition call.": "本机建议：@tier —— 显存 @vram MB，检测批 @det，识别批 @rec，每次识别调用处理 @pages 页。"
   },
   "zh_TW": {
     "Reading Statistics": "閱讀統計",
@@ -2855,6 +2863,14 @@
     "modelCheck.checkDictPair": "“類別數 = 詞典行數 + @extra”這項核對",
     "modelCheck.checkVocabPair": "“類別數 = 詞表行數”這項核對",
     "modelCheck.symbolicAxes": "，符號名為 @names",
-    "modelCheck.fileDoesNotExist": "檔案不存在（@path）"
+    "modelCheck.fileDoesNotExist": "檔案不存在（@path）",
+    "Suggested for this machine": "本機建議",
+    "Apply": "套用",
+    "Run one translation first. The suggestion needs to see which backend this machine actually uses, and nothing is changed until you apply it.": "請先翻譯一次。建議需要看到本機實際使用的後端，且在您點擊套用之前不會改動任何設定。",
+    "No graphics card was detected, so the standard settings are already the safe ones for this machine.": "未偵測到獨立顯示卡，因此標準設定对本機而言已是安全選項。",
+    "Suggested for this machine: @tier. Your detection model has no batch dimension, so detection stays at 1 tile per call.": "本機建議：@tier。您的偵測模型沒有批量維度，因此偵測保持每次 1 塊。",
+    "Suggested for this machine: @tier. A graphics card is in use, but its memory size could not be read, so only the settings that are safe on any card are suggested. Tap to check the graphics memory.": "本機建議：@tier。已在使用顯示卡，但讀不到它的記憶體容量，因此只推薦在任何顯示卡上都安全的設定。點擊可檢測記憶體。",
+    "Suggested for this machine: @tier — detection batch @det, recognition batch @rec, @pages pages per recognition call.": "本機建議：@tier —— 偵測批 @det，識別批 @rec，每次識別呼叫處理 @pages 頁。",
+    "Suggested for this machine: @tier — @vram MB of graphics memory, detection batch @det, recognition batch @rec, @pages pages per recognition call.": "本機建議：@tier —— 記憶體 @vram MB，偵測批 @det，識別批 @rec，每次識別呼叫處理 @pages 頁。"
   }
 }

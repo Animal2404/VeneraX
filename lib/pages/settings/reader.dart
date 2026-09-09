@@ -1097,6 +1097,106 @@ class _ReaderSettingsState extends State<ReaderSettings> {
                 );
               },
             ),
+            // Machine suggestion, in the performance group because it is the
+            // answer to "which of the tiers above is mine?". It is read-only
+            // until the user taps Apply, and it only ever quotes a backend the
+            // runtime actually probed: with no report yet it says so and offers
+            // nothing, rather than assuming a graphics card exists. It has no
+            // effect on the pipeline topology default, which stays freeVram
+            // until decision gate G2 measures the release handshake.
+            if (App.isDesktop)
+              Builder(
+                builder: (context) {
+                  var report = TranslationWorker.instance.lastReport;
+                  var advice = TranslationPerformanceConfig.adviseForDevice(
+                    ep: report?.active,
+                    batchCapable: report?.batchCapable ?? false,
+                  );
+                  var tierNames = {
+                    "saver": "Save resources (low memory)".tl,
+                    "balanced": "Balanced (recommended)".tl,
+                    "fast": "Fast (more battery)".tl,
+                    "custom": "Custom".tl,
+                  };
+                  var tier =
+                      tierNames[advice.preset.name] ?? advice.preset.name;
+                  var subtitle = switch (advice.basis) {
+                    AdviceBasis.noGpuReport =>
+                      "Run one translation first. The suggestion needs to see which backend this machine actually uses, and nothing is changed until you apply it.".tl,
+                    AdviceBasis.cpuOnly =>
+                      "No graphics card was detected, so the standard settings are already the safe ones for this machine.".tl,
+                    AdviceBasis.gpuStaticBatch =>
+                      "Suggested for this machine: @tier. Your detection model has no batch dimension, so detection stays at 1 tile per call.".tlParams({
+                            "tier": tier,
+                          }),
+                    AdviceBasis.gpuVramUnknown =>
+                      "Suggested for this machine: @tier. A graphics card is in use, but its memory size could not be read, so only the settings that are safe on any card are suggested. Tap to check the graphics memory.".tlParams({
+                            "tier": tier,
+                          }),
+                    AdviceBasis.gpuVramBanded =>
+                        advice.vramMb == null
+                        ? "Suggested for this machine: @tier — detection batch @det, recognition batch @rec, @pages pages per recognition call.".tlParams({
+                              "tier": tier,
+                              "det": advice.values.detBatch,
+                              "rec": advice.values.recBatch,
+                              "pages": advice.values.pagesPerOcrCall,
+                            })
+                        : "Suggested for this machine: @tier — @vram MB of graphics memory, detection batch @det, recognition batch @rec, @pages pages per recognition call.".tlParams({
+                              "tier": tier,
+                              "vram": advice.vramMb!,
+                              "det": advice.values.detBatch,
+                              "rec": advice.values.recBatch,
+                              "pages": advice.values.pagesPerOcrCall,
+                            }),
+                    AdviceBasis.mobile =>
+                      "Suggested for this machine: @tier.".tlParams({
+                        "tier": tier,
+                      }),
+                  };
+                  return ListTile(
+                    // The one thing this row cannot learn for free is how much
+                    // video memory the adapter has, and that number is only
+                    // readable by asking the driver (a `nvidia-smi` round trip
+                    // on Windows/NVIDIA, nothing on other vendors). Asking on
+                    // every rebuild would be a process spawn per frame, so it
+                    // happens on tap, and only where the answer can change the
+                    // suggestion.
+                    onTap: advice.basis == AdviceBasis.gpuVramUnknown
+                        ? () async {
+                            await TranslationPerformanceConfig.probeAdapterVram();
+                            setState(() {});
+                          }
+                        : null,
+                    leading: Icon(
+                      advice.isGpuBased
+                          ? Icons.memory
+                          : Icons.help_outline,
+                    ),
+                    title: Text("Suggested for this machine".tl),
+                    subtitle: Text(subtitle),
+                    trailing: advice.isActionable
+                        ? TextButton(
+                            child: Text("Apply".tl),
+                            onPressed: () {
+                              TranslationPerformanceConfig.applyAdvice(advice);
+                              setState(() {
+                                // The suggestion landed on hand-set numbers, so
+                                // reveal them instead of leaving the user with
+                                // a tier they cannot inspect.
+                                if (advice.preset ==
+                                    TranslationPerformancePreset.custom) {
+                                  _translationAdvanced = true;
+                                }
+                              });
+                              widget.onChanged?.call(
+                                TranslationPerformanceConfig.settingKey,
+                              );
+                            },
+                          )
+                        : null,
+                  );
+                },
+              ),
             SelectSetting(
               title: "Pipeline mode".tl,
               // Ruling R-4: which half of the wall clock to sacrifice. Not
