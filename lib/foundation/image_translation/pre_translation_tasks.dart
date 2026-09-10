@@ -360,6 +360,40 @@ class PreTranslationActivity {
 
   int get ocrSweepPendingPages => math.max(0, ocrSweepTotal - ocrRecognizedPages);
 
+  // ---------------------------------------------------------------------
+  // Per-phase completion stamps.
+  //
+  // The card has to be able to say "识别完 37 张用了 1:12" and then *stop* —
+  // the elapsed time of a phase that is over is a fact, not a live figure, and
+  // deriving it from `now` would keep it growing after the phase ended (the
+  // defect this replaced: every row looked alive until the whole job ended).
+  //
+  // Each stamp is written once, at the first observation of that phase
+  // covering every page, by [notePhaseCompletions] — called from the manager's
+  // activity-notify path, so a background job gets the same accuracy as one
+  // being watched (no dependence on the card being built or visible).
+  // ---------------------------------------------------------------------
+
+  DateTime? recognizedDoneAt;
+  DateTime? translatedDoneAt;
+  DateTime? renderedDoneAt;
+
+  /// Records the three completion stamps. Idempotent: `??=` keeps the first
+  /// observation, so a rebuild, a re-entrant notify or a late call cannot move
+  /// a phase's finish line.
+  void notePhaseCompletions(PreTranslationTask task, DateTime now) {
+    if (task.total <= 0) return;
+    if (recognizedDoneAt == null && recognizedThrough(task) >= task.total) {
+      recognizedDoneAt = now;
+    }
+    if (translatedDoneAt == null && translatedThrough(task) >= task.total) {
+      translatedDoneAt = now;
+    }
+    if (renderedDoneAt == null && renderedThrough(task) >= task.total) {
+      renderedDoneAt = now;
+    }
+  }
+
   /// Pages settled for display: committed plus buffered. Never write this back
   /// into [PreTranslationChapter.done] — that would break the resume cursor.
   int liveDone(PreTranslationTask task) => task.done + bufferedDone;
@@ -507,6 +541,12 @@ class PreTranslationActivity {
   /// When the sweep last credited a page; lets readers notice the stream went
   /// quiet instead of quoting the last known rate forever.
   DateTime? get lastOcrSampleAt => _sweepRate.lastSampleAt;
+
+  /// When the last group committed. The card's estimate decays against it
+  /// between commits, so "预计还需" counts down every second instead of only
+  /// jumping when a batch lands (the reported defect: "已用时每秒跳，预计还需
+  /// 不动"). See [decayEta].
+  DateTime? get lastCommitSampleAt => _pipelineRate.lastSampleAt;
 
   /// Stable (wall-clock window) pages/min of answered translation requests.
   /// Null until two of them span a few seconds — use [translateRates] for what
@@ -843,6 +883,43 @@ class PhaseRates {
 /// frame rate: a tick with no event behind it still re-folds, which is exactly
 /// what makes `createdAt -> now` move. Unreadable figures are null and the card
 /// prints `—`; they are never a fabricated 0.
+/// The remaining-time projection, kept alive between commits.
+///
+/// The estimate is `remaining pages × the phase's own page time`, recomputed
+/// only when a sample lands — so with a batch gap of half a minute the number
+/// sat still while "已用时" ticked, which reads as a frozen (or hung) estimate.
+/// That was the reported defect: "预计还需不是按秒刷新的".
+///
+/// The pages counted as *remaining* include the group currently in flight,
+/// whose work is already partly done. Subtracting the time elapsed since the
+/// last sample is what makes the projection decay tick by tick and re-anchor at
+/// the next commit.
+///
+/// Pure: [now] and [lastSampleAt] come in, a Duration goes out. No anchor
+/// (nothing sampled yet) leaves the base untouched; a projection already in the
+/// past clamps to zero rather than going negative.
+Duration? decayEta(
+  Duration? base, {
+  required DateTime now,
+  DateTime? lastSampleAt,
+}) {
+  if (base == null) return null;
+  if (lastSampleAt == null) return base;
+  var spent = now.difference(lastSampleAt);
+  if (spent <= Duration.zero) return base;
+  var left = base - spent;
+  return left > Duration.zero ? left : Duration.zero;
+}
+
+/// How long a phase took, measured from the job's start; null while that phase
+/// has not finished. Clamped at zero so a clock that moved backwards cannot
+/// print a negative duration.
+Duration? phaseDoneAfter(PreTranslationTask task, DateTime? doneAt) {
+  if (doneAt == null) return null;
+  var elapsed = doneAt.difference(task.createdAt);
+  return elapsed.isNegative ? Duration.zero : elapsed;
+}
+
 class PreTranslationProgress {
   PreTranslationProgress({
     required this.running,
@@ -870,6 +947,9 @@ class PreTranslationProgress {
     required this.msPerPage,
     required this.elapsed,
     required this.eta,
+    required this.recognitionDoneAfter,
+    required this.translationDoneAfter,
+    required this.renderDoneAfter,
     required this.epName,
     required this.sessions,
     required this.arenaMb,
@@ -955,12 +1035,20 @@ class PreTranslationProgress {
       if (sweepActive) {
         var pending = activity.ocrSweepPendingPages;
         if (recRate != null && recRate > 0 && pending > 0) {
-          eta = Duration(seconds: (pending * 60 / recRate).round());
+          eta = decayEta(
+            Duration(seconds: (pending * 60 / recRate).round()),
+            now: at,
+            lastSampleAt: activity.lastOcrSampleAt,
+          );
         }
       } else {
         var remaining = math.max(0, total - processed);
         if (commitRate != null && commitRate > 0 && remaining > 0) {
-          eta = Duration(seconds: (remaining * 60 / commitRate).round());
+          eta = decayEta(
+            Duration(seconds: (remaining * 60 / commitRate).round()),
+            now: at,
+            lastSampleAt: activity.lastCommitSampleAt,
+          );
         }
       }
     }
@@ -1027,6 +1115,12 @@ class PreTranslationProgress {
           ? at.difference(task.createdAt)
           : null,
       eta: eta,
+      // How long each phase took, once it is over. These are the numbers the
+      // user reads *after* a phase ends ("识别完 37 张用了多久") and they must
+      // not move again — see [PreTranslationActivity.notePhaseCompletions].
+      recognitionDoneAfter: phaseDoneAfter(task, activity?.recognizedDoneAt),
+      translationDoneAfter: phaseDoneAfter(task, activity?.translatedDoneAt),
+      renderDoneAfter: phaseDoneAfter(task, activity?.renderedDoneAt),
       epName: workerReport?.active.name ?? batchPerf?.epName,
       sessions: workerReport?.sessionCount ?? batchPerf?.sessionCount,
       arenaMb: arenaBytes == null
@@ -1126,8 +1220,17 @@ class PreTranslationProgress {
 
   /// Remaining-time estimate for the *current* phase (sweep pages at sweep
   /// rate, otherwise unprocessed pages at commit rate); null when the rate or
-  /// the remainder is unknown.
+  /// the remainder is unknown. Decays with wall clock between commits — see
+  /// [decayEta].
   final Duration? eta;
+
+  /// How long each phase took, once it finished. Frozen at the phase's own
+  /// finish line (not at job end), so the card can print "识别: 37/37 页 · 用时
+  /// 1:12" while the translation is still running. Null while the phase is
+  /// unfinished — printed as a rate instead, or `—` when there is no rate.
+  final Duration? recognitionDoneAfter;
+  final Duration? translationDoneAfter;
+  final Duration? renderDoneAfter;
 
   /// Engine row — the arena figure is host staging memory, not VRAM (plan
   /// §3.6), which is why the label says "暂存池", never 显存.
@@ -1163,6 +1266,9 @@ class PreTranslationTaskSummary {
     this.translationMsPerPage,
     this.renderMsPerPage,
     this.msPerPage,
+    this.recognitionDoneAfterMs,
+    this.translationDoneAfterMs,
+    this.renderDoneAfterMs,
     this.epName,
     this.sessions,
     this.arenaMb,
@@ -1218,6 +1324,12 @@ class PreTranslationTaskSummary {
       renderMsPerPage:
           activity?.renderWorkRates.msPerPage ?? p.renderMsPerPage,
       msPerPage: p.msPerPage,
+      // The three phase finish times, frozen with the rates they replace: a
+      // finished card shows "识别 37/37 · 用时 1:12" forever, without needing
+      // the activity (which dies with the job) or a clock.
+      recognitionDoneAfterMs: p.recognitionDoneAfter?.inMilliseconds,
+      translationDoneAfterMs: p.translationDoneAfter?.inMilliseconds,
+      renderDoneAfterMs: p.renderDoneAfter?.inMilliseconds,
       epName: p.epName,
       sessions: p.sessions,
       arenaMb: p.arenaMb,
@@ -1260,6 +1372,13 @@ class PreTranslationTaskSummary {
 
   /// Recognition ms/page from the freshest OCR batch at capture time.
   final double? msPerPage;
+
+  /// How long each phase took, in milliseconds from the job's start, frozen at
+  /// the phase's own finish. Kept as a number so the summary rides plain JSON;
+  /// the card turns it back into the same `用时 H:MM` a live card prints.
+  final int? recognitionDoneAfterMs;
+  final int? translationDoneAfterMs;
+  final int? renderDoneAfterMs;
 
   /// Engine row as last observed (the worker may have torn down since; this
   /// is what the card showed *while* it ran, kept honest by being marked
@@ -1305,6 +1424,15 @@ class PreTranslationTaskSummary {
       msPerPage: msPerPage,
       elapsed: task.finishedAt?.difference(task.createdAt),
       eta: null,
+      recognitionDoneAfter: recognitionDoneAfterMs == null
+          ? null
+          : Duration(milliseconds: recognitionDoneAfterMs!),
+      translationDoneAfter: translationDoneAfterMs == null
+          ? null
+          : Duration(milliseconds: translationDoneAfterMs!),
+      renderDoneAfter: renderDoneAfterMs == null
+          ? null
+          : Duration(milliseconds: renderDoneAfterMs!),
       epName: epName,
       sessions: sessions,
       arenaMb: arenaMb,
@@ -1328,6 +1456,9 @@ class PreTranslationTaskSummary {
     'translationMsPerPage': translationMsPerPage,
     'renderMsPerPage': renderMsPerPage,
     'msPerPage': msPerPage,
+    'recognitionDoneAfterMs': recognitionDoneAfterMs,
+    'translationDoneAfterMs': translationDoneAfterMs,
+    'renderDoneAfterMs': renderDoneAfterMs,
     'epName': epName,
     'sessions': sessions,
     'arenaMb': arenaMb,
@@ -1356,6 +1487,9 @@ class PreTranslationTaskSummary {
       translationMsPerPage: (json['translationMsPerPage'] as num?)?.toDouble(),
       renderMsPerPage: (json['renderMsPerPage'] as num?)?.toDouble(),
       msPerPage: (json['msPerPage'] as num?)?.toDouble(),
+      recognitionDoneAfterMs: (json['recognitionDoneAfterMs'] as num?)?.toInt(),
+      translationDoneAfterMs: (json['translationDoneAfterMs'] as num?)?.toInt(),
+      renderDoneAfterMs: (json['renderDoneAfterMs'] as num?)?.toInt(),
       epName: json['epName']?.toString(),
       sessions: (json['sessions'] as num?)?.toInt(),
       arenaMb: (json['arenaMb'] as num?)?.toDouble(),
@@ -1614,6 +1748,13 @@ class PreTranslationTaskManager with ChangeNotifier {
   /// any wiring.
   void _notifyActivity() {
     var now = DateTime.now();
+    // Phase finish lines are stamped here, not in the card's build: every
+    // activity change passes through this method, so a job running in the
+    // background records the same times a watched one does (a stamp taken from
+    // the build path would only exist while the user is looking at the card).
+    for (var task in currentTasks) {
+      _activities[task.id]?.notePhaseCompletions(task, now);
+    }
     var window = PreTranslationRefresh.intervalFrom(
       appdata.implicitData[PreTranslationRefresh.settingKey],
     );
@@ -1964,6 +2105,9 @@ class PreTranslationTaskManager with ChangeNotifier {
       // no new storage. (A job that never got an activity — started, died in
       // `_resolvePageKeys` — still gets a counts-only summary, which is what
       // the committed data can honestly say.)
+      // Last chance to stamp a phase that finished with the job itself: the
+      // loop's final notify can land after the last page was counted.
+      _activities[task.id]?.notePhaseCompletions(task, DateTime.now());
       task.finalSummary = PreTranslationTaskSummary.capture(
         PreTranslationProgress.of(task, activity: _activities[task.id]),
         activity: _activities[task.id],

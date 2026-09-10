@@ -764,44 +764,31 @@ class _TasksPageState extends State<TasksPage>
     ].join(' · ');
   }
 
-  /// One "phase — done/total — own rate — own cost" line for the pre-translation
-  /// card. All three rows go through this one function, so their labels, units,
+  /// One "phase — done/total — figure" line for the pre-translation card.
+  ///
+  /// All three rows go through this one function, so their labels, units,
   /// separators and `—` placeholders cannot drift apart (plan 12-D).
   ///
-  /// Each row carries **its own stream's** figures: pages/min from that phase's
-  /// window, the sample count that rate rests on (plan 12-C — one finished
-  /// batch already is a rate, and the card says how little data it took rather
-  /// than hiding it or pretending it took more), and ms/page from that phase's
-  /// own measurement (plan 12-B: the OCR worker's structured batch perf for
-  /// recognition, the service's structured GroupPerf value object for the two
-  /// stage-2 phases).
-  ///
-  /// The row's two per-page figures are labelled by the quantity they measure,
-  /// so they can no longer read as a contradiction:
-  ///
-  ///  * `@s s/page throughput` is the row's wall-clock pace — the reciprocal of
-  ///    the pages/min printed beside it, pre-computed in the data layer, so the
-  ///    pair is consistent by construction;
-  ///  * `@ms ms/page in group` is that phase's **service time per page**: the
-  ///    mean time one group / OCR batch / request spent on a page it carried.
-  ///    Concurrent groups overlap, so it is ≈ concurrency × the wall-clock page
-  ///    time. A four-group run really did show `16.8 页/分钟` (= 3.6 s/page)
-  ///    next to `平均每页 15727 毫秒`, and both numbers were right about
-  ///    different things — only the label was wrong.
+  /// The figure shown is the one that answers the reader's question at that
+  /// moment:
+  ///  * while the phase runs, its own stream's pace in pages/min;
+  ///  * once the phase is over, **how long it took** (`用时 1:12`) — frozen,
+  ///    because a finished phase's duration is a fact. Deriving it from `now`
+  ///    kept every row looking alive until the whole job ended;
+  ///  * `—` when neither exists — never a borrowed rate, never a 0.
   ///
   /// Nothing here parses, reads a clock or computes: every value is pre-derived
-  /// in [PreTranslationProgress] (including the throughput reciprocal), and an
-  /// unmeasured one prints `—` — a 0 would claim the phase is doing nothing,
-  /// which was never measured (project rule: unreadable is N/A, never a fake 0).
+  /// in [PreTranslationProgress]. The sample counts, per-page throughput and
+  /// in-group service times that used to ride along here were telemetry, not
+  /// the reader's question ("这个阶段还要多久 / 用了多久"), and are gone — the
+  /// same numbers stay in the log lines the diagnostics paste.
   Widget _phaseLine({
     required String labelKey,
     required int done,
     required int total,
     required bool active,
     required double? ratePagesPerMinute,
-    int? samples,
-    double? msPerPage,
-    double? secondsPerPage,
+    Duration? doneAfter,
   }) {
     final style = active
         ? ts.s14.copyWith(
@@ -810,24 +797,17 @@ class _TasksPageState extends State<TasksPage>
           )
         : ts.s14.withColor(context.colorScheme.outline);
     final parts = <String>[
-      if (ratePagesPerMinute == null)
-        // Not one sample yet. `—`, never `0 页/分`.
-        '—'
-      else if (samples != null && samples > 0)
-        "@rate pages/min · @samples samples".tlParams({
-          'rate': ratePagesPerMinute.toStringAsFixed(1),
-          'samples': '$samples',
-        })
-      else
+      if (doneAfter != null)
+        // The same wording the finished card already uses for "how long did
+        // this take" — no new string, and no new translation to drift.
+        'Elapsed @elapsed'.tlParams({'elapsed': formatTaskDuration(doneAfter)})
+      else if (ratePagesPerMinute != null)
         "@rate pages/min".tlParams({
           'rate': ratePagesPerMinute.toStringAsFixed(1),
-        }),
-      if (secondsPerPage != null && secondsPerPage > 0)
-        "@s s/page throughput".tlParams({
-          's': formatSecondsPerPage(secondsPerPage),
-        }),
-      if (msPerPage != null && msPerPage > 0)
-        "@ms ms/page in group".tlParams({'ms': msPerPage.round().toString()}),
+        })
+      else
+        // Not one sample yet. `—`, never `0 页/分`.
+        '—',
     ];
     return Row(
       children: [
@@ -880,8 +860,6 @@ class _TasksPageState extends State<TasksPage>
         ? PreTranslationProgress.of(task, activity: activity)
         : task.finalSummary?.toProgress(task) ??
             PreTranslationProgress.snapshot(task);
-    final dash = '—';
-    final batch = progressView.batch;
     var progressText = task.total == 0
         ? "0%"
         : "${(progress * 100).clamp(0, 100).toStringAsFixed(0)}%";
@@ -992,10 +970,7 @@ class _TasksPageState extends State<TasksPage>
                   total: task.total,
                   active: progressView.focusRecognizing,
                   ratePagesPerMinute: progressView.recognitionRatePerMinute,
-                  samples: progressView.recognitionSamples,
-                  secondsPerPage: progressView.recognitionSecondsPerPage,
-                  // Recognition is the one phase the worker measures per page.
-                  msPerPage: progressView.msPerPage,
+                  doneAfter: progressView.recognitionDoneAfter,
                 ),
                 const SizedBox(height: 2),
                 _phaseLine(
@@ -1004,12 +979,7 @@ class _TasksPageState extends State<TasksPage>
                   total: task.total,
                   active: progressView.focusTranslating,
                   ratePagesPerMinute: progressView.translationRatePerMinute,
-                  samples: progressView.translationSamples,
-                  secondsPerPage: progressView.translationSecondsPerPage,
-                  // From the shared request's own measured wall time, reported
-                  // as a structured GroupPerf by the service (plan 12-B) — the
-                  // service time inside one request, not the job's pace.
-                  msPerPage: progressView.translationMsPerPage,
+                  doneAfter: progressView.translationDoneAfter,
                 ),
                 const SizedBox(height: 2),
                 _phaseLine(
@@ -1018,9 +988,7 @@ class _TasksPageState extends State<TasksPage>
                   total: task.total,
                   active: progressView.focusRendering,
                   ratePagesPerMinute: progressView.commitRatePerMinute,
-                  samples: progressView.commitSamples,
-                  secondsPerPage: progressView.commitSecondsPerPage,
-                  msPerPage: progressView.renderMsPerPage,
+                  doneAfter: progressView.renderDoneAfter,
                 ),
                 // Without this note a live "Recognized 8/82" beside a static
                 // "Pages 0/82" reads as a contradiction; the sweep number is
@@ -1034,13 +1002,9 @@ class _TasksPageState extends State<TasksPage>
                   ),
                 ],
               ],
-              // Live telemetry, small-print, each row gated on its own data
-              // so a finished card keeps the figures it has and drops the
-              // ones that died with the worker window. Null figures print —
-              // (unreadable is N/A, never a fake 0). The old single
-              // "Throughput:" line is gone: its one number was borrowed from
-              // whichever stream was last sampled, which is what the three
-              // per-phase rates above replace.
+              // The job clock. For a live job the ETA decays with wall clock
+              // between commits ([decayEta]), so this row visibly counts down
+              // instead of only moving when a batch lands.
               if (progressView.elapsed != null) ...[
                 const SizedBox(height: 4),
                 Text(
@@ -1058,38 +1022,13 @@ class _TasksPageState extends State<TasksPage>
                 ),
                 const SizedBox(height: 2),
               ],
-              if (batch != null) ...[
-                Text(
-                  "Batch: @pages pages · det @det · rec @rec · crops @crops · lines @lines"
-                      .tlParams({
-                    'pages': batch.pages.toString(),
-                    'det': batch.detBatchCap.toString(),
-                    'rec': batch.recBatchCap.toString(),
-                    'crops': batch.recCrops.toString(),
-                    'lines': batch.decRows.toString(),
-                  }),
-                  style: ts.s12.withColor(context.colorScheme.outline),
-                ),
-                const SizedBox(height: 2),
-              ],
-              if (isLive ||
-                  progressView.epName != null ||
-                  progressView.sessions != null ||
-                  progressView.arenaMb != null ||
-                  progressView.degradedLabel != null) ...[
-                Text(
-                  "Engine: @ep · sessions @sessions · arena @arena MB · degraded @degraded"
-                      .tlParams({
-                    'ep': progressView.epName?.toUpperCase() ?? dash,
-                    'sessions': progressView.sessions?.toString() ?? dash,
-                    'arena': progressView.arenaMb == null
-                        ? dash
-                        : progressView.arenaMb!.toStringAsFixed(1),
-                    'degraded': progressView.degradedLabel ?? dash,
-                  }),
-                  style: ts.s12.withColor(context.colorScheme.outline),
-                ),
-              ],
+              // The batch caps / crop counts / text-line count and the engine
+              // row (backend, live sessions, staging arena, degradation) used
+              // to sit here. They are diagnostics for whoever reads the log,
+              // not information a reader of a comic can act on, and they made
+              // the card look like a console — removed on the user's request.
+              // The same numbers are still emitted by the pipeline logs
+              // (`OcrBatchPerf`, `GroupPerf`, the EP report).
               if (failedPages > 0) ...[
                 const SizedBox(height: 2),
                 Text(

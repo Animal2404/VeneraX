@@ -477,7 +477,7 @@ class _ReaderScaffoldState extends State<_ReaderScaffold> {
         config: TranslationConfig.of(reader.cid, reader.type.sourceKey),
       );
       if (!mounted) return;
-      context.showMessage(message: _describeSaveOutcome(outcome));
+      context.showMessage(message: describeSaveOutcome(outcome));
     } catch (e, s) {
       Log.error('TranslatedLibrary', 'saving the chapter failed: $e', s);
       if (mounted) {
@@ -486,29 +486,6 @@ class _ReaderScaffoldState extends State<_ReaderScaffold> {
     } finally {
       if (mounted) setState(() => _savingChapter = false);
     }
-  }
-
-  /// What to tell the user after a save: how much of it is translation, how much
-  /// is the original art, and whether anything was lost.
-  static String _describeSaveOutcome(SaveChapterOutcome outcome) {
-    if (!outcome.ok) {
-      return outcome.failures.isEmpty
-          ? 'Nothing to save yet: translate this chapter first'.tl
-          : 'Nothing was saved: @reason'.tlParams({
-              'reason': outcome.failures.first,
-            });
-    }
-    var text = 'Saved @pages pages (@translated translated, @original original)'
-        .tlParams({
-          'pages': outcome.saved,
-          'translated': outcome.translated,
-          'original': outcome.originalNoText + outcome.originalUntranslated,
-        });
-    if (outcome.failed > 0) {
-      text =
-          '$text · ${'@count failed'.tlParams({'count': outcome.failed})}';
-    }
-    return text;
   }
 
   void _retryTranslation(String cacheKey, InpaintMode mode) {

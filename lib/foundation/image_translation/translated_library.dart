@@ -601,6 +601,32 @@ List<SavedChapter> orderSavedChapters(List<SavedChapter> chapters) {
   return [for (final entry in indexed) entry.chapter];
 }
 
+/// What to tell the user after a save: how much of it is translation, how much
+/// is the original art, and whether anything was lost.
+///
+/// Lives here, next to the outcome it describes, so the reader's save button and
+/// the library page's per-chapter save cannot drift into two different
+/// sentences about the same result.
+String describeSaveOutcome(SaveChapterOutcome outcome) {
+  if (!outcome.ok) {
+    return outcome.failures.isEmpty
+        ? 'Nothing to save yet: translate this chapter first'.tl
+        : 'Nothing was saved: @reason'.tlParams({
+            'reason': outcome.failures.first,
+          });
+  }
+  var text = 'Saved @pages pages (@translated translated, @original original)'
+      .tlParams({
+        'pages': outcome.saved,
+        'translated': outcome.translated,
+        'original': outcome.originalNoText + outcome.originalUntranslated,
+      });
+  if (outcome.failed > 0) {
+    text = '$text · ${'@count failed'.tlParams({'count': outcome.failed})}';
+  }
+  return text;
+}
+
 /// Staging area for "save the chapter I am reading / I translated" (plan §15).
 ///
 /// The library is a plain directory of manifests — there is no database, so
@@ -877,6 +903,83 @@ class TranslatedLibrary with ChangeNotifier {
     );
     Log.info('TranslatedLibrary', 'chapter $chapterId ${outcome.describe()}');
     return outcome;
+  }
+
+  /// The chapter's page keys in reading order, resolved exactly the way the
+  /// pre-translation sweep resolves them: from the local library when the
+  /// chapter is downloaded, otherwise from the comic source.
+  ///
+  /// The library page needs this because a chapter can be fully translated —
+  /// the user read it, the store holds its pages — without the page keys ever
+  /// being in hand on a screen that offers "save".
+  Future<List<String>> resolveChapterPageKeys({
+    required String comicId,
+    required String? sourceKey,
+    required String chapterId,
+    ComicType? comicType,
+  }) async {
+    final canonicalSourceKey =
+        sourceKey ?? SourcePlatformResolver.localCanonicalKey;
+    final type = comicType ?? ComicType.fromKey(canonicalSourceKey);
+    final manager = LocalManager();
+    if (manager.isInitialized &&
+        manager.isDownloaded(comicId, type, chapterId == '0' ? 0 : null)) {
+      return await manager.getImages(
+        comicId,
+        type,
+        chapterId == '0' ? 0 : chapterId,
+      );
+    }
+    final source = ComicSource.find(canonicalSourceKey);
+    final loader = source?.loadComicPages;
+    if (loader == null) {
+      throw StateError('Comic source not found');
+    }
+    final res = await loader(comicId, chapterId == '0' ? null : chapterId);
+    if (res.error) {
+      throw StateError(res.errorMessage ?? 'Failed to load pages');
+    }
+    return res.data;
+  }
+
+  /// Saves a chapter whose page list is not in hand: resolves the keys first,
+  /// then runs the same [saveChapter] the reader uses.
+  Future<SaveChapterOutcome> saveChapterFromSource({
+    required String comicId,
+    required String? sourceKey,
+    required String chapterId,
+    required String comicTitle,
+    required String chapterTitle,
+    required TranslationConfig config,
+    ComicType? comicType,
+    void Function(int done, int total)? onProgress,
+  }) async {
+    final pageKeys = await resolveChapterPageKeys(
+      comicId: comicId,
+      sourceKey: sourceKey,
+      chapterId: chapterId,
+      comicType: comicType,
+    );
+    if (pageKeys.isEmpty) {
+      return SaveChapterOutcome(
+        comicDirectory: '',
+        chapterDirectory: '',
+        translated: 0,
+        originalNoText: 0,
+        originalUntranslated: 0,
+        failures: const ['chapter has no pages'],
+      );
+    }
+    return saveChapter(
+      comicId: comicId,
+      sourceKey: sourceKey,
+      chapterId: chapterId,
+      comicTitle: comicTitle,
+      chapterTitle: chapterTitle,
+      pageKeys: pageKeys,
+      config: config,
+      onProgress: onProgress,
+    );
   }
 
   /// Deletes one chapter folder and its manifest entry. The translated pages
