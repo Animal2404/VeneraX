@@ -3557,6 +3557,8 @@ class OcrInkGap {
     required this.inkRatio,
     required this.runPx,
     required this.backgroundLuma,
+    this.first,
+    this.second,
   });
 
   final int gapWidth;
@@ -3565,10 +3567,22 @@ class OcrInkGap {
   final int runPx;
   final double backgroundLuma;
 
+  /// The two boxes the strip was measured between, in image px, as
+  /// `(left,top)-(right,bottom)`. Carried out of the isolate so the next log
+  /// says *which* pair a verdict belongs to: a bare `ink=0.73` cannot be
+  /// matched to the bubbles in a screenshot, and "which pair fused" is exactly
+  /// the question a fused page asks. Null in the fixtures that construct this
+  /// value by hand.
+  final IntRect? first;
+  final IntRect? second;
+
+  String _box(IntRect? r) =>
+      r == null ? '?' : '${r.left},${r.top}-${r.right},${r.bottom}';
+
   @override
   String toString() => 'gap=${gapWidth}x$gapHeight '
       'ink=${inkRatio.toStringAsFixed(2)} run=${runPx}px '
-      'bg=${backgroundLuma.round()}';
+      'bg=${backgroundLuma.round()} a=[${_box(first)}] b=[${_box(second)}]';
 }
 
 /// The verdict of one ink audit: whether the strip is a bubble boundary (and
@@ -3815,6 +3829,8 @@ OcrInkVerdict _inkGap(RgbaImage image, IntRect a, IntRect b, _InkAxis axis) {
     inkRatio: inkRatio,
     runPx: shortestRun,
     backgroundLuma: meanLuma,
+    first: a,
+    second: b,
   );
   return OcrInkVerdict(inkRatio < inkColumnShare, gap);
 }
