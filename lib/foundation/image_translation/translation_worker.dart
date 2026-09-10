@@ -1262,6 +1262,10 @@ List<int> ocrCropSelection({required int clusterCount, required int limit}) {
 /// workItems  == blocks + tooShort + implausible + empty + untried
 /// ```
 ///
+/// The `passB={…}` group is not part of that ledger: it counts *attempts* at
+/// the second engine, and a cluster can be attempted twice while still being
+/// tallied once above. See [passBPart].
+///
 /// Those four lines are why this class exists: every one of them was a
 /// silent `continue` before, and a page that lost 90% of its text looked the
 /// same in the log whether the detector, the crop budget or the plausibility
@@ -1319,6 +1323,47 @@ class OcrPageFunnel {
   int empty = 0;
   int untried = 0;
 
+  // --- the second-engine retry (Pass B), reported under `passB={…}` ---------
+  //
+  // Deliberately outside the identities above: those count a cluster's *final
+  // state* once, while these count *attempts*, and a cluster may be attempted
+  // twice and still be tallied once. They exist because the route they describe
+  // was broken in a way no final-state counter can show: clusters the Japanese
+  // decoder failed on were re-queued to that same decoder, so the page looked
+  // like "the gate said no" when the truth was "recognition was never asked".
+  //
+  // Auto source language only. With an explicit language there is no second
+  // engine to fall back to, so every field stays 0 — and see [passBPart]: a
+  // group of zeroes is not printed, because "the fallback rescued nothing" and
+  // "there was no fallback to run" must not read the same.
+
+  /// Clusters the Japanese decoder attempted in **Pass A** and brought back
+  /// unusable — [OcrPassBPlan.jaRejected], counted at the moment the route was
+  /// decided. Read it as "how many clusters owed a recognition retry". A
+  /// cluster whose *fallback* ja attempt failed is not in here (no route was
+  /// owed after it); it is a `jaFallback` with no matching `jaFallbackSaved`.
+  int jaRejected = 0;
+
+  /// Of those, how many reached the fallback recognition engine. Equals
+  /// [jaRejected] whenever a recognition model is loaded, and 0 when none is —
+  /// which is the difference between "recognition failed them too" and
+  /// "recognition was never asked", the very ambiguity this fix removed.
+  int recFallback = 0;
+
+  /// Of those, how many came back readable — the yield of the fallback, and
+  /// the number that says what the fix bought on this page.
+  int recFallbackSaved = 0;
+
+  /// Clusters a recognition engine rejected (or never cropped for at all) that
+  /// went to the Japanese decoder instead. This direction already worked before
+  /// the route was fixed; it is reported so `recFallbackSaved` has a control to
+  /// be compared against, and so a page whose *only* rescue came from ja says
+  /// so.
+  int jaFallback = 0;
+
+  /// Of those, how many came back readable.
+  int jaFallbackSaved = 0;
+
   /// `droppedByDet` on the line: everything the detector or the tile stitch
   /// discarded, before clustering ever saw it.
   int get droppedByDet => det.droppedAll;
@@ -1349,6 +1394,25 @@ class OcrPageFunnel {
       empty +
       untried;
 
+  /// The Pass B group, or `''` when the second-engine retry did not run at all.
+  ///
+  /// A nested `{…}` group like `det={…}`, so a page whose fallback never fired
+  /// costs nothing on the line and stays under `Log.maxLogLength`, and so
+  /// `grep 'passB={' logs.txt` returns exactly the pages where a second engine
+  /// was asked. The keys name the fields, one to one, so a number here can be
+  /// chased back to what incremented it without a legend.
+  String passBPart() {
+    final total = jaRejected +
+        recFallback +
+        recFallbackSaved +
+        jaFallback +
+        jaFallbackSaved;
+    if (total == 0) return '';
+    return ' passB={jaRejected=$jaRejected recFallback=$recFallback'
+        ' recFallbackSaved=$recFallbackSaved jaFallback=$jaFallback'
+        ' jaFallbackSaved=$jaFallbackSaved}';
+  }
+
   /// The developer-log body for this page. One line, `key=value` throughout,
   /// so it survives being reworded less than prose would; grep it with
   /// `OcrFunnel`.
@@ -1362,6 +1426,7 @@ class OcrPageFunnel {
         ' workItems=$workItems tooShort=$tooShort'
         ' implausible=$implausible empty=$empty untried=$untried'
         ' recLinesDropped=$recLinesDropped blocks=$blocks'
+        '${passBPart()}'
         '${droppedByCropLimit > 0 && cut != null ? ' cutAtPct=$cut' : ''}';
   }
 
@@ -1437,6 +1502,133 @@ List<String> loadCharset(String dictPath, {int? expectedClasses}) {
   return (count: lostLines, tallied: true);
 }
 
+/// Where Pass B sends each cluster that came back without usable text, and how
+/// many of them the Japanese decoder rejected.
+///
+/// Produced by [planPassBFallback]. The worker turns the index lists back into
+/// work items and the counts into [OcrPageFunnel] fields; nothing else reads
+/// this class.
+class OcrPassBPlan {
+  const OcrPassBPlan({
+    required this.ja,
+    required this.rec,
+    required this.jaRejected,
+    required this.stayed,
+  });
+
+  /// Clusters to hand to the Japanese (manga OCR) decoder: the ones it has
+  /// **not** attempted yet — a recognition engine rejected them, or no crop
+  /// was ever sent (its engine had no model, or every line was under the 8 px
+  /// recognition floor). The same population as before the route was fixed.
+  final List<int> ja;
+
+  /// Clusters to hand to the fallback recognition engine: the ones the
+  /// Japanese decoder attempted and brought back unusable. This queue was
+  /// unreachable while the route read [_ClusterWork.engine], which names the
+  /// engine that *succeeded* and is empty for exactly these clusters.
+  final List<int> rec;
+
+  /// Every cluster the Japanese decoder attempted and rejected, whether or not
+  /// a fallback engine exists to rescue it. [rec] is this list when one does,
+  /// and empty when none does — the denominator the funnel's `recFallback` and
+  /// `recFallbackSaved` are read against.
+  final List<int> jaRejected;
+
+  /// Clusters that go nowhere: already readable, or with no engine left to
+  /// try. Kept as a number so `ja.length + rec.length + stayed` equals the
+  /// input count — the check that makes "a cluster vanished without being
+  /// routed" fail a test instead of eating a page of text.
+  final int stayed;
+
+  bool get isEmpty => ja.isEmpty && rec.isEmpty;
+}
+
+/// The Pass B route for one batch of clusters, as a pure decision.
+///
+/// [attemptedWith] is [_ClusterWork.attemptedWith] per cluster: the engine that
+/// actually received its crop (`''` when none did). [plausible] is
+/// [_ClusterWork.isPlausible]. Both describe the state *after Pass A*, which is
+/// what the queues are built from. [hasJa] is "a Japanese model is loaded",
+/// [fallbackRec] the recognition engine to fall back to, or `null` when no
+/// recognition model exists (or the only one is the Japanese decoder itself,
+/// which would be a second decode of the same kind).
+///
+/// The rule, in words: **an engine never sees a cluster twice, and the chain
+/// runs one way, ja → rec.**
+///
+///  * usable text → stays put. A cluster the Japanese decoder accepted must not
+///    re-enter Pass B: that is the double-decode and double-count guard.
+///  * rejected by `ja` → [fallbackRec]. This is the fix. Under the previous
+///    route (`item.engine == 'ja'`) this branch never fired, so vertical or
+///    kana-poor text killed by the plausibility gate was re-decoded by the very
+///    engine that had just failed on it and never once by the engine that could
+///    read it — the user-visible "the bubble has text, nothing was translated".
+///  * rejected by a recognition engine, or never attempted → the Japanese
+///    decoder, exactly as before, because it is the one engine that has not
+///    seen the cluster.
+///  * attempted by both engines already → nothing. This is the ping-pong the
+///    route must not create: a cluster that came back unusable from `rec` after
+///    `ja` had already failed on it does not go *back* to `ja`.
+///
+/// A pure function, and the only reason it is one: the routing sits behind two
+/// ONNX calls in a worker isolate no test can start (R3 — no isolate, no
+/// session, no GPU). Its inputs are strings and booleans, so all four rules
+/// above are locked by `test/ocr_pass_b_fallback_test.dart` without a model.
+///
+/// It changes no threshold: the gate that produces `plausible` is
+/// [ocrPlausibility], and this function only reads its verdict.
+OcrPassBPlan planPassBFallback({
+  required List<String> attemptedWith,
+  required List<bool> plausible,
+  required bool hasJa,
+  required String? fallbackRec,
+}) {
+  assert(
+    attemptedWith.length == plausible.length,
+    'one verdict per attempt record',
+  );
+  final toJa = <int>[];
+  final toRec = <int>[];
+  final rejectedByJa = <int>[];
+  var stayed = 0;
+  // A "recognition" engine that is the Japanese decoder under another name is
+  // no fallback at all: `executeMultiEngineBatch` dispatches on the name, so
+  // sending these there would be the second identical decode this fix exists to
+  // remove. Treated as "no fallback engine exists".
+  final canFallBack = fallbackRec != null && fallbackRec != 'ja';
+  for (var i = 0; i < attemptedWith.length; i++) {
+    if (plausible[i]) {
+      // Readable already: Pass B has nothing to add, and a second decode
+      // would rewrite the same text a second time.
+      stayed++;
+      continue;
+    }
+    if (attemptedWith[i] == 'ja') {
+      rejectedByJa.add(i);
+      if (canFallBack) {
+        toRec.add(i);
+      } else {
+        // No recognition model to fall back to. The old route put these in the
+        // ja queue and decoded them a second time; there is nothing to gain
+        // from that, so they stay and are tallied by their ja verdict.
+        stayed++;
+      }
+      continue;
+    }
+    if (hasJa) {
+      toJa.add(i);
+    } else {
+      stayed++;
+    }
+  }
+  return OcrPassBPlan(
+    ja: toJa,
+    rec: toRec,
+    jaRejected: rejectedByJa,
+    stayed: stayed,
+  );
+}
+
 class _ClusterWork {
   _ClusterWork({
     this.pageIndex = 0,
@@ -1460,16 +1652,29 @@ class _ClusterWork {
 
   String text = '';
   String lang = '';
+
+  /// The engine whose output ended up in [text] — the engine that *succeeded*.
+  /// Still deliberately not written on the reject path, and now also harmless
+  /// either way: Pass B routes on [attemptedWith], so this field can no longer
+  /// move a cluster between the two fallback queues.
   String engine = '';
   bool isPlausible = false;
 
+  /// The engine that actually received this cluster's crop, whether or not it
+  /// read anything usable out of it. `''` until a crop reaches one: a cluster
+  /// whose engine had no model, or every line of whose box sat under the 8 px
+  /// recognition floor, has not been attempted by anybody.
+  ///
+  /// This is the record Pass B routes on, and the reason it is a field of its
+  /// own. [engine] names a success, so for exactly the clusters Pass B exists
+  /// to rescue — attempted, then rejected — it is empty, and the route that
+  /// read it (`item.engine == 'ja'`) was false for every one of them. See
+  /// [planPassBFallback] for the rule and
+  /// `test/ocr_pass_b_fallback_test.dart` for the sweep that keeps this from
+  /// being routed off again by accident.
+  String attemptedWith = '';
+
   // --- observability only (F13.5); never read by any decision --------------
-  //
-  // `engine` is deliberately NOT set on the reject path: Pass B routes on
-  // `item.engine == 'ja'`, so recording which engine produced a rejection by
-  // writing to that field would silently move items between the two fallback
-  // queues and change which model a cluster is re-recognized with. The
-  // verdict therefore gets its own field.
   //
   // A `null` means "no crop was ever sent" (no model for the engine, or every
   // line of the cluster under the 8 px recognition floor) and is tallied as
@@ -2233,7 +2438,12 @@ class _WorkerState {
             // The whole cluster went to the decoder, so this attempt is
             // always a real attempt — and the verdict of the *last* one wins
             // (a Pass B retry replaces the Pass A reason, never adds to it).
+            // The attempt is recorded on its own field, whichever way the
+            // verdict goes: it is what Pass B routes on, and a rejection that
+            // left no trace of *who* rejected it is what made the recognition
+            // fallback unreachable.
             final verdict = ocrPlausibility(raw);
+            t.attemptedWith = 'ja';
             t.reject = verdict;
             if (verdict == OcrReject.none) {
               t.text = raw;
@@ -2305,7 +2515,12 @@ class _WorkerState {
 
           for (var i = 0; i < targets.length; i++) {
             final t = targets[i];
+            // A cluster that contributed no crop over the 8 px floor was not
+            // attempted, so it keeps the attempt record it had — which is the
+            // difference between "the gate killed it" and "no gate ever saw
+            // it", on the line and in the route alike.
             if (!sentToRec[i]) continue;
+            t.attemptedWith = engine;
             final raw = clusterParts[i].join(' ').trim();
             final verdict = ocrPlausibility(raw);
             t.reject = verdict;
@@ -2332,27 +2547,67 @@ class _WorkerState {
         executeMultiEngineBatch(targets, group.engine, req.paths, effectiveProfile);
       }
 
-      // Pass B: For un-plausible items in auto mode, try fallback engine
+      // Pass B: in auto mode, give every cluster that came back without usable
+      // text exactly one attempt by the engine that has *not* seen it yet.
+      //
+      // The route is decided from the attempt record (`attemptedWith`), never
+      // from `engine`: `engine` names the engine that produced *readable* text
+      // and is deliberately empty on a rejection, so the route this replaces —
+      // `item.engine == 'ja'` — was false for every cluster a Japanese decoder
+      // had just failed on. Those clusters went back into the ja queue (a
+      // second full-cluster decode of byte-identical input) and the recognition
+      // queue below was never filled at all. That is the "the bubble has text
+      // and nothing was translated" the funnel cannot see from space: the text
+      // was read twice by the engine that could not read it, and once less by
+      // the one that could. See [planPassBFallback].
       if (req.sourceLang == 'auto') {
-        final passBJa = <_ClusterWork>[];
-        final passBRec = <_ClusterWork>[];
-        final defaultRec = recLangs.isNotEmpty ? recLangs.first : 'zh';
+        // `null` rather than the old `'zh'` placeholder when no recognition
+        // model is loaded: the placeholder produced an engine group that
+        // decoded nothing and was counted in `rec={groups:…}` all the same.
+        final fallbackRec = recLangs.isNotEmpty ? recLangs.first : null;
+        final plan = planPassBFallback(
+          attemptedWith: [for (var it in workItems) it.attemptedWith],
+          plausible: [for (var it in workItems) it.isPlausible],
+          hasJa: hasJa,
+          fallbackRec: fallbackRec,
+        );
+        final passBJa = [for (final i in plan.ja) workItems[i]];
+        final passBRec = [for (final i in plan.rec) workItems[i]];
 
-        for (var item in workItems) {
-          if (!item.isPlausible) {
-            if (item.engine == 'ja') {
-              passBRec.add(item);
-            } else if (hasJa) {
-              passBJa.add(item);
-            }
-          }
+        // The fallback is only worth having if the line says what it bought.
+        // These are counted *before* the retry runs, because the retry is what
+        // changes the verdicts: `jaRejected` is how many clusters the Japanese
+        // decoder failed on, `recFallback` how many of those reached
+        // recognition, `recFallbackSaved` how many of those came back readable.
+        for (final i in plan.jaRejected) {
+          funnels[workItems[i].pageIndex]?.jaRejected += 1;
+        }
+        for (final t in passBRec) {
+          funnels[t.pageIndex]?.recFallback += 1;
+        }
+        for (final t in passBJa) {
+          funnels[t.pageIndex]?.jaFallback += 1;
         }
 
         if (passBJa.isNotEmpty) {
           executeMultiEngineBatch(passBJa, 'ja', req.paths, effectiveProfile);
+          for (final t in passBJa) {
+            if (t.isPlausible) funnels[t.pageIndex]?.jaFallbackSaved += 1;
+          }
         }
         if (passBRec.isNotEmpty) {
-          executeMultiEngineBatch(passBRec, defaultRec, req.paths, effectiveProfile);
+          // `passBRec` is non-empty only when a fallback engine exists (the
+          // planner leaves the cluster in `stayed` otherwise), so this never
+          // unwraps null.
+          executeMultiEngineBatch(
+            passBRec,
+            fallbackRec!,
+            req.paths,
+            effectiveProfile,
+          );
+          for (final t in passBRec) {
+            if (t.isPlausible) funnels[t.pageIndex]?.recFallbackSaved += 1;
+          }
         }
       }
       recSw.stop();
