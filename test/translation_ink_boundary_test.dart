@@ -1,6 +1,7 @@
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:venera/foundation/appdata.dart';
 import 'package:venera/foundation/image_translation/translation_performance_config.dart';
 import 'package:venera/foundation/image_translation/translation_types.dart';
 import 'package:venera/foundation/image_translation/translation_worker.dart';
@@ -263,6 +264,136 @@ void main() {
       expect(trace.details.length, OcrInkTrace.maxDetails);
       expect(trace.line(), contains('more]'));
       expect(takeOcrInkTrace(3), isNull, reason: 'read once');
+    });
+  });
+
+  group('side-by-side pairs: the layout vertical text actually presents', () {
+    // Two columns of vertical text, 20 px wide and 120 px tall, 20 px apart —
+    // the geometry of two neighbouring bubbles on a page whose text runs
+    // vertically. Short side = 20 px, so the "thin run" ceiling is
+    // 0.6 × 20 = 12 px, and the gap band is x ∈ [40,60), y ∈ [20,140).
+    final leftColumn = IntRect(20, 20, 40, 140);
+    final rightColumn = IntRect(60, 20, 80, 140);
+
+    test('fixture ⑤: a thin vertical outline across the band ⇒ refuse', () {
+      final image = page(255);
+      paint(image, 48, 0, 50, 200, 0);
+
+      final verdict = ocrInkGapSide(image, leftColumn, rightColumn);
+
+      expect(verdict.allow, isFalse);
+      final gap = verdict.gap!;
+      expect(gap.gapWidth, 20, reason: 'the band is 20 px wide');
+      expect(gap.gapHeight, 120, reason: 'the two columns overlap for 120 px');
+      expect(gap.inkRatio, 1.0);
+      expect(gap.runPx, 2);
+    });
+
+    test('fixture ⑥: a blank band (two columns of one bubble) ⇒ allow', () {
+      final verdict = ocrInkGapSide(page(255), leftColumn, rightColumn);
+
+      expect(verdict.allow, isTrue);
+      expect(verdict.gap!.inkRatio, 0.0);
+    });
+
+    test('fixture ⑦: a wide dark mass ⇒ allow, never read as an outline', () {
+      final image = page(255);
+      // 16 px wide, over the 0.6 × 20 = 12 px ceiling: a mass, not a stroke.
+      paint(image, 44, 0, 60, 200, 0);
+
+      final verdict = ocrInkGapSide(image, leftColumn, rightColumn);
+
+      expect(verdict.allow, isTrue);
+      expect(verdict.gap!.runPx, 0);
+    });
+
+    test('fixture ⑧: a black page ⇒ allow, no bright pixel on either side', () {
+      final verdict = ocrInkGapSide(page(0), leftColumn, rightColumn);
+
+      expect(verdict.allow, isTrue);
+      expect(verdict.gap!.runPx, 0);
+    });
+
+    test('pairs with no band between them are allowed and never throw', () {
+      // Touching side by side.
+      expect(
+        ocrInkGapSide(
+          page(255),
+          IntRect(20, 20, 40, 140),
+          IntRect(40, 20, 60, 140),
+        ).allow,
+        isTrue,
+      );
+      // Overlapping sideways.
+      expect(
+        ocrInkGapSide(
+          page(255),
+          IntRect(20, 20, 40, 140),
+          IntRect(30, 20, 60, 140),
+        ).allow,
+        isTrue,
+      );
+      // Boxes that share no rows at all: the strip is empty.
+      final noOverlap = ocrInkGapSide(
+        page(255),
+        IntRect(20, 500, 40, 620),
+        IntRect(60, 700, 80, 820),
+      );
+      expect(noOverlap.allow, isTrue);
+      expect(noOverlap.gap, isNull);
+    });
+
+    test('the switch decides: identical pixels, one block or two', () {
+      final key = TranslationPerformanceConfig.inkBoundarySplitSettingKey;
+      addTearDown(() => appdata.settings[key] = null);
+      final outlined = page(255);
+      paint(outlined, 48, 0, 50, 200, 0);
+
+      appdata.settings[key] = false;
+      final joined = clusterOcrBoxes(
+        [leftColumn, rightColumn],
+        200,
+        200,
+        pageIndex: 0,
+        image: outlined,
+      );
+      expect(
+        joined,
+        hasLength(1),
+        reason: 'switch off ⇒ the verdict is measured and logged, never applied',
+      );
+      final trace = takeOcrInkTrace(0)!;
+      expect(trace.candidates, 1, reason: 'the side-by-side pair is a candidate now');
+      expect(trace.rejected, 1);
+      expect(trace.line(), contains('gap=20x120'));
+
+      appdata.settings[key] = true;
+      final split = clusterOcrBoxes(
+        [leftColumn, rightColumn],
+        200,
+        200,
+        pageIndex: 1,
+        image: outlined,
+      );
+      expect(
+        split,
+        hasLength(2),
+        reason: 'the outline says these two columns are in different bubbles',
+      );
+
+      final blank = page(255);
+      final stillJoined = clusterOcrBoxes(
+        [leftColumn, rightColumn],
+        200,
+        200,
+        pageIndex: 2,
+        image: blank,
+      );
+      expect(
+        stillJoined,
+        hasLength(1),
+        reason: 'switch on but no outline ⇒ merge exactly as before',
+      );
     });
   });
 

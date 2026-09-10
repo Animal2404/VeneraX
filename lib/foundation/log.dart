@@ -60,6 +60,50 @@ class Log {
 
   static IOSink? _file;
 
+  /// Rotation bounds for `logs.txt`. The file is the record a report is built
+  /// from, so it is never thrown away wholesale — only its head, once it has
+  /// grown past [maxFileBytes]; the most recent [keepFileBytes] survive.
+  static const maxFileBytes = 4 * 1024 * 1024;
+
+  static const keepFileBytes = 1024 * 1024;
+
+  /// The part of a log file that rotation keeps: its last [keepBytes], starting
+  /// on a line boundary so the first retained entry is whole. Pure, so the
+  /// policy is pinned by a test that never touches the filesystem.
+  static List<int> retainedTail(
+    List<int> bytes, {
+    int keepBytes = keepFileBytes,
+  }) {
+    if (bytes.length <= keepBytes) return bytes;
+    var tail = bytes.sublist(bytes.length - keepBytes);
+    var newline = tail.indexOf(10);
+    if (newline >= 0 && newline + 1 < tail.length) {
+      tail = tail.sublist(newline + 1);
+    }
+    return tail;
+  }
+
+  /// Opens the log for **appending**, rotating it first when it got too big.
+  ///
+  /// `openWrite()` truncates, so every launch used to wipe the previous
+  /// session — the very session whose OCR lines someone is about to be asked
+  /// for. Appending keeps the record across restarts, and the rotation above
+  /// keeps it bounded. [clear]'s comment has claimed all along that the file
+  /// "is a separate record this has never truncated"; this is that claim made
+  /// true.
+  static IOSink _openLogFile(File file) {
+    try {
+      if (file.existsSync() && file.lengthSync() > maxFileBytes) {
+        var kept = retainedTail(file.readAsBytesSync());
+        file.writeAsBytesSync(kept, flush: true);
+      }
+    } catch (e) {
+      // A log is never worth failing a start over.
+      debugPrint('Failed to rotate logs: $e');
+    }
+    return file.openWrite(mode: FileMode.append);
+  }
+
   static void addLog(LogLevel level, String title, String content) {
     if (isMuted) return;
     if (_file == null && App.isInitialized) {
@@ -70,7 +114,7 @@ class Log {
         dir = Directory(App.dataPath);
       }
       var file = dir.joinFile("logs.txt");
-      _file = file.openWrite();
+      _file = _openLogFile(file);
     }
 
     if (!ignoreLimitation && content.length > maxLogLength) {

@@ -3337,8 +3337,14 @@ List<List<IntRect>> clusterOcrBoxes(
         // Ink audit, in its own scope so it can neither touch the union-find
         // below nor be skipped by one of its `continue`s. It runs on the pair
         // the geometric gates already accepted, i.e. exactly the merges the
-        // experiment can veto. `a` is the upper box; a pair with no vertical
-        // facing order has no gap band and is not a candidate.
+        // experiment can veto.
+        //
+        // Both facing orders are audited. A pair stacked vertically has the gap
+        // between them; a pair sitting side by side has the same kind of gap
+        // running the other way — and that is the layout two neighbouring
+        // bubbles present when their text is vertical (each line is a tall
+        // narrow column), which is the case that used to get no verdict at all
+        // while the switch was on.
         var inkAllow = true;
         if (image != null) {
           final first = boxes[i];
@@ -3358,6 +3364,23 @@ List<List<IntRect>> clusterOcrBoxes(
               }
             }
             inkAllow = verdict.allow;
+          } else {
+            final left = first.right <= second.left
+                ? first
+                : (second.right <= first.left ? second : null);
+            if (left != null) {
+              final right = identical(left, first) ? second : first;
+              inkCandidates++;
+              final verdict = ocrInkGapSide(image, left, right);
+              final measured = verdict.gap;
+              if (measured != null && !verdict.allow) {
+                inkRejected++;
+                if (inkDetails.length < OcrInkTrace.maxDetails) {
+                  inkDetails.add(measured);
+                }
+              }
+              inkAllow = verdict.allow;
+            }
           }
         }
         if (!inkAllow && TranslationPerformanceConfig.inkBoundarySplit) {
@@ -3516,13 +3539,15 @@ int _axisGap(int startA, int endA, int startB, int endB) =>
 /// One measured gap band between two facing boxes, as [ocrInkGap] found it.
 ///
 /// Fields, in the order [OcrInkTrace.line] prints them:
-/// * [gapWidth] / [gapHeight] — the strip `x ∈ [max(a.left, b.left),
-///   min(a.right, b.right)]`, `y ∈ (a.bottom, b.top)` in px. `WxH`.
-/// * [inkRatio] — share of the strip's columns that carried a qualifying
-///   "dark stroke with bright pixels above and below" run. 0.00…1.00.
-/// * [runPx] — the shortest qualifying run height seen, i.e. the thinnest
-///   stroke the strip offered. A bubble outline is thin; a picture panel or a
-///   hair mass is not.
+/// * [gapWidth] / [gapHeight] — the strip's own size in px (`WxH`), whichever
+///   axis it was measured on: for a stacked pair
+///   `x ∈ [max(a.left, b.left), min(a.right, b.right)]`, `y ∈ (a.bottom, b.top)`;
+///   for a side-by-side pair the same rectangle transposed.
+/// * [inkRatio] — share of the strip's cross-axis positions that carried a
+///   qualifying "dark stroke with bright pixels on both sides" run. 0.00…1.00.
+/// * [runPx] — the shortest qualifying run along the scan axis, i.e. the
+///   thinnest stroke the strip offered. A bubble outline is thin; a picture
+///   panel or a hair mass is not.
 /// * [backgroundLuma] — mean luma of the strip, 0…255, i.e. the local
 ///   background the dark threshold is relative to.
 class OcrInkGap {
@@ -3563,9 +3588,13 @@ class OcrInkVerdict {
 /// with the switch off it still prints what the rule *would* have refused.
 ///
 /// `OcrInk page=N candidates=K rejected=R details=[…]`, fields:
-/// * `candidates` — facing box pairs whose gap band was measured (both boxes
-///   horizontal, one strictly above the other). Pairs that already overlap, or
-///   sit side by side, are not candidates: there is no band between them.
+/// * `candidates` — facing box pairs whose gap band was measured: stacked
+///   (one strictly above the other) or side by side. Pairs that already overlap
+///   have no band between them and are not candidates. The side-by-side case
+///   was added after a real page showed two neighbouring bubbles fusing with
+///   the switch on: vertical text makes each line a tall column, so the two
+///   bubbles' columns are side by side and the vertical-only probe never
+///   judged them.
 /// * `rejected` — candidates the ink rule calls a bubble boundary, i.e. the
 ///   merges the switch *would* refuse. It counts verdicts, not merges: a pair
 ///   whose link is rejected by an existing gate anyway is still counted, so
@@ -3634,9 +3663,20 @@ void clearOcrInkTraces() => _ocrInkTraceByPage.clear();
 /// identical on every platform the worker runs on.
 int _luma(int r, int g, int b) => (299 * r + 587 * g + 114 * b) ~/ 1000;
 
+/// Which way the strip between two audited boxes runs.
+enum _InkAxis {
+  /// `a` sits above `b`: the strip is `y ∈ (a.bottom, b.top)`, scanned down
+  /// each column.
+  vertical,
+
+  /// `a` sits left of `b`: the same test transposed — the strip is
+  /// `x ∈ (a.right, b.left)`, scanned along each row.
+  horizontal,
+}
+
 /// The bubble-outline discriminator, measured on the page's own pixels.
 ///
-/// For two *facing* horizontal boxes `a` (above) and `b` (below) the strip is
+/// For two *facing* boxes `a` (above) and `b` (below) the strip is
 /// `x ∈ [max(a.left, b.left), min(a.right, b.right)]`, `y ∈ (a.bottom, b.top)`.
 /// The strip is called a bubble boundary when at least
 /// [inkColumnShare] of its columns carry a run of dark pixels
@@ -3657,57 +3697,97 @@ int _luma(int r, int g, int b) => (299 * r + 587 * g + 114 * b) ~/ 1000;
 /// boxes that do not face each other, an empty or single-column strip, or a
 /// strip that falls outside the image. The experiment may refuse a merge; it
 /// may never throw or guess.
-OcrInkVerdict ocrInkGap(RgbaImage image, IntRect a, IntRect b) {
+OcrInkVerdict ocrInkGap(RgbaImage image, IntRect a, IntRect b) =>
+    _inkGap(image, a, b, _InkAxis.vertical);
+
+/// The same discriminator across a **horizontal** gap: [a] is the left box, [b]
+/// the right one.
+///
+/// Needed because vertical text turns a bubble's lines into tall narrow columns,
+/// so two *neighbouring* bubbles present as side-by-side boxes — the pairs the
+/// vertical probe cannot judge (`above == null`), which therefore never got a
+/// verdict at all. A real page fell through exactly that hole: the switch was
+/// on, the two bubbles sat side by side, and the merge went through untouched
+/// while the log claimed the rule had been consulted.
+OcrInkVerdict ocrInkGapSide(RgbaImage image, IntRect a, IntRect b) =>
+    _inkGap(image, a, b, _InkAxis.horizontal);
+
+OcrInkVerdict _inkGap(RgbaImage image, IntRect a, IntRect b, _InkAxis axis) {
   const inkColumnShare = 0.8;
   const inkRunHeightFactor = 0.6;
   const inkLumaFactor = 0.45;
 
-  final gapTop = a.bottom;
-  final gapBottom = b.top;
-  if (gapBottom <= gapTop) return const OcrInkVerdict(true, null);
-  final left = math.max(a.left, b.left);
-  final right = math.min(a.right, b.right);
-  if (right <= left) return const OcrInkVerdict(true, null);
-  final stripLeft = math.max(0, left);
-  final stripRight = math.min(image.width, right);
-  final stripTop = math.max(0, gapTop);
-  final stripBottom = math.min(image.height, gapBottom);
-  final columns = stripRight - stripLeft;
-  final rows = stripBottom - stripTop;
-  if (columns <= 0 || rows <= 0) return const OcrInkVerdict(true, null);
-  final maxRun = math.max(
-    1,
-    (inkRunHeightFactor * math.min(a.height, b.height)).round(),
-  );
+  // Along the scan axis: the band strictly between the two boxes. Across it:
+  // the strip both boxes share.
+  final int bandFrom;
+  final int bandTo;
+  final int crossFrom;
+  final int crossTo;
+  // The line thickness the "thin" ceiling is relative to: a box's short side.
+  final int thickness;
+  if (axis == _InkAxis.vertical) {
+    bandFrom = a.bottom;
+    bandTo = b.top;
+    crossFrom = math.max(a.left, b.left);
+    crossTo = math.min(a.right, b.right);
+    thickness = math.min(a.height, b.height);
+  } else {
+    bandFrom = a.right;
+    bandTo = b.left;
+    crossFrom = math.max(a.top, b.top);
+    crossTo = math.min(a.bottom, b.bottom);
+    thickness = math.min(a.width, b.width);
+  }
+  if (bandTo <= bandFrom) return const OcrInkVerdict(true, null);
+  if (crossTo <= crossFrom) return const OcrInkVerdict(true, null);
 
+  final bandLimit = axis == _InkAxis.vertical ? image.height : image.width;
+  final crossLimit = axis == _InkAxis.vertical ? image.width : image.height;
+  final bandLo = math.max(0, bandFrom);
+  final bandHi = math.min(bandLimit, bandTo);
+  final crossLo = math.max(0, crossFrom);
+  final crossHi = math.min(crossLimit, crossTo);
+  final bandLength = bandHi - bandLo;
+  final crossLength = crossHi - crossLo;
+  if (bandLength <= 0 || crossLength <= 0) {
+    return const OcrInkVerdict(true, null);
+  }
+  final maxRun = math.max(1, (inkRunHeightFactor * thickness).round());
+
+  // Pixel addressing, in one place: the only difference between the axes is
+  // which of (p, q) is x and which is y.
   final pixels = image.pixels;
   final stride = image.width * 4;
+  int lumaAt(int p, int q) {
+    final x = axis == _InkAxis.vertical ? q : p;
+    final y = axis == _InkAxis.vertical ? p : q;
+    final base = y * stride + x * 4;
+    return _luma(pixels[base], pixels[base + 1], pixels[base + 2]);
+  }
+
   var sum = 0;
-  for (var y = stripTop; y < stripBottom; y++) {
-    final rowBase = y * stride;
-    for (var x = stripLeft; x < stripRight; x++) {
-      final base = rowBase + x * 4;
-      sum += _luma(pixels[base], pixels[base + 1], pixels[base + 2]);
+  for (var p = bandLo; p < bandHi; p++) {
+    for (var q = crossLo; q < crossHi; q++) {
+      sum += lumaAt(p, q);
     }
   }
-  final meanLuma = sum / (columns * rows);
+  final meanLuma = sum / (bandLength * crossLength);
   final darkLimit = meanLuma * inkLumaFactor;
 
   var inked = 0;
   var shortestRun = 0;
-  for (var x = stripLeft; x < stripRight; x++) {
+  for (var q = crossLo; q < crossHi; q++) {
     var best = 0;
     var run = 0;
-    // "Bright above" has to mean *before the run started*, not merely seen
-    // earlier in the column: the first dark pixel of a run used to reset this
+    // "Bright before" has to mean *before the run started*, not merely seen
+    // earlier in the line: the first dark pixel of a run used to reset this
     // flag, so by the time the closing bright pixel arrived the flag was always
     // false and no run ever qualified. That is why the probe refused nothing on
     // its own positive fixture — see `test/translation_ink_boundary_test.dart`.
     var brightBefore = false;
     var seenBright = false;
-    for (var y = stripTop; y < stripBottom; y++) {
-      final base = y * stride + x * 4;
-      final luma = _luma(pixels[base], pixels[base + 1], pixels[base + 2]);
+    for (var p = bandLo; p < bandHi; p++) {
+      final luma = lumaAt(p, q);
       if (luma < darkLimit) {
         // A run starts here: carry over the bright pixel that closed the
         // previous one, if any, and drop it otherwise.
@@ -3726,10 +3806,12 @@ OcrInkVerdict ocrInkGap(RgbaImage image, IntRect a, IntRect b) {
       if (shortestRun == 0 || best < shortestRun) shortestRun = best;
     }
   }
-  final inkRatio = inked / columns;
+  final inkRatio = inked / crossLength;
+  // Reported as the strip's own width × height, whichever axis it was measured
+  // on, so the log line reads the same for both.
   final gap = OcrInkGap(
-    gapWidth: columns,
-    gapHeight: rows,
+    gapWidth: axis == _InkAxis.vertical ? crossLength : bandLength,
+    gapHeight: axis == _InkAxis.vertical ? bandLength : crossLength,
     inkRatio: inkRatio,
     runPx: shortestRun,
     backgroundLuma: meanLuma,
