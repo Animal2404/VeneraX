@@ -10,6 +10,7 @@ import 'package:venera/utils/translations.dart';
 
 import '../components/components.dart';
 import '../foundation/app.dart';
+import 'ai_translated_manga_page.dart';
 import 'explore_page.dart';
 import 'favorites/favorites_page.dart';
 import 'home_page.dart';
@@ -78,6 +79,15 @@ class _MainPageState extends State<MainPage> {
     );
   }
 
+  /// Opens the saved "AI translated manga" library — the pages the user saved
+  /// from the reader (plan §15). Like the entry above it takes no page slot and
+  /// pushes a screen over the current one, so the selection highlight, the
+  /// re-tap-to-return rule and the "no stacked copies" behaviour all come from
+  /// [NaviPaneState.handleItemTap].
+  void _openTranslatedManga() {
+    _navigatorKey!.currentContext!.to(() => const AiTranslatedMangaPage());
+  }
+
   final _pages = [
     const HomePage(),
     const FavoritesPage(key: PageStorageKey('favorites')),
@@ -109,6 +119,13 @@ class _MainPageState extends State<MainPage> {
       label: 'Categories'.tl,
       icon: Icons.category_outlined,
       activeIcon: Icons.category,
+    ),
+    PaneItemEntry(
+      id: AiTranslatedMangaPage.sidebarEntryId,
+      label: 'AI Translated Manga'.tl,
+      icon: Icons.auto_stories_outlined,
+      activeIcon: Icons.auto_stories,
+      onTap: _openTranslatedManga,
     ),
     PaneItemEntry(
       id: aiTranslationEntryId,

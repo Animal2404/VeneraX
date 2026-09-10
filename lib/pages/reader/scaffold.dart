@@ -14,6 +14,10 @@ class _ReaderScaffold extends StatefulWidget {
 class _ReaderScaffoldState extends State<_ReaderScaffold> {
   bool _isOpen = false;
 
+  /// True while a "save this chapter" run is in flight, so the top bar can show
+  /// progress and a second tap cannot start a second copy.
+  bool _savingChapter = false;
+
   static const kTopBarHeight = 56.0;
 
   static const kBottomBarHeight = 105.0;
@@ -380,6 +384,31 @@ class _ReaderScaffoldState extends State<_ReaderScaffold> {
       ),
     );
 
+    // Save to disk. The rendered page itself only lives in a cache that expires
+    // after 30 days and is evicted under pressure, so "keep this chapter as
+    // translated" has to be an explicit copy (plan §15). The button is offered
+    // even when the current page has no rendering yet: an untranslated page is
+    // saved as its original image and counted as such, so the saved chapter is
+    // never missing a page.
+    widgets.add(
+      Tooltip(
+        message: 'Save this chapter'.tl,
+        child: _savingChapter
+            ? const Padding(
+                padding: EdgeInsets.symmetric(horizontal: 12),
+                child: SizedBox(
+                  width: 18,
+                  height: 18,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                ),
+              )
+            : IconButton(
+                icon: const Icon(Icons.save_alt),
+                onPressed: () => unawaited(_saveCurrentChapter()),
+              ),
+      ),
+    );
+
     if (target != null && !reader.showOriginalPages) {
       switch (service.statusOf(target.cacheKey, target.mode)) {
         case PageTranslationStatus.translating:
@@ -416,6 +445,70 @@ class _ReaderScaffoldState extends State<_ReaderScaffold> {
       }
     }
     return widgets;
+  }
+
+  /// Copies every page of the open chapter into the AI translated manga
+  /// library (plan §15).
+  ///
+  /// Uses the page keys the reader already holds, so every cache key computed
+  /// here is one the pipeline has written. Pages that were never translated are
+  /// fetched and saved as their original image — the saved chapter keeps its
+  /// page count — and the closing message says how many of each kind there were.
+  Future<void> _saveCurrentChapter() async {
+    if (_savingChapter) return;
+    final reader = context.reader;
+    final images = reader.images;
+    if (images == null || images.isEmpty) {
+      context.showMessage(message: 'This chapter has no pages to save'.tl);
+      return;
+    }
+    final chapterTitle =
+        reader.widget.chapters?.titles.elementAtOrNull(reader.chapter - 1) ??
+        '';
+    setState(() => _savingChapter = true);
+    try {
+      final outcome = await TranslatedLibrary().saveChapter(
+        comicId: reader.cid,
+        sourceKey: reader.type.comicSource?.key,
+        chapterId: reader.eid,
+        comicTitle: reader.widget.name,
+        chapterTitle: chapterTitle,
+        pageKeys: List<String>.from(images),
+        config: TranslationConfig.of(reader.cid, reader.type.sourceKey),
+      );
+      if (!mounted) return;
+      context.showMessage(message: _describeSaveOutcome(outcome));
+    } catch (e, s) {
+      Log.error('TranslatedLibrary', 'saving the chapter failed: $e', s);
+      if (mounted) {
+        context.showMessage(message: 'Saving failed'.tl);
+      }
+    } finally {
+      if (mounted) setState(() => _savingChapter = false);
+    }
+  }
+
+  /// What to tell the user after a save: how much of it is translation, how much
+  /// is the original art, and whether anything was lost.
+  static String _describeSaveOutcome(SaveChapterOutcome outcome) {
+    if (!outcome.ok) {
+      return outcome.failures.isEmpty
+          ? 'Nothing to save yet: translate this chapter first'.tl
+          : 'Nothing was saved: @reason'.tlParams({
+              'reason': outcome.failures.first,
+            });
+    }
+    var text = 'Saved @pages pages (@translated translated, @original original)'
+        .tlParams({
+          'pages': outcome.saved,
+          'translated': outcome.translated,
+          'original': outcome.originalNoText + outcome.originalUntranslated,
+        });
+    if (outcome.failed > 0) {
+      text =
+          '$text · ${'@count failed'.tlParams({'count': outcome.failed})}';
+    }
+    return text;
   }
 
   void _retryTranslation(String cacheKey, InpaintMode mode) {
