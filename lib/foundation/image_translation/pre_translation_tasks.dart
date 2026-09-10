@@ -378,9 +378,9 @@ class PreTranslationActivity {
   DateTime? translatedDoneAt;
   DateTime? renderedDoneAt;
 
-  /// Records the three completion stamps. Idempotent: `??=` keeps the first
-  /// observation, so a rebuild, a re-entrant notify or a late call cannot move
-  /// a phase's finish line.
+  /// Records the three completion stamps. Idempotent: each one is written only
+  /// while it is still null, so a rebuild, a re-entrant notify or a late call
+  /// cannot move a phase's finish line.
   void notePhaseCompletions(PreTranslationTask task, DateTime now) {
     if (task.total <= 0) return;
     if (recognizedDoneAt == null && recognizedThrough(task) >= task.total) {

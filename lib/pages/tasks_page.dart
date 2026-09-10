@@ -991,12 +991,13 @@ class _TasksPageState extends State<TasksPage>
                   doneAfter: progressView.renderDoneAfter,
                 ),
                 // Without this note a live "Recognized 8/82" beside a static
-                // "Pages 0/82" reads as a contradiction; the sweep number is
-                // OCR credit, not translation completeness — say so.
+                // "Pages 0/82" reads as a contradiction: recognizing a page is
+                // not translating it. One short line, no engine vocabulary —
+                // "OCR pre-scan" was the jargon this label used to carry.
                 if (progressView.sweepActive) ...[
                   const SizedBox(height: 2),
                   Text(
-                    "Recognized counts the OCR pre-scan only — those pages are not translated yet"
+                    "Recognizing is only the first pass — those pages have no translation yet"
                         .tl,
                     style: ts.s12.withColor(context.colorScheme.outline),
                   ),
