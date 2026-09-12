@@ -20,6 +20,27 @@ import 'package:venera/foundation/image_translation/translation_types.dart';
 /// are. Until that exists, this stays where it was.
 const double maxMaskCoverage = 0.85;
 
+/// Largest bright component a window with white-on-dark lettering may contain.
+///
+/// The black smears on the reported run all came from this shape: on a dark or
+/// mid-tone window the "class further from the background is the lettering"
+/// rule picks the *bright* class, and out there the bright pixels are often the
+/// paper and the outline rather than glyphs. Measured by recomputing this
+/// classifier over the stored erase rectangles and the cached source pages:
+///
+///  * the two windows that smeared carried a largest bright component of
+///    **3,216 px** (white lettering on a black band) and **63,604 px** (a black
+///    heart with its white outline over screentone);
+///  * the legitimate white-on-dark case — three thin light strokes inside a
+///    black bubble, the fixture this file already leans on — comes to **360 px**.
+///
+/// So the discriminator is the size of a single blob, not the share of the
+/// window (a 0.35 coverage ceiling was tried first and the suite rejected it:
+/// legitimate erases mask about half of their rectangle). It is applied **only
+/// when the lettering class is the bright one** — dark-on-light, the ordinary
+/// case and the dense title lettering the suite pins, never enters this rule.
+const int maxBrightComponentPixels = 2000;
+
 /// Working window + per-pixel 0/1 stroke mask for one text region.
 class TextMask {
   TextMask(this.left, this.top, this.rw, this.rh, this.mask);
@@ -668,6 +689,15 @@ abstract final class TextInpainter {
     maskCount = _filterComponents(mask, rw, rh);
     if (maskCount == 0) return null;
 
+    // White-on-dark only: one big bright blob there is the paper or an outline
+    // the contrast test caught, and erasing it drags the dark background across
+    // the page. Refusing leaves the original lettering, which this file already
+    // prefers to a black smear.
+    if (!textIsDark &&
+        _largestComponentPixels(mask, rw, rh) > maxBrightComponentPixels) {
+      return null;
+    }
+
     // Dilate to swallow the anti-aliased halo around each stroke — leftover
     // grey fringe reads as "text not fully erased". The radius scales with the
     // stroke thickness (approximated from the region size) so thin lettering
@@ -763,6 +793,47 @@ abstract final class TextInpainter {
   /// (threshold noise), and a component that fills a large fraction of its own
   /// bounding box (a solid blob — bubble edge or artwork the contrast test
   /// caught — rather than thin lettering). 4-connected flood fill per component.
+  /// Pixels in the largest 4-connected component of [mask].
+  ///
+  /// A separate walk from [_filterComponents] because the two answer different
+  /// questions — that one filters the mask in place, this one only measures it,
+  /// and the measurement is needed for the white-on-dark guard above.
+  static int _largestComponentPixels(Uint8List mask, int rw, int rh) {
+    var n = rw * rh;
+    var seen = Uint8List(n);
+    var stack = <int>[];
+    var largest = 0;
+    for (var start = 0; start < n; start++) {
+      if (mask[start] == 0 || seen[start] != 0) continue;
+      var count = 0;
+      stack.add(start);
+      seen[start] = 1;
+      while (stack.isNotEmpty) {
+        var i = stack.removeLast();
+        count++;
+        var x = i % rw;
+        if (x > 0 && mask[i - 1] == 1 && seen[i - 1] == 0) {
+          seen[i - 1] = 1;
+          stack.add(i - 1);
+        }
+        if (x < rw - 1 && mask[i + 1] == 1 && seen[i + 1] == 0) {
+          seen[i + 1] = 1;
+          stack.add(i + 1);
+        }
+        if (i - rw >= 0 && mask[i - rw] == 1 && seen[i - rw] == 0) {
+          seen[i - rw] = 1;
+          stack.add(i - rw);
+        }
+        if (i + rw < n && mask[i + rw] == 1 && seen[i + rw] == 0) {
+          seen[i + rw] = 1;
+          stack.add(i + rw);
+        }
+      }
+      if (count > largest) largest = count;
+    }
+    return largest;
+  }
+
   static int _filterComponents(Uint8List mask, int rw, int rh) {
     var n = rw * rh;
     var seen = Uint8List(n);
