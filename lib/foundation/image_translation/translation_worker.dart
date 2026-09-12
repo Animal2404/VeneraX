@@ -11,6 +11,7 @@ import 'package:venera/foundation/image_translation/ort_capabilities.dart';
 import 'package:venera/foundation/image_translation/ort_ffi.dart';
 import 'package:venera/foundation/image_translation/translation_types.dart';
 import 'package:venera/foundation/image_translation/balloon.dart';
+import 'package:venera/foundation/image_translation/ocr_dict.dart';
 import 'package:venera/foundation/image_translation/translation_performance_config.dart';
 import 'package:venera/foundation/image_translation/worker_pool_selection.dart';
 import 'package:venera/foundation/log.dart';
@@ -1465,7 +1466,10 @@ List<String> loadCharset(String dictPath, {int? expectedClasses}) {
   if (!file.existsSync()) {
     throw DictMismatchException('Dictionary file not found: $dictPath');
   }
-  final lines = file.readAsLinesSync();
+  // Through the shared reader: a v5 dictionary lives inside the model's own
+  // `inference.yml`, and the validator counts the same file with the same
+  // function. Two different counts here would reject a correct model.
+  final lines = parseDictEntries(file.readAsStringSync());
   final charset = ['', ...lines.map((l) => l.isEmpty ? ' ' : l), ' '];
   if (expectedClasses != null && charset.length != expectedClasses) {
     throw DictMismatchException(

@@ -156,6 +156,7 @@ class ModelComponent {
     this.replaces,
     this.enabled = true,
     this.displayNameKey,
+    this.blurbKey,
   });
 
   final String id;
@@ -186,6 +187,13 @@ class ModelComponent {
 
   /// Localization key for display name.
   final String? displayNameKey;
+
+  /// One plain-language line under the name: what this model does, and when to
+  /// pick it over its neighbour. The list used to show a name, a size and a
+  /// validation verdict — enough to know a file is *there*, not enough to know
+  /// whether to download it, which is why the high/GPU section read as a pile
+  /// of variants nobody could rank.
+  final String? blurbKey;
 
   String get directory =>
       FilePath.join(App.dataPath, 'translation_models', id);
@@ -226,56 +234,79 @@ class ModelComponent {
 /// from their official repositories; nothing is bundled into the app so the
 /// install stays lightweight until the user opts in.
 abstract class TranslationModels {
-  /// Text region detector (PP-OCRv4 mobile, DBNet). Language independent.
+  /// Text region detector (PP-OCRv5 mobile, DBNet). Language independent.
+  ///
+  /// v5-mobile replaced v4-mobile at the same size: the vendor's own detection
+  /// benchmark puts mobile v4 at Hmean 63.8 and mobile v5 at 79.0 — 15 points
+  /// for no extra bytes, so the old entry had no reason to exist. (PP-OCRv4
+  /// server, the other half of the pair this project shipped, scores 69.2 —
+  /// below the *mobile* v5 — which is why the server tier below is v5 too.)
   static const detector = ModelComponent(
     id: 'text_detector',
-    approxSizeBytes: 4745517,
+    approxSizeBytes: 4826518,
     tier: ModelTier.fast,
     kind: ModelKind.detector,
     displayNameKey: 'Text detector',
+    blurbKey: 'Finds the text areas on each page before anything is read.',
     files: [
       ModelFile(
         'det.onnx',
         [
-          '{release}/det.onnx',
-          '{hf}/SWHL/RapidOCR/resolve/main/PP-OCRv4/ch_PP-OCRv4_det_infer.onnx',
+          '{hf}/PaddlePaddle/PP-OCRv5_mobile_det_onnx/resolve/main/inference.onnx',
         ],
         expectedSha256:
-            'd2a7720d45a54257208b1e13e36a8479894cb74155a5efe29462512d42f49da9',
+            'a431985659dc921974177a95adcfbb90fd9e51989a5e04d70d0b75f597b6e61d',
       ),
     ],
   );
 
-  /// High-accuracy server text detector (PP-OCRv4 server, DBNet).
+  /// High-accuracy server text detector (PP-OCRv5 server, DBNet).
+  ///
+  /// Beats the v4 server model it replaced on every axis at once — Hmean 83.8
+  /// against 69.2, and 383 ms against 586 ms on the vendor's CPU benchmark —
+  /// while also being smaller (84 MB against 109 MB). It stays a deliberate
+  /// choice rather than the default: roughly six times the mobile model's cost
+  /// for about five points, which pays off on dense artwork and dirty scans and
+  /// wastes time everywhere else.
   static const detectorHigh = ModelComponent(
     id: 'text_detector_high',
-    approxSizeBytes: 113352104,
+    approxSizeBytes: 88116791,
     tier: ModelTier.high,
     kind: ModelKind.detector,
     displayNameKey: 'High-accuracy text detector (server)',
+    blurbKey:
+        'The same job done more carefully: about 5 points more accurate and roughly six times slower.',
     files: [
       ModelFile(
         'det.onnx',
         [
-          '{release}/det_server.onnx',
-          '{hf}/SWHL/RapidOCR/resolve/main/PP-OCRv4/ch_PP-OCRv4_det_server_infer.onnx',
+          '{hf}/PaddlePaddle/PP-OCRv5_server_det_onnx/resolve/main/inference.onnx',
         ],
         expectedSha256:
-            'cfa39a3f298f6d3fc71789834d15da36d11a6c59b489fc16ea4733728012f786',
+            '10803475a591f7dc623e24670fb5752ec94d39a1f8cf069aac1b6f0ce19cfc85',
       ),
     ],
   );
 
-  /// Reserved: Manga-specific text detector.
-  static const detectorManga = ModelComponent(
-    id: 'text_detector_manga',
-    approxSizeBytes: 10000000,
-    tier: ModelTier.fast,
-    kind: ModelKind.detector,
-    enabled: false,
-    displayNameKey: 'Manga text detector (bubble)',
-    files: [],
-  );
+  // `text_detector_manga` ("Manga text detector (bubble)") lived here as a
+  // reserved row with no files, and shipped for months as a greyed entry
+  // promising "Coming soon" — a promise this project never kept, listed beside
+  // working downloads, which is exactly the kind of row a user cannot tell from
+  // a broken feature. It is removed rather than re-labelled:
+  //
+  //  * the capability it advertised now exists and needs no model at all —
+  //    `balloon.dart` separates two neighbouring bubbles on the page's own ink
+  //    (a flood fill bounded by the outline), the approach both mainstream
+  //    projects take;
+  //  * a *learned* bubble detector is real and licensable (the research
+  //    recommends `ogkalu/comic-text-and-bubble-detector`, RT-DETR-v2, 11.1 MB,
+  //    Apache-2.0, one forward pass for bubble + text), but wiring it means a
+  //    new pre/post-processing chain in Dart, and adding a model the app does
+  //    not run would repeat the mistake this placeholder was.
+  //
+  // See doc/MODEL_RESEARCH_MANGA_MT.md for the survey and the licence traps
+  // (six Ultralytics exports carry AGPL-3.0 *inside the file*, whatever their
+  // repository page says).
 
   /// Japanese OCR (manga-ocr, vision encoder-decoder). The only reliable
   /// option for vertical manga text; large but worth it.
@@ -285,6 +316,8 @@ abstract class TranslationModels {
     tier: ModelTier.fast,
     kind: ModelKind.mangaEncoder,
     displayNameKey: 'Japanese OCR (manga)',
+    blurbKey:
+        'Reads Japanese, including the vertical lettering ordinary OCR cannot follow. Large, and the only reliable option for manga.',
     files: [
       ModelFile(
         'encoder.onnx',
@@ -361,6 +394,8 @@ abstract class TranslationModels {
     tier: ModelTier.fast,
     kind: ModelKind.rec,
     displayNameKey: 'Chinese / Latin OCR',
+    blurbKey:
+        'Reads Chinese and Latin letters. Small and quick; the high variant below is for small or noisy text.',
     files: [
       ModelFile(
         'rec.onnx',
@@ -391,6 +426,8 @@ abstract class TranslationModels {
     kind: ModelKind.rec,
     dictFrom: 'ocr_zh',
     displayNameKey: 'High-accuracy Chinese / Latin OCR (server)',
+    blurbKey:
+        'The larger recognizer for the same languages. Bigger and slower for a modest gain — worth trying when the default misreads, not automatically better.',
     files: [
       ModelFile(
         'rec.onnx',
@@ -453,6 +490,7 @@ abstract class TranslationModels {
     tier: ModelTier.fast,
     kind: ModelKind.rec,
     displayNameKey: 'English OCR',
+    blurbKey: 'Reads English letters.',
     files: [
       ModelFile(
         'rec.onnx',
@@ -476,30 +514,43 @@ abstract class TranslationModels {
   );
 
   /// Korean OCR (PP-OCR mobile rec).
+  /// Korean OCR, model and dictionary from the same release.
+  ///
+  /// The previous pair could never pass validation: a PP-OCRv1-era recognizer
+  /// (3689 output classes) shipped with PaddleOCR v2.7's `korean_dict.txt`
+  /// (3688 lines), while the charset rule requires 3688 + 2 = 3690 — so Korean
+  /// was flagged "Invalid" permanently. The row was in the list; the language
+  /// was not usable. v5 publishes the dictionary *inside the model's own
+  /// `inference.yml`, which makes the pairing exact rather than hopeful: 11945
+  /// entries + blank + space = 11947 classes, and the model outputs 11947
+  /// (counted from the real file, not from documentation). `ocr_dict.dart` is
+  /// what allows a dictionary to be read out of that yml.
   static const ocrKo = ModelComponent(
     id: 'ocr_ko',
-    approxSizeBytes: 3290650,
+    approxSizeBytes: 13418787,
     tier: ModelTier.fast,
     kind: ModelKind.rec,
     displayNameKey: 'Korean OCR',
+    blurbKey:
+        'Reads Korean. Its dictionary travels inside the model file itself, which is what the validation checks.',
     files: [
       ModelFile(
         'rec.onnx',
         [
-          '{release}/rec_ko.onnx',
-          '{hf}/SWHL/RapidOCR/resolve/main/PP-OCRv1/korean_mobile_v2.0_rec_infer.onnx',
+          '{hf}/PaddlePaddle/korean_PP-OCRv5_mobile_rec_onnx/resolve/main/inference.onnx',
         ],
         expectedSha256:
-            'b6558500138b43b46a4941957fb8c918546dae5fb0e71718536f1883acc80faf',
+            '92f0b7785e64fc9090106a241cf4c1eb97472824558272751b88a2a4476d3a08',
       ),
       ModelFile(
+        // The dictionary ships as the model's `inference.yml`; the reader
+        // extracts its `character_dict` block (see `parseDictEntries`).
         'dict.txt',
         [
-          'https://cdn.jsdelivr.net/gh/PaddlePaddle/PaddleOCR@v2.7.0/ppocr/utils/dict/korean_dict.txt',
-          'https://raw.githubusercontent.com/PaddlePaddle/PaddleOCR/v2.7.0/ppocr/utils/dict/korean_dict.txt',
+          '{hf}/PaddlePaddle/korean_PP-OCRv5_mobile_rec_onnx/resolve/main/inference.yml',
         ],
         expectedSha256:
-            'aa1fdc8ae8f7cd40a0ec4edb472eb0421e11427e6ccfee9915440742c18b0a20',
+            'f757fa1c40e99edcf27e9cce879b93eb2a51fa46f5ef39095689b8c37dd75998',
       ),
     ],
   );
@@ -507,7 +558,6 @@ abstract class TranslationModels {
   static const all = [
     detector,
     detectorHigh,
-    detectorManga,
     ocrJa,
     ocrJaFp16,
     ocrZh,

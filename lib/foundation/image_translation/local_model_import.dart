@@ -39,6 +39,7 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
+import 'package:venera/foundation/image_translation/ocr_dict.dart';
 import 'package:venera/foundation/app.dart';
 import 'package:venera/foundation/image_translation/translation_models.dart';
 import 'package:venera/foundation/log.dart';
@@ -1158,7 +1159,8 @@ List<String> onnxStructuralWarnings(
 /// above is guaranteed to compare like for like: Dart drops the trailing
 /// empty line a final newline produces, and a blank line inside the file
 /// still counts as one dictionary line.
-int dictLineCountSync(String path) => File(path).readAsLinesSync().length;
+int dictLineCountSync(String path) =>
+    parseDictEntries(File(path).readAsStringSync()).length;
 
 class _ComponentAnalysis {
   final problems = <String>[];
@@ -1564,7 +1566,7 @@ bool roleNeedsDict(ModelComponent c) =>
 int? _readTextLines(String path, String fileName, _ComponentAnalysis a) {
   List<String> lines;
   try {
-    lines = File(path).readAsLinesSync();
+    lines = parseDictEntries(File(path).readAsStringSync());
   } on FormatException {
     a.failedFile = fileName;
     a.problems.add(

@@ -454,7 +454,14 @@ class _TranslationModelsPageState extends State<TranslationModelsPage> {
       );
     }
 
-    String subtitle = _formatSize(component.approxSizeBytes);
+    // What this model is *for*, in one line, above the size and the verdict.
+    // A `.tl` that finds no translation returns its key, and printing an
+    // English key into a Chinese row would be worse than printing nothing.
+    final blurb = component.blurbKey?.tl;
+    final hasBlurb = blurb != null && blurb != component.blurbKey;
+    String subtitle = hasBlurb
+        ? [blurb, _formatSize(component.approxSizeBytes)].join('\n')
+        : _formatSize(component.approxSizeBytes);
     if (component.requiresGpuEp) {
       if (isGpuBlocked) {
         subtitle += " · ${"Unavailable: no GPU backend detected".tl}";
@@ -502,7 +509,8 @@ class _TranslationModelsPageState extends State<TranslationModelsPage> {
       ),
       isThreeLine:
           state.error != null ||
-          (component.enabled && modelState == ModelState.invalid),
+          (component.enabled && modelState == ModelState.invalid) ||
+          (hasBlurb && component.enabled),
       trailing: trailing,
     );
   }

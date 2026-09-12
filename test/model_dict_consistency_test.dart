@@ -104,7 +104,12 @@ void main() {
     test('ModelComponent properties are correctly initialized', () {
       expect(TranslationModels.detector.tier, ModelTier.fast);
       expect(TranslationModels.detectorHigh.tier, ModelTier.high);
-      expect(TranslationModels.detectorManga.enabled, isFalse);
+      // The reserved bubble-detector row used to be the disabled one to assert
+      // on. It was deleted (see the registry comment: a "Coming soon" promise
+      // the project never kept, listed beside working downloads), so the
+      // disabled rows are now the FP16/GPU variants — disabled for the other
+      // reason, unpublished until gate G5.
+      expect(TranslationModels.ocrJaFp16.enabled, isFalse);
 
       expect(TranslationModels.ocrZhFp16.requiresGpuEp, isTrue);
       expect(TranslationModels.ocrZhHighFp16.requiresGpuEp, isTrue);
@@ -119,7 +124,15 @@ void main() {
           .where((c) => c.kind == ModelKind.detector)
           .map((c) => c.id)
           .toList();
-      expect(detectors, containsAll(['text_detector', 'text_detector_high', 'text_detector_manga']));
+      expect(
+        detectors,
+        containsAll(['text_detector', 'text_detector_high']),
+      );
+      expect(
+        detectors,
+        isNot(contains('text_detector_manga')),
+        reason: 'the reserved bubble row was removed, not hidden',
+      );
 
       final manga = TranslationModels.all
           .where((c) => c.kind == ModelKind.mangaEncoder)
@@ -209,18 +222,29 @@ void main() {
       expect(listed.length, listed.toSet().length);
     });
 
-    test('a file-less placeholder keeps its "Coming soon" row', () {
-      // text_detector_manga is reserved, not unpublished: different case,
-      // different answer.
-      expect(
-        TranslationModels.isUnpublishedAsset(TranslationModels.detectorManga),
-        isFalse,
+    test('a file-less placeholder is reserved, not an unpublished asset', () {
+      // The registry ships no such row any more, but the rule has to hold for
+      // any placeholder a future release declares: "disabled with files" is a
+      // G5-pending asset that must stay hidden, while "disabled with no files"
+      // is a reserved feature and keeps its row. Same flag, opposite answers —
+      // which is why this is asserted on a fixture instead of on whichever
+      // component happened to be reserved that week.
+      const reserved = ModelComponent(
+        id: 'reserved_fixture',
+        approxSizeBytes: 1,
+        kind: ModelKind.detector,
+        enabled: false,
+        files: [],
       );
-      expect(TranslationModels.detectorManga.files, isEmpty);
+
+      expect(TranslationModels.isUnpublishedAsset(reserved), isFalse);
+      expect(reserved.files, isEmpty);
+      // And the real registry currently contains neither kind of dead row
+      // beyond the G5 ones it already hides.
       expect(
         TranslationModels.listedComponents(ModelSection.detection)
-            .map((c) => c.id),
-        contains('text_detector_manga'),
+            .where((c) => !c.enabled),
+        isEmpty,
       );
     });
 
