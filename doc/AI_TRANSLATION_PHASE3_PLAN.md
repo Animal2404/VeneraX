@@ -382,3 +382,45 @@
 
 
 
+
+---
+
+## 10. 第四轮：气泡掩码 / 翻译记忆 / 缓存清扫竞态（提交 `8d9496d` + `c458a06`）
+
+用户要求"上网搜真实有效的方案"，并且三类问题必须查到落地做法。本轮先调研、再动手，**并且撤掉了一个自己刚写的死代码**。
+
+### 10-1 调研结论（每条都验证过是否适用）
+
+| 问题 | 网上的主流答案 | 是否适用于我们 |
+| :-- | :-- | :-- |
+| 气泡融合 | `manga-image-translator` 的 `rendering/ballon_extractor.py`（Canny+floodFill 取气泡掩码）、`BallonsTranslator` 的 `utils/textblock_mask.py::canny_flood`、MANPU/ICDAR《Text block segmentation in comic speech bubbles》（区域生长被限制在气泡轮廓内） | **适用** → 本轮实现 |
+| 气泡融合（几何侧） | 同项目的 `textline_merge.split_text_region`：对每个连通块求 MST，把最离群的那条边切开并递归 | **不适用**（见 10-2 的算术） |
+| 擦字黑块 | LaMa + DirectML 有自定义算子，GPU 上崩或出坏图（Carve/LaMa-ONNX 讨论、sd-webui-controlnet #2143） | **不适用**：本仓库没有 LaMa，只有 `patch` / 纯 Dart `smart` 擦除 |
+| 擦字黑块（可行方向） | `BallonsTranslator` 的 `textbgr_calculator` / `bground_calculator`：按文字块**自身背景统计**回填 | 待定（需要用户给一页出黑块的页面确认分类） |
+| API 翻译慢 | 调用方式（批量 JSON + 并发 + AIMD + 术语表）本已正确；收益在请求边缘：无内容行直通、翻译记忆、`response_format`、`max_tokens` | **部分适用** → 本轮实现前两条 |
+
+### 10-2 被撤掉的 MST 拆分（一个真实死路的算术）
+
+先按 `manga-image-translator` 移植了 MST 拆分，写测试时发现**它在本管线里永远不会触发**：
+
+- 合并门槛是 `inflate = 0.55 × 短边`（每侧），所以**单条链路的极限间距 = 0.55a + 0.55b = 1.1 × 平均短边**；
+- MST 拆分门槛是 `1.5 × 平均短边`；
+- `1.1 < 1.5` 恒成立 ⇒ MST 里最重的那条边永远够不到拆分门槛。
+
+那个项目能用，是因为它的合并容差大到 3 倍字号（链路能跨真正的大洞）；我们的链路本就紧，两个气泡能并上说明它们**已经几乎贴着**——这种距离上几何与"一个气泡里排得很紧的两块"不可区分（§2.5 早就证明过）。**推理已写进代码注释**，避免后人重走。配置项也一并撤掉。
+
+### 10-3 落地
+
+1. **气泡掩码**（新文件 `balloon.dart`，纯 Dart）：以文字块中心为种子，在受限窗口内漫水填充亮区（阈值取窗口自身均值的一个比例，能跨白纸/网点/泛黄扫描页），返回 `enclosed`（是否被描边封闭）。`sameBalloon(a,b)` 只在**两侧都封闭**且**彼此种子不落在对方区域内**时判否 → 聚类时拒绝该合并。这条**无条件生效**（是修复不是实验），且只在正面证据下否决；任一侧不封闭即回退几何判断。新增 7 例测试（含"一气泡两列"必须仍合并、"两气泡"必须切开、"开放画面"必须回退）。
+2. **翻译记忆 + 免翻译直通**（`llm_translator.dart`）：键 = 目标语言 + 模型 + 原文；`……`/`!?`/`♪` 这类无词行直接原样返回，不占请求；请求只带未命中的行，返回按原序折回；`重新翻译` 会清空记忆。新增 9 例测试（键的隔离、空/无词不入库、容量淘汰、清空语义）。
+3. **缓存清扫竞态**（`cache_manager.dart`，由 CI 连续两次失败暴露）：
+   `writeCache` **先写文件、后插行**，而 `CacheManager()` 构造时启动的孤儿清扫正好能落在这两步之间 → POSIX 上删掉刚写的缓存文件，Windows 上因写者仍持有句柄直接抛 `PathAccessException errno 32` 给调用方（测试里表现为 `image_downloader_stream_test` 间歇性变红）。现在清扫**跳过 60 秒内修改过的文件**，并把"删不掉"当作清扫可以跳过的情况而不是错误。宽限期谓词是纯函数 + 4 例测试。
+
+### 10-4 验证
+
+| 检查 | 结果 |
+| :-- | :-- |
+| 云端 `Test`（`8d9496d`） | `executed 1399 / passed 1399 / failed 0 / skipped 1 / exit 0` + `GUARD PASS`（1383→1399 = 本轮新增 16 例全部执行通过） |
+| 云端 `Test` + `Build_Windows`（`c458a06`） | `executed 1403 / passed 1403 / failed 0` + `GUARD PASS`；`Build_Windows` success 16m27s；产物已解包 |
+| 本机 `flutter analyze --no-pub lib/ test/` | 0 error（剩余 9 条均为未改动文件的既有 info/warning） |
+| **仍未验证** | ① 气泡掩码在真机页面上是否真的把用户那一页切开（需要一次真实翻译 + `OcrInk … balloon=N` 日志）；② 黑块仍未定位（需要出问题的那一页） |
