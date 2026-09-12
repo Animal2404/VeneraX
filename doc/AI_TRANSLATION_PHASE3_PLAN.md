@@ -424,3 +424,55 @@
 | 云端 `Test` + `Build_Windows`（`c458a06`） | `executed 1403 / passed 1403 / failed 0` + `GUARD PASS`；`Build_Windows` success 16m27s；产物已解包 |
 | 本机 `flutter analyze --no-pub lib/ test/` | 0 error（剩余 9 条均为未改动文件的既有 info/warning） |
 | **仍未验证** | ① 气泡掩码在真机页面上是否真的把用户那一页切开（需要一次真实翻译 + `OcrInk … balloon=N` 日志）；② 黑块仍未定位（需要出问题的那一页） |
+
+---
+
+## 11. 三张截图对应的三项改进（调研 → 施工 → 云验证）
+
+### 11-1 阶段 1：现状查证（先读代码，不猜）
+
+| 截图 | 界面 | 源码位置 | 查证结果 |
+| :-- | :-- | :-- | :-- |
+| 1 | AI 翻译漫画 → 章节列表 | `lib/pages/ai_translated_manga_page.dart` | 每行 trailing 只有「保存/删除」两个之一，**没有重新翻译**；详情页的 `_retranslateChapter` 才是既有入口（清缓存 + `resetChapterStatus` + 排入预翻译任务） |
+| 2 | 设置 → 阅读设置 → AI 翻译 → 高级设置 | `lib/pages/settings/reader.dart` + `setting_components.dart` | 7 个性能滑块**只有标题没有说明**；`_SliderSetting` 当时**没有** help 位；流水线模式/墨迹拆分/刷新间隔/文字消除/推理后端**已有**说明 |
+| 3 | 设置 → 翻译模型 | `lib/pages/settings/translation_models_settings.dart` + `lib/foundation/image_translation/translation_models.dart` | 模型清单**本地定义**（非远程 JSON）：11 个组件，其中 `text_detector_manga`（漫画气泡检测(专用)）**files 为空** = 路线图占位，页面按 `isUnpublishedAsset` 规则显示「即将推出」；「高精与 GPU 加速变体」= `tier==high` 或 `requiresGpuEp` 的组件，是**真实且会被档位选中**的（`tier == high && detectorHigh.isInstalled` 等处） |
+
+**模型清单逐条判定（含来源）**：
+
+| 条目 | 判定 | 依据 |
+| :-- | :-- | :-- |
+| 文本检测（PP-OCRv4 mobile） | **换** | 同体积下 v5 mobile Hmean 79.0 vs v4 mobile 63.8（PaddleOCR 官方检测基准） |
+| 高精文本检测（PP-OCRv4 server） | **换** | v4 server Hmean 69.2 / 109MB / 586ms，**低于 v5 mobile**；v5 server 83.8 / 84MB / 383ms |
+| 漫画气泡检测（专用）9.5MB | **删** | files 为空、从未实现；能力已由 `balloon.dart`（纯 Dart，无模型）提供；若将来要学习的检测器，调研给出许可干净的候选 `ogkalu/comic-text-and-bubble-detector`（RT-DETR-v2，11.1MB，Apache-2.0） |
+| 韩语识别 3.1MB | **修** | 旧配对结构性失败：模型 3689 类 vs 词典 3688 行、规则要 3690 → 永远「校验不通过」。v5 把词典内联在模型自己的 `inference.yml`：11945 + blank + space = 11947（对真实文件实测） |
+| 日语（manga-ocr）/ 中文 / 英文 / 高精中文 | 保留 | 用途清晰，见行内新增的一句话说明 |
+| Ultralytics 系 YOLO 导出（调研推荐过的候选） | **不用** | 文件内部元数据写着 AGPL-3.0（仓库页却标 apache/mit）→ 商用不可打包 |
+| LaMa/comic-text-detector（GPL-3.0） | 不用 | 同上，仓库页许可证与上游义务不一致 |
+
+### 11-2 阶段 2：结果页直接重新翻译
+
+章节行 trailing 变为 `[翻译/重新翻译] [保存或删除]`。语义对齐详情页既有流程：**重新翻译 = 清掉该章译文与渲染图 + 重置状态标记 + 排入预翻译任务**（复用同一套后台任务/进度卡/取消），并区分「已入队」与「该漫画正在翻译中（`start` 返回的是已在跑的任务）」。新增文案 5 条（简繁各 1491 键）。
+
+### 11-3 阶段 3：每个功能一句大白话
+
+`_SliderSetting` 新增 `help` 位（照抄本仓库既有的 `Column([Text, Slider])` 形态），7 个性能滑块各补一句，按调研来的模板写：**做什么 → 推荐值 → 调大/调小的代价**。例如「文字识别批大小」= 日语漫画提速最明显也最吃显存的一项，加到速度不再变快为止。文案：`doc/UX_RESEARCH_MANGA_MT_TOOLS.md` §4（40 条来源）给出模板与依据（NN/g 渐进披露 + The Power of Defaults）。
+
+### 11-4 阶段 4：模型清单改造
+
+1. **默认检测器** → PP-OCRv5 mobile det（4,826,518 B，sha256 `a4319856…`，本地下载后计算，且与 HF 的 `X-Linked-ETag` 一致）。
+2. **高精检测器** → PP-OCRv5 server det（88,116,791 B，sha256 `10803475…`，取自 HEAD 的 LFS etag）。
+3. **韩语** → v5 配对（模型 13,418,787 B `92f0b778…` + 词典 96,039 B `f757fa1c…`）。新增 `lib/foundation/image_translation/ocr_dict.dart`：一个解析器同时读「纯文本词典」与「`inference.yml` 内联 `character_dict`」，并让**三个计数点**（`loadCharset` / `dictLineCountSync` / `_readTextLines`）走同一个函数 —— 三者不一致正是把正确模型判死的机制。
+4. **删除** `text_detector_manga` 占位行（连同测试里对它的三处引用改为自带夹具的语义测试）。
+5. **每个模型一行说明**：`ModelComponent.blurbKey` + 模型页渲染 + 7 条文案（简繁）。
+
+**置信度声明（必须说清）**：`v5serverdet` 与 `korec` 的 sha256 来自 HF 的 LFS etag，**只做了体积吻合 + etag 机制单样本交叉验证**（唯一同时下载并 HEAD 的文件两者完全一致），**未逐字节下载复核**。若真机下载校验失败，即此处待复核。
+
+**副作用提醒**：已下载过旧检测器的用户，行内会因 sha 不匹配显示校验不通过，需重新下载该模型（文件名相同，路径不变）。OCR 侧不受影响（`ocr_ja`/`ocr_zh` 未改动）。
+
+### 11-5 阶段 5：云验证
+
+| 检查 | 结果 |
+| :-- | :-- |
+| `flutter analyze --no-pub lib/ test/`（本机，唯一允许的本地命令） | 0 error（剩余 9 条均为未改动文件的既有 info/warning） |
+| 云端 `Test`（`7fe6f28`：阶段 2+3） | 见 §11-6 |
+| 云端 `Test` + `Build_Windows`（`ea7dd9a`：阶段 4） | 见 §11-6 |
