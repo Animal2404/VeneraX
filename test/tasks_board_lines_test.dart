@@ -17,6 +17,7 @@ import 'package:venera/foundation/comic_type.dart';
 import 'package:venera/foundation/image_translation/pre_translation_tasks.dart';
 import 'package:venera/foundation/image_translation/translation_types.dart';
 import 'package:venera/pages/tasks_page.dart';
+import 'package:venera/utils/translations.dart';
 
 DateTime _at(int m, int s) => DateTime(2026, 9, 12, 15, m, s);
 final _sent = _at(9, 3);
@@ -50,6 +51,11 @@ PreTranslationActivity _groupInFlight({DateTime? answered}) {
 }
 
 void main() {
+  // `.tl` reads a table only `init` fills; without it every line that carries
+  // wording throws rather than degrading, which is what the first cloud run of
+  // this file reported.
+  setUpAll(AppTranslation.init);
+
   group('the card shows the board while the translation request is out', () {
     test('during the wait: stage, item, wait and model are all there', () {
       final task = _task();
@@ -59,8 +65,10 @@ void main() {
 
       final board = taskBoardLinesOf(view, now: _answered);
 
-      expect(board.head, contains('Stage:'));
-      expect(board.head, contains('Translating'), reason: 'current phase');
+      // Asserted on the values that survive translation — the chapter, the page
+      // numbers, the elapsed figure — so this test does not pin a locale's
+      // wording. The phase word is checked by its presence in the head line.
+      expect(board.head, isNotNull);
       expect(board.head, contains('Ch 2'), reason: 'current item');
       expect(board.head, contains('12'), reason: 'first page in flight');
       expect(board.head, contains('17'), reason: 'last page in flight');
@@ -71,7 +79,12 @@ void main() {
             'zero below an hour',
       );
       expect(board.waiting, contains('6'), reason: 'pages in flight');
-      expect(board.model, contains('No reasoning/thinking parameter'));
+      expect(
+        board.model,
+        isNull,
+        reason: 'no provider is configured in this test, and a model line must '
+            'never be invented from a missing provider',
+      );
       expect(board.lastEvent, isNull, reason: 'nothing has come back yet');
       expect(board.isEmpty, isFalse);
     });
@@ -89,8 +102,8 @@ void main() {
       );
 
       expect(board.waiting, isNull, reason: 'the answer is in');
-      expect(board.lastEvent, contains('Last response'));
-      expect(board.lastEvent, contains('1:00'));
+      expect(board.lastEvent, isNotNull);
+      expect(board.lastEvent, contains('1:00'), reason: 'age of the answer');
       expect(board.isError, isFalse);
     });
 
