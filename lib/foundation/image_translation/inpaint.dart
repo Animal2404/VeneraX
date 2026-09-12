@@ -7,11 +7,38 @@ import 'package:venera/foundation/image_translation/translation_types.dart';
 class TextMask {
   TextMask(this.left, this.top, this.rw, this.rh, this.mask);
 
+  /// The background luminance the classifier measured in the ring, and the
+  /// luminance of the class it decided was lettering.
+  ///
+  /// Recorded because "the erase left a black smear" has two very different
+  /// causes and the ledger could not tell them apart: a mask that swallowed
+  /// artwork (the classes went the wrong way round on a dark background), and a
+  /// fill that dragged dark pixels across a light area. With both numbers, plus
+  /// the coverage below, one log line answers which of the two happened.
+  int? bgLuma;
+
+  /// Luminance of the class the classifier took for lettering.
+  int? textLuma;
+
   final int left;
   final int top;
   final int rw;
   final int rh;
   final Uint8List mask;
+}
+
+/// The classifier's own account of one window: what it measured as background,
+/// what it took for lettering, and how much of the window it masked.
+extension TextMaskLedger on TextMask {
+  String get ledger {
+    var covered = 0;
+    for (var i = 0; i < mask.length; i++) {
+      if (mask[i] != 0) covered++;
+    }
+    var share = mask.isEmpty ? 0.0 : covered / mask.length;
+    return 'bg=${bgLuma ?? -1} text=${textLuma ?? -1} '
+        'cover=${share.toStringAsFixed(2)}';
+  }
 }
 
 /// How one erase attempt ended. Naming these is the point: every `kept*`
@@ -48,7 +75,12 @@ enum EraseOutcome {
 
 /// One line of the erase ledger: what happened to one requested rectangle.
 class EraseResult {
-  const EraseResult(this.rect, this.outcome, [this.detail]);
+  const EraseResult(this.rect, this.outcome, [this.detail, this.maskStats]);
+
+  /// The classifier's numbers for this window (`bg=… text=… cover=…`), when a
+  /// mask was computed at all. Carried so the ledger can be read without
+  /// re-running the erase.
+  final String? maskStats;
 
   /// The rectangle as the caller asked for it.
   final IntRect rect;
@@ -96,6 +128,19 @@ class EraseReport {
   /// ledger", which is why [describeLedger] exists.
   String describe({int detailLimit = 4}) {
     final parts = <String>['erased=$erased', 'skipped=$skipped'];
+    // What the classifier saw, for the windows that ran. Without this the
+    // ledger says an erase "succeeded" while the page shows a black smear, and
+    // the two causes of that (a mask over artwork, a fill dragging dark pixels)
+    // stay indistinguishable.
+    final stats =
+        results
+            .where((r) => r.wrotePixels && r.maskStats != null)
+            .take(detailLimit)
+            .map((r) => '${r.rect.left},${r.rect.top}(${r.maskStats})')
+            .join(' ');
+    if (stats.isNotEmpty) {
+      parts.add('masks={$stats}');
+    }
     if (rolledBack > 0) {
       parts.add('rolled_back=$rolledBack');
       final reasons =
@@ -217,7 +262,7 @@ abstract final class TextInpainter {
         continue;
       }
       final (outcome, detail) = eraseWindow(image, m);
-      results.add(EraseResult(rect, outcome, detail));
+      results.add(EraseResult(rect, outcome, detail, m.ledger));
     }
     return EraseReport(results);
   }
@@ -622,7 +667,11 @@ abstract final class TextInpainter {
         }
       }
     }
-    return TextMask(left, top, rw, rh, mask);
+    // The classifier's own numbers ride along so the ledger can distinguish
+    // "the mask swallowed artwork" from "the fill dragged dark pixels".
+    return TextMask(left, top, rw, rh, mask)
+      ..bgLuma = bgLum.round()
+      ..textLuma = textMean.round();
   }
 
   static int _ringMeanLuminance(Uint8List lum, int rw, int rh) {
