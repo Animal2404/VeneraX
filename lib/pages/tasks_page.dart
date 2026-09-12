@@ -964,13 +964,18 @@ class _TasksPageState extends State<TasksPage>
                   task.finalSummary != null ||
                   task.done + task.failed > 0) ...[
                 const SizedBox(height: 4),
+                // `durations.*` — each phase's own cost — not the cumulative
+                // `…DoneAfter` marks. The cumulative figure is what the total
+                // row prints, and reading it under a phase's name is how
+                // "Translated 4:41" came to include the 0:50 of recognition and
+                // stop adding up to the 4:44 beside it.
                 _phaseLine(
                   labelKey: "Recognized: @done/@total",
                   done: progressView.recognized,
                   total: task.total,
                   active: progressView.focusRecognizing,
                   ratePagesPerMinute: progressView.recognitionRatePerMinute,
-                  doneAfter: progressView.recognitionDoneAfter,
+                  doneAfter: progressView.durations.recognition,
                 ),
                 const SizedBox(height: 2),
                 _phaseLine(
@@ -979,7 +984,7 @@ class _TasksPageState extends State<TasksPage>
                   total: task.total,
                   active: progressView.focusTranslating,
                   ratePagesPerMinute: progressView.translationRatePerMinute,
-                  doneAfter: progressView.translationDoneAfter,
+                  doneAfter: progressView.durations.translation,
                 ),
                 const SizedBox(height: 2),
                 _phaseLine(
@@ -988,7 +993,7 @@ class _TasksPageState extends State<TasksPage>
                   total: task.total,
                   active: progressView.focusRendering,
                   ratePagesPerMinute: progressView.commitRatePerMinute,
-                  doneAfter: progressView.renderDoneAfter,
+                  doneAfter: progressView.durations.render,
                 ),
                 // Without this note a live "Recognized 8/82" beside a static
                 // "Pages 0/82" reads as a contradiction: recognizing a page is

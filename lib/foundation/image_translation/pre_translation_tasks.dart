@@ -378,6 +378,45 @@ class PreTranslationActivity {
   DateTime? translatedDoneAt;
   DateTime? renderedDoneAt;
 
+  /// When recognition actually began (the first chunk reached the worker).
+  /// Distinct from `task.createdAt`: the job exists from the moment the user
+  /// presses the button, and the gap between the two is downloads and model
+  /// loading — real time, but not "recognition".
+  DateTime? ocrStartedAt;
+
+  /// When the first translation request went out, and when the first answer
+  /// came back. The pair is what makes the silence in between *visible*: that
+  /// wait is one long `await` with no natural progress of its own, so a card
+  /// that can say "waiting since 12:03" is the difference between "slow" and
+  /// "stuck".
+  DateTime? requestSentAt;
+  DateTime? firstResponseAt;
+
+  /// Set once the six-timestamp timeline has been logged for this job, so a
+  /// finished card that keeps rebuilding cannot repeat the line.
+  bool timelineLogged = false;
+
+  /// Stamps the two figures that only the pipeline's own callbacks can see.
+  ///
+  /// Written on first observation only: chunks finish out of order, and a
+  /// later chunk entering recognition must not move the phase's start line
+  /// backwards.
+  void notePipelineStage(TranslationStage stage, DateTime at) {
+    if (ocrStartedAt == null &&
+        (stage == TranslationStage.loadingModel ||
+            stage == TranslationStage.recognizing)) {
+      ocrStartedAt = at;
+    }
+    if (requestSentAt == null && stage == TranslationStage.translating) {
+      requestSentAt = at;
+    }
+  }
+
+  /// Records the first translation answer for this job, once.
+  void noteFirstResponse(DateTime at) {
+    firstResponseAt ??= at;
+  }
+
   /// Records the three completion stamps. Idempotent: each one is written only
   /// while it is still null, so a rebuild, a re-entrant notify or a late call
   /// cannot move a phase's finish line.
@@ -391,6 +430,10 @@ class PreTranslationActivity {
     }
     if (renderedDoneAt == null && renderedThrough(task) >= task.total) {
       renderedDoneAt = now;
+    }
+    if (!timelineLogged && renderedDoneAt != null) {
+      timelineLogged = true;
+      logPhaseTimeline(task, this);
     }
   }
 
@@ -914,10 +957,163 @@ Duration? decayEta(
 /// How long a phase took, measured from the job's start; null while that phase
 /// has not finished. Clamped at zero so a clock that moved backwards cannot
 /// print a negative duration.
+///
+/// This is the *cumulative* figure — "the job had been running this long when
+/// the phase finished". It is the wrong number for a row labelled with one
+/// phase's name, which is what [phaseDurationsOf] exists to provide; it is kept
+/// for the total row, where the same quantity is exactly right.
 Duration? phaseDoneAfter(PreTranslationTask task, DateTime? doneAt) {
   if (doneAt == null) return null;
   var elapsed = doneAt.difference(task.createdAt);
   return elapsed.isNegative ? Duration.zero : elapsed;
+}
+
+/// Each phase's own cost, measured between consecutive finish lines.
+///
+/// The card used to print [phaseDoneAfter] under "Recognized / Translated /
+/// Rendered … elapsed", so a run whose recognition took 0:50 and whose
+/// translation took 3:51 showed "Translated … 4:41" — the OCR time included,
+/// because 4:41 was the clock since the job started, not the phase. The user
+/// reads that row as the phase's cost and cannot reconcile it with the total:
+/// 0:50 + 4:41 + 0:03 ≠ 4:44. Subtracting the previous stamp is the whole fix,
+/// and it needs no new measurement — the finish lines were already recorded.
+///
+/// Additive by construction: recognition + translation + render == total.
+class PhaseDurations {
+  const PhaseDurations({
+    this.recognition,
+    this.translation,
+    this.render,
+    this.total,
+    this.ocrStartDelay,
+  });
+
+  /// Job start → recognition finished.
+  final Duration? recognition;
+
+  /// Recognition finished → translation finished. This is the phase the user
+  /// complained about: it starts when the text is in hand and the request can
+  /// go out, and ends when the last answer lands.
+  final Duration? translation;
+
+  /// Translation finished → pages drawn.
+  final Duration? render;
+
+  /// Job start → pages drawn.
+  final Duration? total;
+
+  /// Job start → the first chunk reached the worker (downloads, queueing).
+  final Duration? ocrStartDelay;
+
+  /// Null when any phase is still open — a half-finished sum is a wrong
+  /// number, not a partial one.
+  bool get complete =>
+      recognition != null && translation != null && render != null;
+
+  /// The three phases added up. Must equal [total] once every phase is in;
+  /// `phase_durations_test.dart` pins that, because a display that disagrees
+  /// with itself is the defect this type was written to remove.
+  Duration? get sum {
+    if (!complete) return null;
+    return recognition! + translation! + render!;
+  }
+}
+
+/// Reads the phase costs off a job's stamps. Pure: every input is a value the
+/// caller already holds, so the arithmetic is testable without a running job.
+PhaseDurations phaseDurationsOf(
+  PreTranslationTask task,
+  PreTranslationActivity? activity,
+) {
+  Duration? between(DateTime? from, DateTime? to) {
+    if (from == null || to == null) return null;
+    var d = to.difference(from);
+    return d.isNegative ? Duration.zero : d;
+  }
+
+  var created = task.createdAt;
+  var ocrDone = activity?.recognizedDoneAt;
+  var xlateDone = activity?.translatedDoneAt;
+  var renderDone = activity?.renderedDoneAt;
+  var ocrStart = activity?.ocrStartedAt;
+  // A job that already finished carries its stamps in the summary, so a card
+  // opened later reads the same numbers as one that watched it happen.
+  if (ocrDone == null || xlateDone == null || renderDone == null) {
+    var summary = task.finalSummary;
+    if (summary != null) {
+      ocrDone ??= _stampFromMs(created, summary.recognitionDoneAfterMs);
+      xlateDone ??= _stampFromMs(created, summary.translationDoneAfterMs);
+      renderDone ??= _stampFromMs(created, summary.renderDoneAfterMs);
+    }
+  }
+  return PhaseDurations(
+    recognition: between(created, ocrDone),
+    translation: between(ocrDone, xlateDone),
+    render: between(xlateDone, renderDone),
+    total: between(created, renderDone),
+    ocrStartDelay: between(created, ocrStart),
+  );
+}
+
+DateTime? _stampFromMs(DateTime created, int? ms) =>
+    ms == null ? null : created.add(Duration(milliseconds: ms));
+
+/// The same subtraction, for the three cumulative millisecond marks a finished
+/// job persists. Kept beside [phaseDurationsOf] so the live card and the
+/// summary card cannot disagree about what "translation took" means.
+PhaseDurations phaseDurationsFromStamps({
+  required int? recognitionDoneAfterMs,
+  required int? translationDoneAfterMs,
+  required int? renderDoneAfterMs,
+}) {
+  Duration? ms(int? v) => v == null ? null : Duration(milliseconds: v);
+  Duration? diff(int? from, int? to) {
+    if (from == null || to == null) return null;
+    var d = to - from;
+    return Duration(milliseconds: d < 0 ? 0 : d);
+  }
+
+  return PhaseDurations(
+    recognition: ms(recognitionDoneAfterMs),
+    translation: diff(recognitionDoneAfterMs, translationDoneAfterMs),
+    render: diff(translationDoneAfterMs, renderDoneAfterMs),
+    total: ms(renderDoneAfterMs),
+  );
+}
+
+/// One grep-able line with the six timestamps a report needs, plus the three
+/// phase costs and their sum.
+///
+/// The card shows the numbers; a log line is what makes them *checkable* — a
+/// user reporting "4:41 of translation" and a developer reading the same run
+/// can now both point at the same six instants. The sum is printed rather than
+/// left to the reader: recognition + translation + render must equal total, and
+/// printing both sides is how a future regression in that arithmetic shows up
+/// as a disagreement instead of as a plausible-looking number.
+void logPhaseTimeline(PreTranslationTask task, PreTranslationActivity activity) {
+  var d = phaseDurationsOf(task, activity);
+  String at(DateTime? t) => t == null
+      ? '-'
+      : '${t.hour.toString().padLeft(2, '0')}:'
+            '${t.minute.toString().padLeft(2, '0')}:'
+            '${t.second.toString().padLeft(2, '0')}.'
+            '${t.millisecond.toString().padLeft(3, '0')}';
+  String secs(Duration? v) =>
+      v == null ? '-' : (v.inMilliseconds / 1000).toStringAsFixed(1);
+  Log.info(
+    'Pre-translation',
+    'PhaseTimeline pages=${task.total} '
+    'start=${at(task.createdAt)} '
+    'ocrStart=${at(activity.ocrStartedAt)} '
+    'ocrDone=${at(activity.recognizedDoneAt)} '
+    'reqSent=${at(activity.requestSentAt)} '
+    'firstResp=${at(activity.firstResponseAt)} '
+    'done=${at(activity.renderedDoneAt)} '
+    'ocr=${secs(d.recognition)}s '
+    'translate=${secs(d.translation)}s '
+    'render=${secs(d.render)}s '
+    'sum=${secs(d.sum)}s total=${secs(d.total)}s',
+  );
 }
 
 class PreTranslationProgress {
@@ -950,6 +1146,7 @@ class PreTranslationProgress {
     required this.recognitionDoneAfter,
     required this.translationDoneAfter,
     required this.renderDoneAfter,
+    this.durations = const PhaseDurations(),
     required this.epName,
     required this.sessions,
     required this.arenaMb,
@@ -1121,6 +1318,7 @@ class PreTranslationProgress {
       recognitionDoneAfter: phaseDoneAfter(task, activity?.recognizedDoneAt),
       translationDoneAfter: phaseDoneAfter(task, activity?.translatedDoneAt),
       renderDoneAfter: phaseDoneAfter(task, activity?.renderedDoneAt),
+      durations: phaseDurationsOf(task, activity),
       epName: workerReport?.active.name ?? batchPerf?.epName,
       sessions: workerReport?.sessionCount ?? batchPerf?.sessionCount,
       arenaMb: arenaBytes == null
@@ -1231,6 +1429,11 @@ class PreTranslationProgress {
   final Duration? recognitionDoneAfter;
   final Duration? translationDoneAfter;
   final Duration? renderDoneAfter;
+
+  /// Each phase's own cost. The three `…DoneAfter` fields above are cumulative
+  /// marks since the job started; these are the numbers a row labelled with one
+  /// phase's name should print (see [phaseDurationsOf] for why both exist).
+  final PhaseDurations durations;
 
   /// Engine row — the arena figure is host staging memory, not VRAM (plan
   /// §3.6), which is why the label says "暂存池", never 显存.
@@ -1433,6 +1636,11 @@ class PreTranslationTaskSummary {
       renderDoneAfter: renderDoneAfterMs == null
           ? null
           : Duration(milliseconds: renderDoneAfterMs!),
+      durations: phaseDurationsFromStamps(
+        recognitionDoneAfterMs: recognitionDoneAfterMs,
+        translationDoneAfterMs: translationDoneAfterMs,
+        renderDoneAfterMs: renderDoneAfterMs,
+      ),
       epName: epName,
       sessions: sessions,
       arenaMb: arenaMb,
@@ -2884,9 +3092,15 @@ class PreTranslationTaskManager with ChangeNotifier {
           // the stream's sample source (the GroupPerf below carries pages plus
           // duration), it only records *when* the answer landed.
           var crossed = activity.noteStage(stage);
+          _activities[task.id]?.notePipelineStage(stage, DateTime.now());
           // The service scores only the pages it was handed, on the same scale.
           activity.completedPages = settledBeforeBatch + completed;
-          if (crossed) answeredAt = DateTime.now();
+          if (crossed) {
+            answeredAt = DateTime.now();
+            // `crossed` is the moment this group's answer landed, so the first
+            // one of them is the first response of the whole job.
+            _activities[task.id]?.noteFirstResponse(answeredAt!);
+          }
           _notifyActivity();
         },
         onGroupPerf: (perf) {
@@ -3033,10 +3247,14 @@ class PreTranslationTaskManager with ChangeNotifier {
             // still the timestamp the perf sample is credited at, so the
             // window measures "answer landed", not "page finished drawing".
             var crossed = activity.noteStage(stage);
+            _activities[task.id]?.notePipelineStage(stage, DateTime.now());
             // The service scores only the pages it was handed, on the same
             // page-unit scale, so the two halves simply add up.
             activity.completedPages = preSettled + completed;
-            if (crossed) answeredAt = DateTime.now();
+            if (crossed) {
+              answeredAt = DateTime.now();
+              _activities[task.id]?.noteFirstResponse(answeredAt!);
+            }
             _notifyActivity();
           },
           onGroupPerf: (perf) {

@@ -19,6 +19,7 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:venera/foundation/comic_type.dart';
 import 'package:venera/foundation/image_translation/pre_translation_tasks.dart';
+import 'package:venera/foundation/image_translation/translation_types.dart';
 
 final _start = DateTime(2026, 1, 1, 12);
 
@@ -272,6 +273,128 @@ void main() {
         later.eta!,
         greaterThanOrEqualTo(Duration.zero),
       );
+    });
+  });
+
+  group('phase costs: the three rows must add up to the total', () {
+    // The reported run, to the second — the one in the user's screenshot:
+    // job start 15:08:12, recognition done 15:09:02 (the card's 「已识别 0:50」),
+    // translation done 15:12:53 (the card's 「已翻译 4:41」), render done
+    // 15:12:56 (「已渲染 4:44」). The rows printed the *cumulative* marks, so
+    // "Translated 4:41" contained the 0:50 of OCR and the three rows could not
+    // be added up to the 4:44 printed under them. These fixtures are that run.
+    PreTranslationTask reportedTask() => PreTranslationTask(
+      id: 't',
+      cid: 'c',
+      sourceKey: 's',
+      comicType: ComicType(0),
+      title: 'Comic',
+      chapters: [PreTranslationChapter(eid: '1', title: 'Ch 1', total: 37)],
+      createdAt: DateTime(2026, 9, 12, 15, 8, 12),
+      status: PreTranslationTaskStatus.running,
+    );
+
+    PreTranslationActivity reportedActivity() {
+      final activity = PreTranslationActivity();
+      activity.ocrStartedAt = DateTime(2026, 9, 12, 15, 8, 20);
+      activity.requestSentAt = DateTime(2026, 9, 12, 15, 9, 3);
+      activity.firstResponseAt = DateTime(2026, 9, 12, 15, 10, 51);
+      activity.recognizedDoneAt = DateTime(2026, 9, 12, 15, 9, 2);
+      activity.translatedDoneAt = DateTime(2026, 9, 12, 15, 12, 53);
+      activity.renderedDoneAt = DateTime(2026, 9, 12, 15, 12, 56);
+      return activity;
+    }
+
+    test('the reported run: 0:50 OCR + 3:51 translate + 0:03 render = 4:44', () {
+      final d = phaseDurationsOf(reportedTask(), reportedActivity());
+
+      expect(d.recognition, const Duration(seconds: 50));
+      expect(
+        d.translation,
+        const Duration(seconds: 231),
+        reason: '4:41 minus the 0:50 the row used to swallow',
+      );
+      expect(d.render, const Duration(seconds: 3));
+      expect(d.total, const Duration(seconds: 284));
+      expect(d.sum, d.total, reason: 'the rows must add up to the total row');
+      expect(d.complete, isTrue);
+      expect(d.ocrStartDelay, const Duration(seconds: 8));
+    });
+
+    test('an open phase has no sum at all, rather than half a number', () {
+      final task = reportedTask();
+      final activity = PreTranslationActivity()
+        ..recognizedDoneAt = DateTime(2026, 9, 12, 15, 9, 2);
+
+      final d = phaseDurationsOf(task, activity);
+
+      expect(d.recognition, const Duration(seconds: 50));
+      expect(d.translation, isNull);
+      expect(d.render, isNull);
+      expect(d.total, isNull);
+      expect(d.sum, isNull);
+      expect(d.complete, isFalse);
+    });
+
+    test('a backwards clock cannot print a negative phase', () {
+      final task = reportedTask();
+      final activity = PreTranslationActivity()
+        ..recognizedDoneAt = DateTime(2026, 9, 12, 15, 9, 2)
+        ..translatedDoneAt = DateTime(2026, 9, 12, 15, 9, 0)
+        ..renderedDoneAt = DateTime(2026, 9, 12, 15, 8, 0);
+
+      final d = phaseDurationsOf(task, activity);
+
+      expect(d.translation, Duration.zero);
+      expect(d.render, Duration.zero);
+      for (final v in [d.recognition, d.translation, d.render, d.total]) {
+        expect(v!.isNegative, isFalse);
+      }
+    });
+
+    test('the persisted summary agrees with the live job, to the second', () {
+      // A card opened after the fact reads the summary; a card watched live
+      // reads the activity. The two must not disagree about what a phase cost,
+      // which is why both go through the same subtraction.
+      final live = phaseDurationsOf(reportedTask(), reportedActivity());
+      final stored = phaseDurationsFromStamps(
+        recognitionDoneAfterMs: 50000,
+        translationDoneAfterMs: 281000,
+        renderDoneAfterMs: 284000,
+      );
+
+      expect(stored.recognition, live.recognition);
+      expect(stored.translation, live.translation);
+      expect(stored.render, live.render);
+      expect(stored.total, live.total);
+      expect(stored.sum, stored.total);
+    });
+
+    test('a summary from before this change simply has no durations', () {
+      final stored = phaseDurationsFromStamps(
+        recognitionDoneAfterMs: null,
+        translationDoneAfterMs: null,
+        renderDoneAfterMs: null,
+      );
+
+      expect(stored.complete, isFalse);
+      expect(stored.sum, isNull);
+    });
+
+    test('the pipeline stamps are written once and never move', () {
+      final activity = PreTranslationActivity();
+
+      activity.notePipelineStage(TranslationStage.recognizing, _at(5));
+      activity.notePipelineStage(TranslationStage.translating, _at(30));
+      activity.noteFirstResponse(_at(90));
+      // Every later chunk re-reports its stage, and every later group answers.
+      activity.notePipelineStage(TranslationStage.recognizing, _at(40));
+      activity.notePipelineStage(TranslationStage.translating, _at(60));
+      activity.noteFirstResponse(_at(120));
+
+      expect(activity.ocrStartedAt, _at(5));
+      expect(activity.requestSentAt, _at(30));
+      expect(activity.firstResponseAt, _at(90));
     });
   });
 
