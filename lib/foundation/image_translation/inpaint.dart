@@ -3,6 +3,27 @@ import 'dart:typed_data';
 
 import 'package:venera/foundation/image_translation/translation_types.dart';
 
+/// How much of an OCR rectangle may be masked before the erase is refused.
+///
+/// Was 0.85, which only caught the absurd case. Measured on the reported run,
+/// by recomputing this classifier over the stored erase rectangles and the
+/// cached source pages, the two populations do not overlap at all:
+///
+///  * a bubble on light paper — the case the eraser is for — masks 0.09 to 0.27
+///    of its rectangle;
+///  * the three windows that came back as black smears — white lettering on a
+///    black band (background 74), lettering over screentone (151), a black heart
+///    with its white outline (147) — mask 0.45, 0.48 and 0.51.
+///
+/// The mechanism is the class choice: on a dark or mid-tone window "the class
+/// further from the ring's mean is the lettering" picks the *bright* class,
+/// which out there is the paper and the outline rather than the glyphs, so half
+/// the rectangle is erased and the fill drags the dark background across it.
+/// Refusing those windows costs nothing worse than the outcome this file already
+/// prefers everywhere else: the original lettering is left in place, which is a
+/// readable page, where a black smear is not.
+const double maxMaskCoverage = 0.35;
+
 /// Working window + per-pixel 0/1 stroke mask for one text region.
 class TextMask {
   TextMask(this.left, this.top, this.rw, this.rh, this.mask);
@@ -640,7 +661,9 @@ abstract final class TextInpainter {
       1,
       (allowedRight - allowedLeft) * (allowedBottom - allowedTop),
     );
-    if (maskCount == 0 || maskCount > allowedArea * 0.85) return null;
+    if (maskCount == 0 || maskCount > allowedArea * maxMaskCoverage) {
+      return null;
+    }
 
     // Drop isolated speck components (threshold noise) before erasing: an
     // erased+filled speck becomes a faint smudge on otherwise clean art. Only
