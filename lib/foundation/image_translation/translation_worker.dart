@@ -2335,13 +2335,24 @@ class _WorkerState {
                   for (var box in tileBoxes) {
                     box.top += info.top;
                     box.bottom += info.top;
-                    if (!boxesList.any((existing) => _iou(existing, box) > 0.5)) {
+                    final duplicateOf = boxesList.indexWhere(
+                      (existing) => duplicateDetectionBox(existing, box),
+                    );
+                    if (duplicateOf < 0) {
                       boxesList.add(box);
                     } else {
                       // The same line seen twice because two detection tiles
                       // overlap by 128 px. F13.5: this used to be exactly as
                       // invisible as a real rejection, and it is not one —
                       // which is why it is tallied apart from `tiny`/`lowScore`.
+                      //
+                      // Keep the fuller of the two: the truncated copy is the
+                      // artefact of the tile edge, and keeping whichever arrived
+                      // first is how a half-line came to be recognized and drawn
+                      // beside the whole one.
+                      if (box.area > boxesList[duplicateOf].area) {
+                        boxesList[duplicateOf] = box;
+                      }
                       tally.dupTile++;
                     }
                   }
@@ -4423,6 +4434,41 @@ int _ensureContrast(int text, int bg) {
   // Too close: fall back to a high-contrast neutral against the background.
   return bl < 128 ? 0xFFF5F5F5 : 0xFF202020;
 }
+
+/// How much of the *smaller* box the intersection covers.
+///
+/// The metric for "the same thing seen twice at different sizes": a line
+/// crossing a detection-tile edge is detected once whole and once truncated,
+/// and the truncated box sits entirely inside the whole one. IoU cannot see
+/// that — it divides by the union, so a partial box scores below 0.5 no matter
+/// how completely it is contained — which is why both copies survived the
+/// stitch, reached clustering as two lines, were translated twice and drawn in
+/// two overlapping boxes (the duplicated text in the stored blocks of pages 4
+/// and 9 is exactly this).
+double _containment(IntRect a, IntRect b) {
+  var left = math.max(a.left, b.left);
+  var top = math.max(a.top, b.top);
+  var right = math.min(a.right, b.right);
+  var bottom = math.min(a.bottom, b.bottom);
+  if (left >= right || top >= bottom) return 0;
+  var inter = (right - left) * (bottom - top);
+  var smaller = math.min(a.area, b.area);
+  return smaller <= 0 ? 0 : inter / smaller;
+}
+
+/// Whether two boxes are the same text line detected in two overlapping tiles.
+///
+/// Called only for boxes coming from *different* tiles, so a match is never a
+/// pair of legitimately separate lines in one tile: with that guarantee,
+/// near-identical boxes (IoU) and nested boxes (containment) are both the same
+/// line. The threshold is high on purpose — a line that merely touches its
+/// neighbour stays out, which the adjacent columns of one bubble depend on.
+bool duplicateDetectionBox(
+  IntRect a,
+  IntRect b, {
+  double containment = 0.8,
+  double iou = 0.5,
+}) => _containment(a, b) >= containment || _iou(a, b) > iou;
 
 double _iou(IntRect a, IntRect b) {
   var left = math.max(a.left, b.left);
