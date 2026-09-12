@@ -398,6 +398,124 @@ void main() {
     });
   });
 
+  group('the board has something true to say while a request is out', () {
+    // The reported run's silent window: the first request went out at 15:09:03
+    // and the first answer landed at 15:10:51, and for those 108 seconds the
+    // card had no line that could change. These assertions pin the two facts
+    // the board is built from, so "the screen looked frozen" cannot come back
+    // as a display bug that no test sees.
+    PreTranslationActivity activityWith({
+      DateTime? requestSentAt,
+      DateTime? firstResponseAt,
+    }) {
+      final activity = PreTranslationActivity();
+      activity.requestSentAt = requestSentAt;
+      activity.firstResponseAt = firstResponseAt;
+      return activity;
+    }
+
+    test('waiting is live: it grows with the clock the card is drawn at', () {
+      final activity = activityWith(
+        requestSentAt: DateTime(2026, 9, 12, 15, 9, 3),
+      );
+
+      expect(
+        activity.waitingFor(DateTime(2026, 9, 12, 15, 9, 33)),
+        const Duration(seconds: 30),
+      );
+      expect(
+        activity.waitingFor(DateTime(2026, 9, 12, 15, 10, 51)),
+        const Duration(seconds: 108),
+        reason: 'the reported silence, to the second',
+      );
+    });
+
+    test('there is no wait before a request, and none after an answer', () {
+      expect(
+        activityWith().waitingFor(DateTime(2026, 9, 12, 15, 9, 30)),
+        isNull,
+        reason: 'nothing has been asked yet',
+      );
+      expect(
+        activityWith(
+          requestSentAt: DateTime(2026, 9, 12, 15, 9, 3),
+          firstResponseAt: DateTime(2026, 9, 12, 15, 10, 51),
+        ).waitingFor(DateTime(2026, 9, 12, 15, 11, 0)),
+        isNull,
+        reason: 'the answer is in; the wait is over for good',
+      );
+    });
+
+    test('a backwards clock cannot print a negative wait', () {
+      final activity = activityWith(
+        requestSentAt: DateTime(2026, 9, 12, 15, 9, 3),
+      );
+
+      expect(
+        activity.waitingFor(DateTime(2026, 9, 12, 15, 9, 0)),
+        Duration.zero,
+      );
+    });
+
+    test('the first-response flag follows the two stamps', () {
+      expect(activityWith().isWaitingForFirstResponse, isFalse);
+      expect(
+        activityWith(
+          requestSentAt: DateTime(2026, 9, 12, 15, 9, 3),
+        ).isWaitingForFirstResponse,
+        isTrue,
+      );
+      expect(
+        activityWith(
+          requestSentAt: DateTime(2026, 9, 12, 15, 9, 3),
+          firstResponseAt: DateTime(2026, 9, 12, 15, 10, 51),
+        ).isWaitingForFirstResponse,
+        isFalse,
+      );
+    });
+
+    test('the board carries the current item and the last response', () {
+      final task = _task();
+      final activity = PreTranslationActivity()
+        ..currentChapter = 'Ch 2'
+        ..currentFromPage = 12
+        ..currentToPage = 17
+        ..requestSentAt = _at(10)
+        ..lastResponseAt = _at(40);
+      task.chapters.first.done = task.total;
+      activity.notePhaseCompletions(task, _at(50));
+
+      final view = PreTranslationProgress.snapshot(
+        task,
+        activity: activity,
+        now: _at(20),
+      );
+
+      expect(view.currentChapter, 'Ch 2');
+      expect(view.currentFromPage, 12);
+      expect(view.currentToPage, 17);
+      expect(view.lastResponseAt, _at(40));
+      expect(view.boardWaiting, const Duration(seconds: 10));
+      expect(view.boardError, isNull);
+    });
+
+    test('a finished card carries no board facts at all', () {
+      // The summary path leaves every one of them null: a finished job has no
+      // current item, no wait, and must not name whichever model is configured
+      // now as if it had produced this output.
+      final task = _task(status: PreTranslationTaskStatus.completed);
+      final progress = PreTranslationProgress.snapshot(task, now: _at(60));
+      final summary = PreTranslationTaskSummary.capture(progress);
+      final view = summary.toProgress(task);
+
+      expect(view.currentChapter, isNull);
+      expect(view.boardWaiting, isNull);
+      expect(view.boardModel, isNull);
+      expect(view.lastResponseAt, isNull);
+      expect(view.boardError, isNull);
+    });
+  });
+
   group('the frozen summary carries the phase finish times', () {
     test('through JSON, and back into the card fold', () {
       final task = _task();

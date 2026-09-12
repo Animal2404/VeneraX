@@ -863,6 +863,57 @@ class _TasksPageState extends State<TasksPage>
     var progressText = task.total == 0
         ? "0%"
         : "${(progress * 100).clamp(0, 100).toStringAsFixed(0)}%";
+    // ---------------------------------------------------------------------
+    // Board lines. Null when a line has nothing true to say — a finished card
+    // shows none of them, and a line that cannot be filled is better absent
+    // than filled with a placeholder.
+    // ---------------------------------------------------------------------
+    String? stageName() {
+      if (progressView.focusRecognizing) return 'Recognizing'.tl;
+      if (progressView.focusTranslating) return 'Translating'.tl;
+      if (progressView.focusRendering) return 'Rendering'.tl;
+      return null;
+    }
+
+    final boardStage = stageName();
+    final where = progressView.currentChapter == null
+        ? null
+        : 'Now: @chapter · pages @from-@to'.tlParams({
+            'chapter': progressView.currentChapter!,
+            'from': '${progressView.currentFromPage ?? 0}',
+            'to': '${progressView.currentToPage ?? 0}',
+          });
+    final String? boardLine = boardStage == null && where == null
+        ? null
+        : [
+            if (boardStage != null)
+              'Stage: @stage'.tlParams({'stage': boardStage}),
+            if (where != null) where,
+          ].join(' · ');
+
+    final waiting = progressView.boardWaiting;
+    final String? waitingLine = waiting == null
+        ? null
+        : 'Waiting for the translation endpoint: @waited (@pages pages in flight)'
+              .tlParams({
+                'waited': formatTaskDuration(waiting),
+                'pages':
+                    '${(progressView.currentToPage ?? 0) - (progressView.currentFromPage ?? 0) + 1}',
+              });
+    final model = progressView.boardModel;
+    final String? modelLine = model == null || model.isEmpty
+        ? null
+        : '$model · ${'No reasoning/thinking parameter is sent: the app posts only the model, the system prompt and the text.'.tl}';
+    final lastEventLine = progressView.boardError != null
+        ? 'Last error: @error'.tlParams({'error': progressView.boardError!})
+        : progressView.lastResponseAt != null
+        ? 'Last response @ago'.tlParams({
+            'ago': formatTaskDuration(
+              DateTime.now().difference(progressView.lastResponseAt!),
+            ),
+          })
+        : null;
+
     final card = Card(
       elevation: 0,
       color: context.colorScheme.surface,
@@ -1027,6 +1078,45 @@ class _TasksPageState extends State<TasksPage>
                   style: ts.s12.withColor(context.colorScheme.outline),
                 ),
                 const SizedBox(height: 2),
+              ],
+              // The live board (phase 2). Everything above counts what has
+              // *finished*; between "request sent" and "answer arrived" those
+              // counters cannot move, and on the reported run that silence
+              // lasted 108 seconds with nothing on screen to say the job was
+              // alive. These lines are the signal for that window: which phase
+              // it is in, what it is working on, how long it has been waiting,
+              // and when anything last came back.
+              if (boardLine != null) ...[
+                const SizedBox(height: 4),
+                Text(
+                  boardLine,
+                  style: ts.s12.withColor(context.colorScheme.onSurface),
+                ),
+              ],
+              if (waitingLine != null) ...[
+                const SizedBox(height: 2),
+                Text(
+                  waitingLine,
+                  style: ts.s12.withColor(context.colorScheme.primary),
+                ),
+              ],
+              if (modelLine != null) ...[
+                const SizedBox(height: 2),
+                Text(
+                  modelLine,
+                  style: ts.s12.withColor(context.colorScheme.outline),
+                ),
+              ],
+              if (lastEventLine != null) ...[
+                const SizedBox(height: 2),
+                Text(
+                  lastEventLine,
+                  style: ts.s12.withColor(
+                    progressView.boardError != null
+                        ? context.colorScheme.error
+                        : context.colorScheme.outline,
+                  ),
+                ),
               ],
               // The batch caps / crop counts / text-line count and the engine
               // row (backend, live sessions, staging arena, degradation) used

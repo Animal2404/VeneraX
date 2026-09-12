@@ -8,6 +8,7 @@ import 'package:venera/foundation/appdata.dart';
 import 'package:venera/foundation/background_keepalive.dart';
 import 'package:venera/foundation/comic_source/comic_source.dart';
 import 'package:venera/foundation/comic_type.dart';
+import 'package:venera/foundation/image_translation/llm_translator.dart';
 import 'package:venera/foundation/image_translation/ordered_group_committer.dart';
 import 'package:venera/foundation/image_translation/ort_capabilities.dart';
 import 'package:venera/foundation/image_translation/page_prefetcher.dart';
@@ -395,6 +396,47 @@ class PreTranslationActivity {
   /// Set once the six-timestamp timeline has been logged for this job, so a
   /// finished card that keeps rebuilding cannot repeat the line.
   bool timelineLogged = false;
+
+  // ---------------------------------------------------------------------
+  // What the board needs *during* a wait.
+  //
+  // A group's counters only move when its batch lands, so between "request
+  // sent" and "answer arrived" the card had no signal at all: on the reported
+  // run that was 108 seconds of a screen that looked frozen (the log has the
+  // same hole - the first BlockFunnel line lands at 15:10:51, almost two
+  // minutes after the previous translation line). These fields are the signal
+  // for that window: what is being worked on, and when anything last came back.
+  // ---------------------------------------------------------------------
+
+  /// The chapter the job is inside right now.
+  String? currentChapter;
+
+  /// 1-based page range of the group in flight, within that chapter.
+  int? currentFromPage;
+  int? currentToPage;
+
+  /// When the most recent group answer (or failure) landed. Null until the
+  /// first one, which is exactly the state the waiting line exists for.
+  DateTime? lastResponseAt;
+
+  /// The last error any group hit, verbatim and short. Kept so the board can
+  /// say "last error: ..." instead of showing a progress bar that stopped.
+  String? lastError;
+
+  /// How long the job has been waiting for a translation answer, or null when
+  /// it is not waiting. Live by construction: the caller passes `now`, so the
+  /// figure ticks with the card's own refresh instead of standing still.
+  Duration? waitingFor(DateTime now) {
+    var sent = requestSentAt;
+    if (sent == null || firstResponseAt != null) return null;
+    var d = now.difference(sent);
+    return d.isNegative ? Duration.zero : d;
+  }
+
+  /// Whether the job is still waiting for the *first* answer while requests are
+  /// already out - the silent window, named.
+  bool get isWaitingForFirstResponse =>
+      requestSentAt != null && firstResponseAt == null;
 
   /// Stamps the two figures that only the pipeline's own callbacks can see.
   ///
@@ -1147,6 +1189,13 @@ class PreTranslationProgress {
     required this.translationDoneAfter,
     required this.renderDoneAfter,
     this.durations = const PhaseDurations(),
+    this.currentChapter,
+    this.currentFromPage,
+    this.currentToPage,
+    this.lastResponseAt,
+    this.boardWaiting,
+    this.boardModel,
+    this.boardError,
     required this.epName,
     required this.sessions,
     required this.arenaMb,
@@ -1319,6 +1368,19 @@ class PreTranslationProgress {
       translationDoneAfter: phaseDoneAfter(task, activity?.translatedDoneAt),
       renderDoneAfter: phaseDoneAfter(task, activity?.renderedDoneAt),
       durations: phaseDurationsOf(task, activity),
+      currentChapter: activity?.currentChapter,
+      currentFromPage: activity?.currentFromPage,
+      currentToPage: activity?.currentToPage,
+      lastResponseAt: activity?.lastResponseAt,
+      boardWaiting: activity?.waitingFor(now ?? DateTime.now()),
+      // The model is a property of the configured endpoint, not of the run —
+      // and the endpoint may have been re-pointed since. So it is quoted only
+      // while the job is live; a finished card would otherwise name whatever
+      // model happens to be configured *now* as if it had produced this output.
+      boardModel: task.isRunning || activity != null
+          ? LlmProviderStore.active?.model
+          : null,
+      boardError: activity?.lastError,
       epName: workerReport?.active.name ?? batchPerf?.epName,
       sessions: workerReport?.sessionCount ?? batchPerf?.sessionCount,
       arenaMb: arenaBytes == null
@@ -1434,6 +1496,29 @@ class PreTranslationProgress {
   /// marks since the job started; these are the numbers a row labelled with one
   /// phase's name should print (see [phaseDurationsOf] for why both exist).
   final PhaseDurations durations;
+
+  // -------------------------------------------------------------------------
+  // Live board facts. All optional: a finished card has no "current item" and
+  // no wait to show, and the summary path leaves every one of them null.
+  // -------------------------------------------------------------------------
+
+  /// Chapter the job is inside, and the 1-based page range of the group in
+  /// flight. Together they are the "what is it doing right now" line.
+  final String? currentChapter;
+  final int? currentFromPage;
+  final int? currentToPage;
+
+  /// When the last group's answer (or failure) landed.
+  final DateTime? lastResponseAt;
+
+  /// How long the current translation wait has lasted; null when not waiting.
+  /// Filled from the activity's own stamps, so it ticks with the card's
+  /// refresh instead of only moving when a batch commits.
+  final Duration? boardWaiting;
+
+  /// Model the request is addressed to, and the last error anyone hit.
+  final String? boardModel;
+  final String? boardError;
 
   /// Engine row — the arena figure is host staging memory, not VRAM (plan
   /// §3.6), which is why the label says "暂存池", never 显存.
@@ -3099,7 +3184,9 @@ class PreTranslationTaskManager with ChangeNotifier {
             answeredAt = DateTime.now();
             // `crossed` is the moment this group's answer landed, so the first
             // one of them is the first response of the whole job.
-            _activities[task.id]?.noteFirstResponse(answeredAt!);
+            var board = _activities[task.id];
+            board?.noteFirstResponse(answeredAt!);
+            board?.lastResponseAt = answeredAt;
           }
           _notifyActivity();
         },
@@ -3181,6 +3268,14 @@ class PreTranslationTaskManager with ChangeNotifier {
     // render completions, or it quietly starts measuring a different phase.
     DateTime? answeredAt;
     activity.stage = TranslationStage.fetching;
+    // The board names the work, not just the count: "chapter 2, pages 12-17"
+    // is what a user can match against the pages in front of them.
+    var board = _activities[task.id];
+    if (board != null) {
+      board.currentChapter = chapter.title;
+      board.currentFromPage = start + 1;
+      board.currentToPage = end;
+    }
     _notifyActivity();
 
     void reportFetchPhase() {
@@ -3253,7 +3348,9 @@ class PreTranslationTaskManager with ChangeNotifier {
             activity.completedPages = preSettled + completed;
             if (crossed) {
               answeredAt = DateTime.now();
-              _activities[task.id]?.noteFirstResponse(answeredAt!);
+              var board = _activities[task.id];
+              board?.noteFirstResponse(answeredAt!);
+              board?.lastResponseAt = answeredAt;
             }
             _notifyActivity();
           },
