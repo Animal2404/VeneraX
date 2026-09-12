@@ -864,55 +864,7 @@ class _TasksPageState extends State<TasksPage>
         ? "0%"
         : "${(progress * 100).clamp(0, 100).toStringAsFixed(0)}%";
     // ---------------------------------------------------------------------
-    // Board lines. Null when a line has nothing true to say — a finished card
-    // shows none of them, and a line that cannot be filled is better absent
-    // than filled with a placeholder.
-    // ---------------------------------------------------------------------
-    String? stageName() {
-      if (progressView.focusRecognizing) return 'Recognizing'.tl;
-      if (progressView.focusTranslating) return 'Translating'.tl;
-      if (progressView.focusRendering) return 'Rendering'.tl;
-      return null;
-    }
-
-    final boardStage = stageName();
-    final where = progressView.currentChapter == null
-        ? null
-        : 'Now: @chapter · pages @from-@to'.tlParams({
-            'chapter': progressView.currentChapter!,
-            'from': '${progressView.currentFromPage ?? 0}',
-            'to': '${progressView.currentToPage ?? 0}',
-          });
-    final String? boardLine = boardStage == null && where == null
-        ? null
-        : [
-            if (boardStage != null)
-              'Stage: @stage'.tlParams({'stage': boardStage}),
-            if (where != null) where,
-          ].join(' · ');
-
-    final waiting = progressView.boardWaiting;
-    final String? waitingLine = waiting == null
-        ? null
-        : 'Waiting for the translation endpoint: @waited (@pages pages in flight)'
-              .tlParams({
-                'waited': formatTaskDuration(waiting),
-                'pages':
-                    '${(progressView.currentToPage ?? 0) - (progressView.currentFromPage ?? 0) + 1}',
-              });
-    final model = progressView.boardModel;
-    final String? modelLine = model == null || model.isEmpty
-        ? null
-        : '$model · ${'No reasoning/thinking parameter is sent: the app posts only the model, the system prompt and the text.'.tl}';
-    final lastEventLine = progressView.boardError != null
-        ? 'Last error: @error'.tlParams({'error': progressView.boardError!})
-        : progressView.lastResponseAt != null
-        ? 'Last response @ago'.tlParams({
-            'ago': formatTaskDuration(
-              DateTime.now().difference(progressView.lastResponseAt!),
-            ),
-          })
-        : null;
+    final board = taskBoardLinesOf(progressView);
 
     final card = Card(
       elevation: 0,
@@ -1086,33 +1038,33 @@ class _TasksPageState extends State<TasksPage>
               // alive. These lines are the signal for that window: which phase
               // it is in, what it is working on, how long it has been waiting,
               // and when anything last came back.
-              if (boardLine != null) ...[
+              if (board.head != null) ...[
                 const SizedBox(height: 4),
                 Text(
-                  boardLine,
+                  board.head!,
                   style: ts.s12.withColor(context.colorScheme.onSurface),
                 ),
               ],
-              if (waitingLine != null) ...[
+              if (board.waiting != null) ...[
                 const SizedBox(height: 2),
                 Text(
-                  waitingLine,
+                  board.waiting!,
                   style: ts.s12.withColor(context.colorScheme.primary),
                 ),
               ],
-              if (modelLine != null) ...[
+              if (board.model != null) ...[
                 const SizedBox(height: 2),
                 Text(
-                  modelLine,
+                  board.model!,
                   style: ts.s12.withColor(context.colorScheme.outline),
                 ),
               ],
-              if (lastEventLine != null) ...[
+              if (board.lastEvent != null) ...[
                 const SizedBox(height: 2),
                 Text(
-                  lastEventLine,
+                  board.lastEvent!,
                   style: ts.s12.withColor(
-                    progressView.boardError != null
+                    board.isError
                         ? context.colorScheme.error
                         : context.colorScheme.outline,
                   ),
@@ -2448,3 +2400,90 @@ String formatTaskDuration(Duration? d) {
 /// card calls, not a copy of it.
 String formatSecondsPerPage(double seconds) =>
     seconds >= 1 ? seconds.toStringAsFixed(1) : seconds.toStringAsFixed(2);
+
+/// The live board's text, built from values only.
+///
+/// Pure and top level on purpose: the card's board is the user-visible half of
+/// "show what is happening while the request is out", and the only way to
+/// assert it without a running pipeline is to be able to call it with a
+/// progress value. Every line is null when it has nothing true to say — a
+/// finished card shows none of them, and a line that cannot be filled is better
+/// absent than filled with a placeholder.
+class TaskBoardLines {
+  const TaskBoardLines({
+    this.head,
+    this.waiting,
+    this.model,
+    this.lastEvent,
+    this.isError = false,
+  });
+
+  /// `Stage: … · Now: chapter, pages a-b`, as one line; null when neither half
+  /// is known. A single nullable string rather than a list so the card cannot
+  /// index an empty one.
+  final String? head;
+  final String? waiting;
+  final String? model;
+  final String? lastEvent;
+
+  /// Whether [lastEvent] is an error, so the card can colour it.
+  final bool isError;
+
+  bool get isEmpty =>
+      head == null &&
+      waiting == null &&
+      model == null &&
+      lastEvent == null;
+}
+
+TaskBoardLines taskBoardLinesOf(PreTranslationProgress p, {DateTime? now}) {
+  String? stageName;
+  if (p.focusRecognizing) {
+    stageName = 'Recognizing'.tl;
+  } else if (p.focusTranslating) {
+    stageName = 'Translating'.tl;
+  } else if (p.focusRendering) {
+    stageName = 'Rendering'.tl;
+  }
+
+  final where = p.currentChapter == null
+      ? null
+      : 'Now: @chapter · pages @from-@to'.tlParams({
+          'chapter': p.currentChapter!,
+          'from': '${p.currentFromPage ?? 0}',
+          'to': '${p.currentToPage ?? 0}',
+        });
+  final head = <String?>[
+    if (stageName != null) 'Stage: @stage'.tlParams({'stage': stageName}),
+    if (where != null) where,
+  ];
+
+  final waiting = p.boardWaiting;
+  final pages =
+      (p.currentToPage ?? 0) - (p.currentFromPage ?? 0) + 1;
+
+  final model = p.boardModel;
+  return TaskBoardLines(
+    head: head.isEmpty ? null : head.whereType<String>().join(' · '),
+    waiting: waiting == null
+        ? null
+        : 'Waiting for the translation endpoint: @waited (@pages pages in flight)'
+              .tlParams({
+                'waited': formatTaskDuration(waiting),
+                'pages': '$pages',
+              }),
+    model: model == null || model.isEmpty
+        ? null
+        : '$model · ${'No reasoning/thinking parameter is sent: the app posts only the model, the system prompt and the text.'.tl}',
+    lastEvent: p.boardError != null
+        ? 'Last error: @error'.tlParams({'error': p.boardError!})
+        : p.lastResponseAt != null
+        ? 'Last response @ago'.tlParams({
+            'ago': formatTaskDuration(
+              (now ?? DateTime.now()).difference(p.lastResponseAt!),
+            ),
+          })
+        : null,
+    isError: p.boardError != null,
+  );
+}
