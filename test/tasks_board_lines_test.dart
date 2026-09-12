@@ -66,8 +66,9 @@ void main() {
       expect(board.head, contains('17'), reason: 'last page in flight');
       expect(
         board.waiting,
-        contains('01:48'),
-        reason: '108 seconds of silence, the number the user could not see',
+        contains('1:48'),
+        reason: '108 seconds of silence; formatTaskDuration drops the leading '
+            'zero below an hour',
       );
       expect(board.waiting, contains('6'), reason: 'pages in flight');
       expect(board.model, contains('No reasoning/thinking parameter'));
@@ -89,7 +90,7 @@ void main() {
 
       expect(board.waiting, isNull, reason: 'the answer is in');
       expect(board.lastEvent, contains('Last response'));
-      expect(board.lastEvent, contains('01:00'));
+      expect(board.lastEvent, contains('1:00'));
       expect(board.isError, isFalse);
     });
 
