@@ -54,11 +54,15 @@ void main() {
 
       funnel.countOutcome(OcrReject.empty, text: '   ');
       funnel.countOutcome(OcrReject.untried, text: '');
-      funnel.countOutcome(null);
+      funnel.countOutcome(null); // a null verdict *is* "never attempted"
 
       expect(funnel.rejectedSamples, isEmpty);
       expect(funnel.empty, 1);
-      expect(funnel.untried, 1);
+      expect(
+        funnel.untried,
+        2,
+        reason: 'the explicit untried plus the null verdict, which maps to it',
+      );
     });
 
     test('the sample is bounded while the counts stay exact', () {
