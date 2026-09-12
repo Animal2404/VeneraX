@@ -5,24 +5,20 @@ import 'package:venera/foundation/image_translation/translation_types.dart';
 
 /// How much of an OCR rectangle may be masked before the erase is refused.
 ///
-/// Was 0.85, which only caught the absurd case. Measured on the reported run,
-/// by recomputing this classifier over the stored erase rectangles and the
-/// cached source pages, the two populations do not overlap at all:
+/// 0.85, and a tighter ceiling was tried and rejected. Measuring the reported
+/// run separates two populations neatly on *coverage* alone — a bubble on light
+/// paper masks 0.09 to 0.27 of its rectangle, while the three windows that came
+/// back as black smears (white lettering on a black band, lettering over
+/// screentone, a black heart with its white outline) mask 0.45, 0.48 and 0.51 —
+/// but coverage is not the discriminator that survives contact with the rest of
+/// the suite: dense title lettering next to a page edge, and light lettering on
+/// a black bubble, are both legitimate erases that mask about half their
+/// rectangle, and a 0.35 ceiling refused them. The suite caught it.
 ///
-///  * a bubble on light paper — the case the eraser is for — masks 0.09 to 0.27
-///    of its rectangle;
-///  * the three windows that came back as black smears — white lettering on a
-///    black band (background 74), lettering over screentone (151), a black heart
-///    with its white outline (147) — mask 0.45, 0.48 and 0.51.
-///
-/// The mechanism is the class choice: on a dark or mid-tone window "the class
-/// further from the ring's mean is the lettering" picks the *bright* class,
-/// which out there is the paper and the outline rather than the glyphs, so half
-/// the rectangle is erased and the fill drags the dark background across it.
-/// Refusing those windows costs nothing worse than the outcome this file already
-/// prefers everywhere else: the original lettering is left in place, which is a
-/// readable page, where a black smear is not.
-const double maxMaskCoverage = 0.35;
+/// So the black smear still needs a discriminator that separates *glyph-shaped*
+/// bright pixels from *artwork-shaped* bright ones — not how many of them there
+/// are. Until that exists, this stays where it was.
+const double maxMaskCoverage = 0.85;
 
 /// Working window + per-pixel 0/1 stroke mask for one text region.
 class TextMask {
