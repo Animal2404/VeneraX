@@ -6,6 +6,7 @@ import 'package:flutter/painting.dart';
 import 'package:venera/foundation/appdata.dart';
 import 'package:venera/foundation/cache_manager.dart';
 import 'package:venera/foundation/image_translation/llm_translator.dart';
+import 'package:venera/foundation/image_translation/ocr_page_label.dart';
 import 'package:venera/foundation/image_translation/ocr_fingerprint.dart';
 import 'package:venera/foundation/image_translation/ort_capabilities.dart';
 import 'package:venera/foundation/image_translation/rate_limiter.dart';
@@ -275,19 +276,6 @@ class _TranslationTask {
 /// - the text-level result (regions + translations, ~KB, 90 days): when only
 ///   the image was evicted the page is re-rendered locally without paying
 ///   for OCR or another translation request.
-/// The page-identifying tail of a cache key, for logs.
-///
-/// `…@https://i3.nhentai.net/galleries/2089266/31.jpg#s` becomes `31.jpg`: the
-/// last path segment, with the render-mode suffix removed. Full keys are
-/// unreadable in a line and the batch-local index is ambiguous, so the segment
-/// is the one part that is both short and unique per page.
-String ocrBatchPageLabel(String cacheKey) {
-  var base = cacheKey.split('#').first;
-  var slash = base.lastIndexOf('/');
-  var label = slash >= 0 ? base.substring(slash + 1) : base;
-  return label.isEmpty ? base : label;
-}
-
 class ImageTranslationService with ChangeNotifier {
   ImageTranslationService._();
 

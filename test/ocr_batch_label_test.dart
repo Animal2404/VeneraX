@@ -12,7 +12,7 @@
 // 末段（短、且逐页唯一），批内的 page=N 从此可以映射回真实页。
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:venera/foundation/image_translation/translation_service.dart';
+import 'package:venera/foundation/image_translation/ocr_page_label.dart';
 
 void main() {
   group('the OCR batch line names the pages it covers', () {
