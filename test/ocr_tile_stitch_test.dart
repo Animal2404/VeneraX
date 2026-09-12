@@ -81,6 +81,59 @@ void main() {
       );
     });
 
+    test('the threshold is a boundary, not a knob: four real pairs', () {
+      /// Every box here comes from the reported run's stored blocks.
+      ///
+      /// Three pairs are the same line captured twice by two overlapping tiles;
+      /// they must merge, and the fuller copy has to win. The fourth is two
+      /// adjacent columns of one bubble - different lines - and merging it
+      /// would delete a sentence.
+      final merge = [
+        // (whole, partial) containment 1.00
+        (IntRect(778, 1140, 887, 1463), IntRect(780, 1145, 885, 1284)),
+        (IntRect(366, 1206, 477, 1449), IntRect(374, 1212, 474, 1277)),
+        // character-for-character duplicate, containment 1.00
+        (IntRect(142, 1169, 247, 1378), IntRect(162, 1188, 259, 1370)),
+      ];
+      for (final (a, b) in merge) {
+        expect(duplicateDetectionBox(a, b), isTrue, reason: '$a / $b');
+      }
+
+      // containment 0.08
+      expect(
+        duplicateDetectionBox(
+          IntRect(239, 1086, 304, 1432),
+          IntRect(142, 1169, 247, 1378),
+        ),
+        isFalse,
+        reason: 'two columns of one bubble; each carries different lines',
+      );
+    });
+
+    test('the ambiguous middle of the range is left alone on purpose', () {
+      /// Two more pairs from the same run sit between the two groups:
+      /// containment 0.47 and 0.70, both "one bubble, two recognition
+      /// variants". One would want merging and one would not, and geometry
+      /// cannot tell them apart - so the threshold stays where the unambiguous
+      /// pairs put it, and these are documented rather than tuned around.
+      expect(
+        duplicateDetectionBox(
+          IntRect(548, 1166, 631, 1246),
+          IntRect(611, 1178, 648, 1257),
+        ),
+        isFalse,
+        reason: 'containment 0.47',
+      );
+      expect(
+        duplicateDetectionBox(
+          IntRect(142, 1169, 247, 1378),
+          IntRect(159, 1189, 285, 1282),
+        ),
+        isFalse,
+        reason: 'containment 0.70',
+      );
+    });
+
     test('lines that do not touch are never duplicates', () {
       expect(
         duplicateDetectionBox(
