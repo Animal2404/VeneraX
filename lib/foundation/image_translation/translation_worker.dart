@@ -10,6 +10,7 @@ import 'package:venera/foundation/image_translation/ocr_batching.dart';
 import 'package:venera/foundation/image_translation/ort_capabilities.dart';
 import 'package:venera/foundation/image_translation/ort_ffi.dart';
 import 'package:venera/foundation/image_translation/translation_types.dart';
+import 'package:venera/foundation/image_translation/balloon.dart';
 import 'package:venera/foundation/image_translation/translation_performance_config.dart';
 import 'package:venera/foundation/image_translation/worker_pool_selection.dart';
 import 'package:venera/foundation/log.dart';
@@ -3307,7 +3308,13 @@ List<List<IntRect>> clusterOcrBoxes(
   // can state what the rule would have done even while it changes nothing.
   var inkCandidates = 0;
   var inkRejected = 0;
+  // Merges the balloon fill refused. Unlike the strip probe this runs whether or
+  // not the ink experiment is enabled — see the veto site below.
+  var balloonRejected = 0;
   final inkDetails = <OcrInkGap>[];
+  // One balloon fill per box, computed the first time a box takes part in a
+  // candidate pair and reused for every later pair it appears in.
+  final balloons = <int, BalloonRegion?>{};
   int find(int i) {
     while (parents[i] != i) {
       parents[i] = parents[parents[i]];
@@ -3386,6 +3393,36 @@ List<List<IntRect>> clusterOcrBoxes(
         if (!inkAllow && TranslationPerformanceConfig.inkBoundarySplit) {
           continue;
         }
+        // Balloon veto. The strip probe above judges a *straight* band between
+        // two boxes, so an outline that cuts across the band diagonally — the
+        // shape two nearly-touching bubbles actually present — stays under its
+        // 80 % share and the merge survives. The balloon fill does not look at
+        // the gap's shape at all: it asks whether a walk from one block's
+        // centre reaches the other without crossing ink, which is the question
+        // the strip was standing in for. Only positive evidence vetoes: two
+        // blocks in the same balloon, or either one not enclosed, leave the
+        // geometric decision untouched.
+        //
+        // Computed on demand and cached per box: one bounded flood fill per
+        // *candidate* box. This one is NOT behind the ink experiment's switch —
+        // it is the fix itself, and it only ever vetoes on positive evidence
+        // (both blocks enclosed, each centre outside the other's region). The
+        // strip probe above stays experimental because it guesses from a single
+        // band; this one asks the page a question it can answer.
+        if (image != null) {
+          final firstBalloon = balloons.putIfAbsent(
+            i,
+            () => balloonRegionOf(image, boxes[i]),
+          );
+          final secondBalloon = balloons.putIfAbsent(
+            j,
+            () => balloonRegionOf(image, boxes[j]),
+          );
+          if (!sameBalloon(firstBalloon, secondBalloon)) {
+            balloonRejected++;
+            continue;
+          }
+        }
         var rootI = find(i);
         var rootJ = find(j);
         if (rootI == rootJ) continue;
@@ -3425,6 +3462,7 @@ List<List<IntRect>> clusterOcrBoxes(
       candidates: inkCandidates,
       rejected: inkRejected,
       details: inkDetails,
+      balloonRejected: balloonRejected,
     );
   } else if (pageIndex != null) {
     // No pixels to audit: drop any stale entry so a reused page index cannot
@@ -3435,6 +3473,20 @@ List<List<IntRect>> clusterOcrBoxes(
   for (var i = 0; i < boxes.length; i++) {
     groups.putIfAbsent(find(i), () => []).add(boxes[i]);
   }
+  // NOTE: a minimum-spanning-tree split over each cluster (as
+  // `manga-image-translator` does in `textline_merge.split_text_region`) was
+  // written here and then removed, because it provably cannot fire in this
+  // pipeline: a link is only ever made when the two inflated boxes intersect,
+  // and inflation is `0.55 x short side` per box, so no *link* can bridge more
+  // than `0.55a + 0.55b = 1.1 x mean thickness` — while the split threshold
+  // that would cut it is `1.5 x mean thickness`. The MST's heaviest edge is
+  // always one of the links, so it always sits under the threshold. Their
+  // version works because their merge tolerance is up to three glyph widths,
+  // which is why a chain there can bridge a real hole. Ours cannot: two
+  // bubbles only fuse here when they are already almost touching, and no
+  // geometric rule separates that from a legitimately tight block (see the
+  // narration-gap arithmetic in the plan). The signal that can is ink — the
+  // probe below, and the balloon mask in `balloon.dart`.
   return groups.values.toList();
 }
 
@@ -3628,6 +3680,7 @@ class OcrInkTrace {
     required this.candidates,
     required this.rejected,
     required this.details,
+    this.balloonRejected = 0,
   });
 
   static const maxDetails = 3;
@@ -3636,6 +3689,14 @@ class OcrInkTrace {
   final int candidates;
   final int rejected;
   final List<OcrInkGap> details;
+
+  /// Candidate *merges* the balloon fill refused: the two blocks' centres lie in
+  /// different enclosed bright regions, i.e. they are in different speech
+  /// bubbles. Counted separately from [rejected] because the two probes answer
+  /// different questions and a silent one hiding the other would make the next
+  /// report unreadable — a page where `rejected=0 balloon=3` says the strip
+  /// probe found nothing and the balloons did the work.
+  final int balloonRejected;
 
   String line() {
     final buffer = StringBuffer(
@@ -3650,6 +3711,9 @@ class OcrInkTrace {
       buffer.write(' …+${rejected - details.length}more');
     }
     buffer.write(']');
+    // Appended, never inserted: the line's head is what existing readers and
+    // tests key on, and a new field may not move it.
+    buffer.write(' balloon=$balloonRejected');
     return buffer.toString();
   }
 }

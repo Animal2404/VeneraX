@@ -554,6 +554,11 @@ class ImageTranslationService with ChangeNotifier {
       await invalidateScope(comicScopePrefix(sourceKey, cid));
       _clearGlossary('$cid@$sourceKey');
     }
+    // "重新翻译" means *ask again*, so the session's translation memory must not
+    // hand back the wording this action exists to replace. The durable store and
+    // the caches above are per page; the memory is per string, so it is dropped
+    // wholesale — it repopulates from the next batch.
+    LlmTranslator.forgetAllTranslations();
     notifyListeners();
   }
 

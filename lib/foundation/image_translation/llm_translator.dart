@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:math' as math;
 
+import 'package:flutter/foundation.dart';
 import 'package:uuid/uuid.dart';
 import 'package:venera/foundation/appdata.dart';
 import 'package:venera/foundation/image_translation/public_translator.dart';
@@ -415,6 +416,80 @@ abstract class LlmTranslator {
   /// The returned [LlmTranslationResult] holds the aligned translations plus
   /// any new name/proper-noun pairs the model reported for this page, which
   /// the caller merges back into the comic's glossary.
+  /// Translations already paid for, keyed by target language + model + source
+  /// text.
+  ///
+  /// Manga repeat themselves relentlessly — `ハァ…`, `……`, `!?`, the same
+  /// catch-phrase on every page — and a re-read or a re-render asks for the same
+  /// strings again. Every hit is a request that never leaves the machine, which
+  /// is the cheapest speed-up available to a pipeline that is otherwise waiting
+  /// on someone else's API. The model is part of the key: a different endpoint
+  /// or model may legitimately word things differently, and silently serving the
+  /// old wording would make switching models look broken.
+  static final _memory = <String, String>{};
+
+  /// Bound on [_memory]. Insertion order is the eviction order (the map is a
+  /// LinkedHashMap), so a long session drops its oldest entries first.
+  static const memoryCapacity = 4000;
+
+  static String _memoryKey(String targetLang, String model, String text) =>
+      '$targetLang\u0000$model\u0000$text';
+
+  /// Whether [text] contains anything a translator could translate.
+  ///
+  /// A bubble holding only `…`, `!?`, `♪` or `ーーー` has no words in it: the
+  /// LLM can only echo it back, and manga are full of them. Skipping these is
+  /// safe by construction — the returned text is the input, unchanged — and it
+  /// removes whole lines from every request.
+  @visibleForTesting
+  static bool needsTranslation(String text) {
+    for (final rune in text.runes) {
+      // Letters and digits in any script; punctuation, spaces and symbols are
+      // not translatable content.
+      if (rune >= 0x30 && rune <= 0x39) return true; // 0-9
+      if (rune >= 0x41 && rune <= 0x5A) return true; // A-Z
+      if (rune >= 0x61 && rune <= 0x7A) return true; // a-z
+      if (rune >= 0xC0 && rune <= 0x24F) return true; // Latin-1 supplement
+      if (rune >= 0x3040 && rune <= 0x30FF) return true; // kana
+      if (rune >= 0x3400 && rune <= 0x9FFF) return true; // CJK
+      if (rune >= 0xAC00 && rune <= 0xD7AF) return true; // hangul
+      if (rune >= 0x1100 && rune <= 0x11FF) return true; // hangul jamo
+      if (rune >= 0x0400 && rune <= 0x04FF) return true; // cyrillic
+    }
+    return false;
+  }
+
+  /// Records a translation the endpoint has just returned.
+  ///
+  /// Exposed (with [memoryLookup]) only so the keying and eviction rules can be
+  /// pinned by a test: the batch path that calls it needs a network endpoint.
+  @visibleForTesting
+  static void remember(String targetLang, String model, String source, String translated) {
+    if (source.trim().isEmpty || translated.trim().isEmpty) return;
+    if (!needsTranslation(source)) return;
+    final key = _memoryKey(targetLang, model, source);
+    _memory.remove(key);
+    _memory[key] = translated;
+    while (_memory.length > memoryCapacity) {
+      _memory.remove(_memory.keys.first);
+    }
+  }
+
+  /// Reads back what [remember] stored, for the same key.
+  @visibleForTesting
+  static String? memoryLookup(String targetLang, String model, String text) =>
+      _memory[_memoryKey(targetLang, model, text)];
+
+  /// Drops every remembered translation. Used by "重新翻译", where the point of
+  /// the action is a fresh answer rather than the one already paid for.
+  static void forgetAllTranslations() => _memory.clear();
+
+  @visibleForTesting
+  static void clearMemory() => forgetAllTranslations();
+
+  @visibleForTesting
+  static int get memorySize => _memory.length;
+
   static Future<LlmTranslationResult> translateBatch(
     List<String> texts,
     String targetLang, {
@@ -426,6 +501,37 @@ abstract class LlmTranslator {
     if (activeIsPublicFree) {
       return _translateBatchPublic(texts, targetLang);
     }
+    // Two cheap filters before anything is sent. A line with no letters in it
+    // is passed through untouched, and a line this model has already translated
+    // in this session is served from memory. Both shrink the request; neither
+    // invents a translation.
+    var passthrough = <int, String>{};
+    var cached = <int, String>{};
+    var pending = <int>[];
+    for (var i = 0; i < texts.length; i++) {
+      final text = texts[i];
+      var trimmed = text.trim();
+      if (trimmed.isEmpty || !needsTranslation(trimmed)) {
+        passthrough[i] = text;
+        continue;
+      }
+      final hit = _memory[_memoryKey(targetLang, _model, text)];
+      if (hit != null) {
+        cached[i] = hit;
+        continue;
+      }
+      pending.add(i);
+    }
+    if (pending.isEmpty) {
+      var results = List<String>.generate(
+        texts.length,
+        (i) => passthrough[i] ?? cached[i] ?? '',
+      );
+      return LlmTranslationResult(results, const {});
+    }
+    // The request carries only the misses; `sent` maps the ids the model sees
+    // back to the caller's indices.
+    final sent = <String>[for (final i in pending) texts[i]];
     var target = _targetName(targetLang);
     var systemPrompt =
         '你是资深的二次元漫画本地化译者，热爱 ACGN 文化。将用户提供的 JSON 对象中 lines '
@@ -446,7 +552,8 @@ abstract class LlmTranslator {
     var payload = jsonEncode({
       if (glossary.isNotEmpty) 'glossary': glossary,
       'lines': [
-        for (var i = 0; i < texts.length; i++) {'id': i, 'text': texts[i]},
+        // Only the misses: `sent[k]` is the k-th text the model is asked about.
+        for (var i = 0; i < sent.length; i++) {'id': i, 'text': sent[i]},
       ],
     });
 
@@ -511,7 +618,20 @@ abstract class LlmTranslator {
               throw Exception('LLM response has no content');
             }
             _aimd.onSuccess(bucket);
-            return _parse(content, texts.length);
+            final parsed = _parse(content, sent.length);
+            // Remember what the model just produced, then hand the caller a
+            // list that is aligned with *its* input again.
+            for (var k = 0; k < sent.length; k++) {
+              remember(targetLang, _model, sent[k], parsed.texts[k]);
+            }
+            var merged = List<String>.generate(
+              texts.length,
+              (i) => passthrough[i] ?? cached[i] ?? '',
+            );
+            for (var k = 0; k < sent.length; k++) {
+              merged[pending[k]] = parsed.texts[k];
+            }
+            return LlmTranslationResult(merged, parsed.glossary);
           }
           lastError = Exception(
             'LLM endpoint returned $status: ${_briefBody(response.data)}',
