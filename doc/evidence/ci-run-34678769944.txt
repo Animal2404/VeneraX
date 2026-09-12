@@ -1,0 +1,12 @@
+run status: completed | conclusion: success
+ job Build_Windows -> completed success
+ job Test -> completed success
+ job Build_Android -> completed skipped
+ job Build_MacOS -> completed skipped
+ job TestBisect -> completed skipped
+ job Build_Linux -> completed skipped
+ job Build_Linux_ARM64 -> completed skipped
+ job Build_IOS -> completed skipped
+ job Release -> completed skipped
+ job Update_AltStore_Beta_Source -> completed skipped
+ job Update_AltStore_Source -> completed skipped

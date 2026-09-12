@@ -1,0 +1,15 @@
+# 构建产物（run 34678769944 / 提交 ea7dd9a）
+total 150308
+drwxr-xr-x 1 axia 197121        0  9月 12 15:01 .
+drwxr-xr-x 1 axia 197121        0  9月 12 15:03 ..
+-rwxr-xr-x 1 axia 197121   149504  9月 12 15:01 app_links_plugin.dll
+-rwxr-xr-x 1 axia 197121    96768  9月 12 15:01 battery_plus_plugin.dll
+-rwxr-xr-x 1 axia 197121    99328  9月 12 15:01 connectivity_plus_plugin.dll
+-rwxr-xr-x 1 axia 197121    62464  9月 12 15:01 dartjni.dll
+drwxr-xr-x 1 axia 197121        0  9月 12 15:01 data
+-rwxr-xr-x 1 axia 197121   206336  9月 12 15:01 desktop_webview_window_plugin.dll
+-rwxr-xr-x 1 axia 197121 18527776  9月 12 15:01 DirectML.dll
+-rwxr-xr-x 1 axia 197121    80384  9月 12 15:01 dynamic_color_plugin.dll
+-rwxr-xr-x 1 axia 197121   110592  9月 12 15:01 file_selector_windows_plugin.dll
+
+171M	/e/Gemini/VeneraX-round3

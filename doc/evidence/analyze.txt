@@ -1,0 +1,13 @@
+Analyzing 2 items...                                            
+
+   info - Use an initializing formal to assign a parameter to a field. Try using an initialing formal ('this._domain') to initialize the field - lib\foundation\comic_state_repository.dart:121:8 - prefer_initializing_formals
+   info - Use an initializing formal to assign a parameter to a field. Try using an initialing formal ('this._localManager') to initialize the field - lib\foundation\comic_state_repository.dart:122:8 - prefer_initializing_formals
+   info - Use an initializing formal to assign a parameter to a field. Try using an initialing formal ('this._historyManager') to initialize the field - lib\foundation\comic_state_repository.dart:123:8 - prefer_initializing_formals
+   info - Use an initializing formal to assign a parameter to a field. Try using an initialing formal ('this._favoritesManager') to initialize the field - lib\foundation\comic_state_repository.dart:124:8 - prefer_initializing_formals
+   info - Use an initializing formal to assign a parameter to a field. Try using an initialing formal ('this._clientFactory') to initialize the field - lib\network\webdav_library.dart:160:8 - prefer_initializing_formals
+   info - Use an initializing formal to assign a parameter to a field. Try using an initialing formal ('this._prepare') to initialize the field - lib\pages\reader\continuous_page_turn_coordinator.dart:34:8 - prefer_initializing_formals
+   info - Use an initializing formal to assign a parameter to a field. Try using an initialing formal ('this._navigate') to initialize the field - lib\pages\reader\continuous_page_turn_coordinator.dart:35:8 - prefer_initializing_formals
+   info - Invalid use of a private type in a public API. Try making the private type public, or making the API that uses the private type also be private - test\ocr_pass_b_fallback_test.dart:686:14 - library_private_types_in_public_api
+warning - The value of the local variable 'i' isn't used. Try removing the variable or using it - test\ocr_pass_b_fallback_test.dart:741:20 - unused_local_variable
+
+9 issues found. (ran in 8.2s)

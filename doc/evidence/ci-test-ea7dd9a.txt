@@ -1,0 +1,7 @@
+2026-09-12T06:44:08.0355217Z [self-test] ok   an all-skipped run fails the executed-case floor
+2026-09-12T06:44:08.0516757Z GUARD SELF-TEST PASS: 11/11 checks behaved as specified (drift, floor, stale exclusion, cap, tolerated failure, real failure, missing-reason rejection, teardown-exit-code).
+2026-09-12T06:47:06.6307323Z executed cases       : 1420
+2026-09-12T06:47:06.6307773Z passed / failed      : 1420 / 0
+2026-09-12T06:47:06.6308229Z skipped              : 1
+2026-09-12T06:47:06.6309384Z flutter test exit    : 0
+2026-09-12T06:47:06.6312921Z GUARD PASS: every on-disk test file executed at least one case, no unexcluded failure, executed-case floor met.
