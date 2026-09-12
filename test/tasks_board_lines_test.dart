@@ -51,10 +51,13 @@ PreTranslationActivity _groupInFlight({DateTime? answered}) {
 }
 
 void main() {
-  // `.tl` reads a table only `init` fills; without it every line that carries
-  // wording throws rather than degrading, which is what the first cloud run of
-  // this file reported.
-  setUpAll(AppTranslation.init);
+  // `.tl` reads a table only `init` fills, and `init` needs the test bindings
+  // before it will run outside a `testWidgets` body — the two cloud runs of
+  // this file named both halves of that.
+  setUpAll(() async {
+    TestWidgetsFlutterBinding.ensureInitialized();
+    await AppTranslation.init();
+  });
 
   group('the card shows the board while the translation request is out', () {
     test('during the wait: stage, item, wait and model are all there', () {
