@@ -1370,10 +1370,41 @@ class OcrPageFunnel {
   /// discarded, before clustering ever saw it.
   int get droppedByDet => det.droppedAll;
 
+  /// Texts this page's gate threw away, with the verdict that did it.
+  ///
+  /// The counts above prove *that* a page lost clusters; they cannot prove
+  /// *what* was lost, which is the whole question behind "OCR 识别不全": a
+  /// bubble left in Japanese in the rendered page is either a bubble the
+  /// detector never found, or one whose recognized text the plausibility gate
+  /// rejected, and the counts alone cannot tell those apart. Six samples fit in
+  /// a log line and are enough to recognise the text on sight; the counts stay
+  /// exact, so the sample never has to be read as a total.
+  final List<(OcrReject, String)> rejectedSamples = [];
+
+  /// How many texts the sample list may hold.
+  static const rejectedSampleLimit = 6;
+
+  /// Longest text kept per sample, in characters. Enough to recognise which
+  /// bubble it came from, short enough that six of them stay on one line.
+  static const rejectedSampleChars = 28;
+
   /// Counts the final verdict of one cluster. [reject] `null` means no
-  /// recognition attempt ran.
-  void countOutcome(OcrReject? reject) {
-    switch (reject ?? OcrReject.untried) {
+  /// recognition attempt ran. [text] is the recognized string, kept (bounded)
+  /// for the reject reasons that mean "there was text here and I refused it" —
+  /// `empty` and `untried` have nothing to show.
+  void countOutcome(OcrReject? reject, {String? text}) {
+    var verdict = reject ?? OcrReject.untried;
+    if (text != null &&
+        text.trim().isNotEmpty &&
+        (verdict == OcrReject.short || verdict == OcrReject.ratio) &&
+        rejectedSamples.length < rejectedSampleLimit) {
+      var sample = text.trim();
+      if (sample.length > rejectedSampleChars) {
+        sample = sample.substring(0, rejectedSampleChars);
+      }
+      rejectedSamples.add((verdict, sample));
+    }
+    switch (verdict) {
       case OcrReject.none:
         blocks++;
       case OcrReject.short:
@@ -1418,8 +1449,22 @@ class OcrPageFunnel {
   /// The developer-log body for this page. One line, `key=value` throughout,
   /// so it survives being reworded less than prose would; grep it with
   /// `OcrFunnel`.
+  /// The kept reject samples as `rejected=[short:あ, ratio:……]`, or '' when the
+  /// page rejected nothing. A helper rather than an inline map so the quoting
+  /// inside a log string stays readable.
+  String _rejectedPart() {
+    if (rejectedSamples.isEmpty) return '';
+    final parts = <String>[];
+    for (final sample in rejectedSamples) {
+      final verdict = sample.$1 == OcrReject.short ? 'short' : 'ratio';
+      parts.add('$verdict:${sample.$2}');
+    }
+    return ' rejected=[${parts.join(', ')}]';
+  }
+
   String line() {
     final cut = cutAtPct;
+    var rejected = _rejectedPart();
     return 'OcrFunnel page=$pageIndex det=${det.render()}'
         ' detBoxes=$detBoxes clusters=$clusters cropLimit=$cropLimit'
         ' droppedByDet=${det.droppedAll}'
@@ -1428,6 +1473,7 @@ class OcrPageFunnel {
         ' workItems=$workItems tooShort=$tooShort'
         ' implausible=$implausible empty=$empty untried=$untried'
         ' recLinesDropped=$recLinesDropped blocks=$blocks'
+        '$rejected'
         '${passBPart()}'
         '${droppedByCropLimit > 0 && cut != null ? ' cutAtPct=$cut' : ''}';
   }
@@ -2626,7 +2672,9 @@ class _WorkerState {
     for (var item in workItems) {
       final text = item.text.trim();
       if (text.isEmpty || !item.isPlausible) {
-        funnels[item.pageIndex]?.countOutcome(item.reject);
+        // The recognized string rides along: a rejection nobody can read back
+        // is a rejection nobody can check.
+        funnels[item.pageIndex]?.countOutcome(item.reject, text: item.text);
         continue;
       }
       funnels[item.pageIndex]?.countOutcome(OcrReject.none);
