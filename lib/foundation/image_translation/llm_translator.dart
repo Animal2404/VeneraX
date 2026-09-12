@@ -1,4 +1,6 @@
 import 'dart:convert';
+
+import 'package:crypto/crypto.dart';
 import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
@@ -9,6 +11,18 @@ import 'package:venera/foundation/image_translation/rate_limiter.dart';
 import 'package:venera/foundation/image_translation/translation_performance_config.dart';
 import 'package:venera/foundation/log.dart';
 import 'package:venera/network/app_dio.dart';
+
+/// Short, key-safe stamp of a translation engine: provider kind + endpoint +
+/// model, hashed.
+///
+/// Hashed because a URL carries `:` and `/`, and this string is concatenated
+/// into cache keys that double as file names. Pure, so the "which inputs may
+/// invalidate a cache" rule is pinned by a test rather than by comment.
+String translationEngineStampOf({
+  required String kind,
+  required String url,
+  required String model,
+}) => sha1.convert(utf8.encode('$kind|$url|$model')).toString().substring(0, 8);
 
 /// One page's translation outcome: the per-bubble texts (aligned with the
 /// input, empty where the model refused/failed) plus any proper-noun
@@ -254,6 +268,29 @@ abstract class LlmTranslator {
   static const _slotWaitBackstop = Duration(minutes: 30);
 
   static String get _rawUrl => (LlmProviderStore.active?.url ?? '').trim();
+
+  /// Stamp of the engine that produced a translation, for the cache prefix.
+  ///
+  /// Without it, changing the model in settings changed nothing a reader could
+  /// see: the rendered page and the stored text are keyed by language pair and
+  /// page identity only, so the old translation kept being served and the new
+  /// model looked broken ("模型还是没改"). The stamp makes a model change a new
+  /// cache generation, exactly like a language change already was.
+  ///
+  /// Only inputs that *change the output* are folded in — provider kind,
+  /// endpoint and model. The API key is not (rotating a key is not a new model),
+  /// and neither are the entry's id or display name, so renaming a provider does
+  /// not throw away every cached translation. 'none' when nothing is configured,
+  /// so a user who never set an endpoint keeps the generation they had.
+  static String get engineStamp {
+    final provider = LlmProviderStore.active;
+    if (provider == null) return 'none';
+    return translationEngineStampOf(
+      kind: provider.kind.token,
+      url: provider.url,
+      model: provider.model,
+    );
+  }
 
   static String get _apiKey => (LlmProviderStore.active?.key ?? '').trim();
 

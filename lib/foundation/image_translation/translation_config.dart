@@ -1,4 +1,5 @@
 import 'package:venera/foundation/appdata.dart';
+import 'package:venera/foundation/image_translation/llm_translator.dart';
 import 'package:venera/foundation/image_translation/translation_types.dart';
 import 'package:venera/foundation/source_platform.dart';
 
@@ -63,15 +64,28 @@ class TranslationConfig {
     );
   }
 
-  /// Cache-key prefix for this language pair. Every page key of every comic
-  /// translated with these languages starts with it, so changing the pair
-  /// naturally addresses a different cache generation instead of serving pages
-  /// translated into another language.
+  /// Cache-key prefix for this language pair **and the engine selected when it
+  /// was translated**. Every page key of every comic translated with these
+  /// languages starts with it, so changing the pair naturally addresses a
+  /// different cache generation instead of serving pages translated into
+  /// another language — and the engine stamp extends that same rule to the
+  /// model, which used to be invisible to the cache: a reader who switched
+  /// models kept being served the previous model's pages and reasonably
+  /// concluded the setting did nothing.
+  ///
+  /// The prefix is the *whole* generation switch: the rendered image key
+  /// (`ImageTranslationService.cacheKeyFor`) and the durable per-page text
+  /// (`translated_page.cache_key`, `translated_chapter_index.scope_prefix`) are
+  /// all built from it, so one stamp moves both. Scope prefixes for deletion
+  /// are still built by concatenating onto this string, so `invalidateScope`
+  /// and the library's "delete saved chapter" keep working unchanged.
   // Generation 2 stores per-line erase rectangles and uses stricter OCR block
   // grouping. Reusing generation-1 rows would keep their broad erase boxes and
   // could still remove artwork even though the renderer itself was fixed.
+  // Generation 3 adds [kTranslationPromptGeneration] and the engine stamp.
   String get cachePrefix =>
-      'pageTranslation@$kOcrSchemaGeneration@$sourceLang>$targetLang@';
+      'pageTranslation@$kOcrSchemaGeneration@$kTranslationPromptGeneration@'
+      '$sourceLang>$targetLang@${LlmTranslator.engineStamp}@';
 }
 
 /// Cache generation for the OCR pipeline, shared by the rendered-page key
@@ -80,3 +94,9 @@ class TranslationConfig {
 /// decode semantics change; keeping the two in one constant is what stops the
 /// rendered cache and the intermediate cache from disagreeing.
 const int kOcrSchemaGeneration = 2;
+
+/// Revision of the translation *prompting* (the system prompt, the glossary
+/// instructions, the response shape). Bump it when the wording sent to the model
+/// changes in a way that should re-translate what is already cached: the prompt
+/// lives in code, so nothing else in the key could notice.
+const int kTranslationPromptGeneration = 1;
