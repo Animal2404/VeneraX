@@ -489,6 +489,7 @@ class _SliderSetting extends StatefulWidget {
     required this.interval,
     required this.min,
     required this.max,
+    this.help,
     this.onChanged,
     this.comicId,
     this.comicSource,
@@ -496,6 +497,14 @@ class _SliderSetting extends StatefulWidget {
   });
 
   final String title;
+
+  /// One plain-language line under the title: what this knob does, and what
+  /// turning it up or down costs. Added because the performance sliders shipped
+  /// as bare labels — a user reading "OCR recognition batch size 8" has no way
+  /// to tell whether 8 is high, low, or a mistake, and a knob nobody understands
+  /// is a knob nobody touches (which leaves the default doing all the work —
+  /// see the progressive-disclosure note in the settings research doc).
+  final String? help;
 
   final String settingsIndex;
 
@@ -546,15 +555,7 @@ class _SliderSettingState extends State<_SliderSetting> {
     final fractionDigits = widget.interval >= 1
         ? 0
         : widget.interval.toString().split('.').last.length;
-    return ListTile(
-      title: Text(widget.title, softWrap: true, maxLines: 2),
-      trailing: Text(
-        value.toInt() == value
-            ? value.toInt().toString()
-            : value.toStringAsFixed(fractionDigits),
-        style: ts.s12,
-      ),
-      subtitle: Slider(
+    final slider = Slider(
         value: value,
         onChanged: (value) {
           if (value.toInt() == value) {
@@ -605,10 +606,27 @@ class _SliderSettingState extends State<_SliderSetting> {
           }
           widget.onChanged?.call();
         },
-        divisions: ((widget.max - widget.min) / widget.interval).toInt(),
-        min: widget.min,
-        max: widget.max,
+      divisions: ((widget.max - widget.min) / widget.interval).toInt(),
+      min: widget.min,
+      max: widget.max,
+    );
+    return ListTile(
+      title: Text(widget.title, softWrap: true, maxLines: 2),
+      trailing: Text(
+        value.toInt() == value
+            ? value.toInt().toString()
+            : value.toStringAsFixed(fractionDigits),
+        style: ts.s12,
       ),
+      subtitle: widget.help == null
+          ? slider
+          : Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(widget.help!.tl, style: ts.s12),
+                slider,
+              ],
+            ),
     );
   }
 }

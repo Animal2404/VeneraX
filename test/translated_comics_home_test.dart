@@ -8,6 +8,7 @@ import 'package:venera/foundation/appdata.dart';
 import 'package:venera/foundation/comic_details_cache.dart';
 import 'package:venera/foundation/comic_source/comic_source.dart';
 import 'package:venera/foundation/home_layout.dart';
+import 'package:venera/foundation/image_translation/translation_service.dart';
 import 'package:venera/foundation/image_translation/translation_store.dart';
 import 'package:venera/pages/home_page.dart';
 import 'package:venera/pages/translated_comics_page.dart';
@@ -50,8 +51,19 @@ void main() {
       for (var section in kHomeSections)
         {'id': section.id, 'visible': section.id == 'translatedComics'},
     ];
-    const chapter = TranslationChapterIdentity(
-      scopePrefix: 'pageTranslation@2@auto>zh@src@comic@ch1@',
+    // The scope prefix is *not* spelled out here on purpose. It is a cache
+    // generation the app owns (`TranslationConfig.cachePrefix`), and a fixture
+    // that pins it verbatim goes stale the moment that generation moves — which
+    // is exactly what happened when the engine stamp was added: the seeded row
+    // stopped matching and this test failed with "0 chapters". Asking the
+    // production helper keeps the fixture testing the *behaviour* instead of
+    // the key format.
+    final chapter = TranslationChapterIdentity(
+      scopePrefix: ImageTranslationService.chapterScopePrefix(
+        'src',
+        'comic',
+        'ch1',
+      ),
       sourceKey: 'src',
       comicId: 'comic',
       chapterId: 'ch1',

@@ -1368,6 +1368,9 @@ class _ReaderSettingsState extends State<ReaderSettings> {
               _SliderSetting(
                 title: "Pages per pre-translation request".tl,
                 settingsIndex: "imageTranslationPreBatchPages",
+                help:
+                    "How many pages are handed to the recognizer at once for a background translation. Bigger batches are faster on a strong GPU and hold more memory at the same time. 4-6 is the safe zone on a 6 GB laptop GPU; raise it only when the GPU is clearly not the bottleneck."
+,
                 interval: 1,
                 min: 1,
                 max: App.isDesktop ? 20 : 8,
@@ -1378,6 +1381,9 @@ class _ReaderSettingsState extends State<ReaderSettings> {
               _SliderSetting(
                 title: "OCR parallelism (0 = auto)".tl,
                 settingsIndex: "imageTranslationOcrWorkers",
+                help:
+                    "How many recognizers run side by side. 0 lets the app pick from the hardware it detected. More of them finish a chapter sooner but split the graphics memory between them, which is what makes a small GPU slower instead of faster."
+,
                 interval: 1,
                 min: 0,
                 max: App.isDesktop ? 6 : 2,
@@ -1389,6 +1395,9 @@ class _ReaderSettingsState extends State<ReaderSettings> {
                 _SliderSetting(
                   title: "OCR detection batch size".tl,
                   settingsIndex: "imageTranslationOcrDetBatch",
+                  help:
+                      "How many image tiles the text detector looks at in one batch. Higher is faster on a capable GPU and uses more memory; 2 is the default that leaves a 6 GB card room to spare."
+,
                   interval: 1,
                   min: 1,
                   max: 4,
@@ -1399,6 +1408,9 @@ class _ReaderSettingsState extends State<ReaderSettings> {
                 _SliderSetting(
                   title: "OCR recognition batch size".tl,
                   settingsIndex: "imageTranslationOcrRecBatch",
+                  help:
+                      "How many text lines the recognizer reads in one batch. This is the biggest speed lever for Japanese manga, which has many short lines per page, and also the biggest memory consumer. Raise it until the speed stops improving."
+,
                   interval: 1,
                   min: 1,
                   max: App.isDesktop ? 32 : 4,
@@ -1409,6 +1421,9 @@ class _ReaderSettingsState extends State<ReaderSettings> {
                 _SliderSetting(
                   title: "Pages per OCR call".tl,
                   settingsIndex: "imageTranslationPagesPerOcrCall",
+                  help:
+                      "How many pages one recognition call covers. More pages amortise the per-call overhead; fewer keep memory flat and update the progress display sooner."
+,
                   interval: 1,
                   min: 1,
                   max: 8,
@@ -1420,6 +1435,9 @@ class _ReaderSettingsState extends State<ReaderSettings> {
               _SliderSetting(
                 title: "Image download concurrency".tl,
                 settingsIndex: "imageTranslationImageConcurrency",
+                help:
+                    "How many page images are downloaded at the same time. Raise it on a fast connection; lower it when the comic source starts throttling or returning errors."
+,
                 interval: 1,
                 min: 1,
                 max: App.isDesktop ? 6 : 3,
@@ -1430,6 +1448,9 @@ class _ReaderSettingsState extends State<ReaderSettings> {
               _SliderSetting(
                 title: "Translation request concurrency".tl,
                 settingsIndex: "imageTranslationLlmConcurrency",
+                help:
+                    "How many translation requests may be in flight at once. More means a chapter finishes sooner, but a slow or rate-limited API will start refusing them. The app backs off by itself when that happens, and this is the ceiling it climbs back to."
+,
                 interval: 1,
                 min: 1,
                 max: App.isDesktop ? 4 : 3,

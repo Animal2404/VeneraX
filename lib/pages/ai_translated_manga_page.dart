@@ -9,6 +9,7 @@ import 'package:venera/foundation/comic_type.dart';
 import 'package:venera/foundation/history.dart';
 import 'package:venera/foundation/image_translation/translated_library.dart';
 import 'package:venera/foundation/image_translation/translation_config.dart';
+import 'package:venera/foundation/image_translation/pre_translation_tasks.dart';
 import 'package:venera/foundation/image_translation/translation_models.dart';
 import 'package:venera/foundation/image_translation/translation_service.dart';
 import 'package:venera/foundation/image_translation/translation_store.dart';
@@ -568,6 +569,71 @@ class _TranslatedMangaChaptersPageState
     return manager.find(saved.id, ComicType.local);
   }
 
+  /// Translate this chapter, or redo it.
+  ///
+  /// The two differ only in whether the existing translation is thrown away
+  /// first, and both end by queueing the chapter, because "re-translated" and
+  /// "translated later when you happen to open the page" are not the same
+  /// promise. Queueing reuses the background job the chapter picker starts, so
+  /// the progress card, the task list and the cancel button all work here too.
+  Future<void> _translateChapter(TranslatedMangaChapterRow row) async {
+    final current = entry;
+    if (!ImageTranslationService.isReadyForComic(
+      current.comicId,
+      current.sourceKey,
+    )) {
+      context.showMessage(message: 'Configure AI translation first'.tl);
+      return;
+    }
+    final redo = row.translatedPages > 0;
+    showConfirmDialog(
+      context: context,
+      title: redo
+          ? 'Re-translate this chapter?'.tl
+          : 'Translate this chapter?'.tl,
+      content: redo
+          ? 'This clears the translation of "@title" and translates it again.'
+                .tlParams({'title': row.title})
+          : 'Starts translating "@title" in the background. Progress shows up on the Tasks page.'
+                .tlParams({'title': row.title}),
+      onConfirm: () async {
+        if (redo) {
+          await ImageTranslationService.instance.retranslate(
+            current.comicId,
+            current.sourceKey,
+            eid: row.chapterId,
+          );
+          PreTranslationTaskManager.instance.resetChapterStatus(
+            current.comicId,
+            current.sourceKey,
+            {row.chapterId},
+          );
+          if (mounted) setState(_refreshRows);
+        }
+        final task = PreTranslationTaskManager.instance.start(
+          cid: current.comicId,
+          sourceKey: current.sourceKey,
+          comicType: ComicType.fromKey(current.sourceKey),
+          title: current.titleOrId,
+          cover: current.cover,
+          chapters: [
+            PreTranslationChapter(eid: row.chapterId, title: row.title),
+          ],
+        );
+        if (!mounted) return;
+        if (task == null) {
+          context.showMessage(message: 'Configure AI translation first'.tl);
+        } else if (task.chapters.any((c) => c.eid == row.chapterId)) {
+          context.showMessage(message: 'Added to the translation queue'.tl);
+        } else {
+          // `start` hands back the running job for this comic instead of
+          // opening a second one; saying "queued" here would be a lie.
+          context.showMessage(message: 'This comic is already translating'.tl);
+        }
+      },
+    );
+  }
+
   Future<void> _saveChapter(TranslatedMangaChapterRow row) async {
     if (savingChapterId != null) return;
     final current = entry;
@@ -693,16 +759,37 @@ class _TranslatedMangaChaptersPageState
                           child: CircularProgressIndicator(strokeWidth: 2),
                         ),
                       )
-                    : row.isSaved
-                    ? IconButton(
-                        tooltip: 'Delete'.tl,
-                        icon: const Icon(Icons.delete_outline),
-                        onPressed: () => _deleteChapter(row.saved!),
-                      )
-                    : IconButton(
-                        tooltip: 'Save this chapter'.tl,
-                        icon: const Icon(Icons.save_alt),
-                        onPressed: () => unawaited(_saveChapter(row)),
+                    : Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          // Translate / re-translate from right here. The
+                          // reader's own menu could already do this for the
+                          // page in front of you, and the comic's detail page
+                          // for a chapter you had to go find — which is the
+                          // step this removes: seeing "82 pages translated"
+                          // in the library should let you redo it without
+                          // navigating back to where the chapter lives.
+                          IconButton(
+                            tooltip: row.translatedPages > 0
+                                ? 'Re-translate'.tl
+                                : 'Translate'.tl,
+                            icon: const Icon(Icons.refresh),
+                            onPressed: () =>
+                                unawaited(_translateChapter(row)),
+                          ),
+                          if (row.isSaved)
+                            IconButton(
+                              tooltip: 'Delete'.tl,
+                              icon: const Icon(Icons.delete_outline),
+                              onPressed: () => _deleteChapter(row.saved!),
+                            )
+                          else
+                            IconButton(
+                              tooltip: 'Save this chapter'.tl,
+                              icon: const Icon(Icons.save_alt),
+                              onPressed: () => unawaited(_saveChapter(row)),
+                            ),
+                        ],
                       ),
               );
             },
