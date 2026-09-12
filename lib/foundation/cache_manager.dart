@@ -1,9 +1,31 @@
 import 'package:crypto/crypto.dart';
 import 'package:sqlite3/sqlite3.dart';
 import 'package:venera/foundation/sqlite_connection.dart';
+import 'package:venera/foundation/log.dart';
 import 'package:venera/utils/io.dart';
 
 import 'app.dart';
+
+/// How long a cache file must exist before the orphan sweep may remove it.
+///
+/// `writeCache` writes the file **before** it inserts the row that makes the
+/// file "managed", so a sweep listing the directory in that gap would see a
+/// live entry as an orphan — and on Windows the `delete` can then fail outright
+/// with errno 32 because the writer still holds the handle, turning a routine
+/// sweep into an exception delivered to whoever happened to be writing. Both
+/// halves of that are real: the file is destroyed, or the caller crashes. The
+/// grace window removes the race instead of hardening only the symptom.
+const Duration kCacheSweepGrace = Duration(seconds: 60);
+
+/// Whether a file with no row in the cache table is old enough to be swept.
+///
+/// Pure, so the boundary is pinned by a test: a file written a moment ago is
+/// somebody's in-flight write; one that has sat there for [grace] is litter.
+bool unmanagedCacheFileIsSweepable(
+  DateTime modified,
+  DateTime now, {
+  Duration grace = kCacheSweepGrace,
+}) => now.difference(modified) >= grace;
 
 class CacheManager {
   static String get cachePath => '${App.cachePath}/cache';
@@ -57,10 +79,33 @@ class CacheManager {
     });
     // delete unmanaged files
     // Only modify the database in the main isolate to avoid deadlock
+    var sweepNow = DateTime.now();
     for (var filePath in res['unmanagedFiles'] as List<String>) {
       var file = File(filePath);
       if (await file.exists()) {
-        await file.delete();
+        // A file younger than the grace window is a write in flight, not an
+        // orphan: `writeCache` creates the file first and inserts its row after,
+        // so this sweep can legitimately catch it in between.
+        try {
+          final stat = await file.stat();
+          if (!unmanagedCacheFileIsSweepable(stat.modified, sweepNow)) {
+            continue;
+          }
+        } on FileSystemException catch (e) {
+          Log.warning('CacheManager', 'cache sweep could not stat ${file.path}: $e');
+          continue;
+        }
+        try {
+          await file.delete();
+        } on FileSystemException catch (e) {
+          // Windows refuses to unlink a file another handle still holds. A
+          // sweep is housekeeping: it may skip a file, never fail its caller.
+          Log.warning(
+            'CacheManager',
+            'cache sweep could not delete ${file.path}: $e',
+          );
+          continue;
+        }
       }
       var segments = file.uri.pathSegments;
       var name = segments.last;
